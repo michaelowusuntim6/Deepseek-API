@@ -1,4 +1,3 @@
-```markdown
 # DeepSeek Unofficial — library, TUI, and OpenAI-compatible server
 
 > **Unofficial project.** Not affiliated with or endorsed by DeepSeek. It automates the consumer experience at [chat.deepseek.com](https://chat.deepseek.com) using **your own signed-in account**. No API key, no credits, no billing. Use it responsibly and within DeepSeek's terms.
