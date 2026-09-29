@@ -1,0 +1,26 @@
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Session artifacts — contain session tokens + cookies. NEVER commit.
+session.json
+session
+*.env.*
+!.env.example
+CLAUDE.md# Local session (bearer token + cookies — NEVER commit)
+session/
+FIX_REPORT.md
+*.log
+venv/
+__pycache__/
+*.pyc
+.env
+# Local session (bearer token + cookies — NEVER commit)
+session/
+FIX_REPORT.md
+*.log
+venv/
+__pycache__/
+*.pyc
+.env
