@@ -1,9 +1,3 @@
-Nice — the TUI is confirmed working, both blocks render cleanly. Now let's ship a README that reflects everything the project actually does (it's grown a lot since the original one was written).
-
-## 1. Replace `README.md`
-
-Save this as `~/Deepseek-API/README.md`:
-
 ```markdown
 # DeepSeek Unofficial — library, TUI, and OpenAI-compatible server
 
