@@ -27,3 +27,4 @@ __pycache__/
 
 # Local working documents — never commit
 *_REPORT.md
+test_sdk.py
