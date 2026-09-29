@@ -24,3 +24,6 @@ venv/
 __pycache__/
 *.pyc
 .env
+
+# Local working documents — never commit
+*_REPORT.md

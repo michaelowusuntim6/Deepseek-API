@@ -39,13 +39,21 @@ import httpx
 
 from .auth import Session, get_session
 from .pow import DeepSeekPow
+from .tools import Tool, ToolCall, execute_tool
 
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
 DEFAULT_MODEL_TYPE = "default"
 _CID_SEP = ":"
 
-PartKind = Literal["thinking", "answer"]
+PartKind = Literal["thinking", "answer", "tool_call", "tool_result"]
+
+TOOL_SYSTEM_PREAMBLE = """You have access to the following tools. When you want to call a tool, respond with ONLY a single JSON object wrapped in <tool_call></tool_call> tags, and nothing else before or after it. The JSON must have keys "name" (string) and "arguments" (object). Wait for the tool result before continuing. If no tool is needed, respond normally without any tool_call tags.
+
+Available tools:
+{tools_schema}
+
+When you receive a tool result, it will appear as a user message prefixed with "TOOL RESULT for <tool_name>:". Use it to continue."""
 
 # ----- Optional debug logging ------------------------------------------------
 
@@ -91,10 +99,18 @@ class Reply:
     """A completed chat reply plus the id to resume the conversation.
 
     `thinking` holds the DeepThink reasoning trace (empty when thinking is off).
+    `tool_call` holds any requested ToolCall (or None if no tool requested).
+    `tool_calls_made` records all ToolCalls attempted during chat_with_tools.
     """
     text: str
     conversation_id: str
     thinking: str = ""
+    tool_call: Optional[ToolCall] = None
+    tool_calls_made: list[ToolCall] = None
+
+    def __post_init__(self):
+        if self.tool_calls_made is None:
+            self.tool_calls_made = []
 
     def __str__(self) -> str:
         return self.text
@@ -176,10 +192,170 @@ class DeepSeekClient:
         answer: list[str] = []
         reasoning: list[str] = []
         for kind, text in s.iter_parts():
-            (reasoning if kind == "thinking" else answer).append(text)
+            if kind == "thinking":
+                reasoning.append(text)
+            elif kind == "answer":
+                answer.append(text)
         return Reply(text="".join(answer),
                      conversation_id=s.conversation_id,
-                     thinking="".join(reasoning))
+                     thinking="".join(reasoning),
+                     tool_call=s.tool_call)
+
+    def _default_manual_approval(self, call: ToolCall) -> tuple[bool, bool]:
+        """Prompt user on stdin for approval. Returns (approved, remember)."""
+        print(f"\nTool call requested: {call.name}({call.arguments})")
+        while True:
+            resp = input("Approve tool call? [y]es / [n]o / [a]lways: ").strip().lower()
+            if resp in ("y", "yes"):
+                return True, False
+            if resp in ("n", "no"):
+                return False, False
+            if resp in ("a", "always"):
+                return True, True
+
+    def chat_with_tools(
+        self,
+        prompt: str,
+        tools: list[Tool],
+        approval: str | Callable[[ToolCall], bool] = "manual",
+        conversation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        thinking: bool = False,
+        search: bool = False,
+        max_iterations: int = 8,
+    ) -> Reply:
+        tools_schema_str = json.dumps([t.schema() for t in tools], indent=2)
+        current_prompt = (
+            TOOL_SYSTEM_PREAMBLE.format(tools_schema=tools_schema_str)
+            + "\n\nUser: "
+            + prompt
+        )
+
+        current_cid = conversation_id
+        current_model = model
+        tool_calls_made: list[ToolCall] = []
+        always_approved_tools: set[str] = set()
+
+        for iteration in range(max_iterations):
+            reply = self.chat(
+                current_prompt,
+                conversation_id=current_cid,
+                model=current_model if iteration == 0 else None,
+                thinking=thinking,
+                search=search,
+            )
+            current_cid = reply.conversation_id
+
+            if reply.tool_call is None:
+                reply.tool_calls_made = tool_calls_made
+                return reply
+
+            call = reply.tool_call
+            tool_calls_made.append(call)
+
+            # Check approval
+            approved = False
+            if call.name in always_approved_tools:
+                approved = True
+            elif approval == "auto":
+                approved = True
+            elif approval == "manual":
+                appr, remember = self._default_manual_approval(call)
+                approved = appr
+                if remember and approved:
+                    always_approved_tools.add(call.name)
+            elif callable(approval):
+                approved = bool(approval(call))
+
+            if approved:
+                result = execute_tool(call, tools)
+            else:
+                result = "User rejected this tool call."
+
+            # Build next prompt turn
+            call_raw = call.raw if call.raw else json.dumps({"name": call.name, "arguments": call.arguments})
+            current_prompt = (
+                f"<tool_call>{call_raw}</tool_call>\n\n"
+                f"TOOL RESULT for {call.name}:\n{result}"
+            )
+
+        reply.tool_calls_made = tool_calls_made
+        return reply
+
+    def stream_with_tools(
+        self,
+        prompt: str,
+        tools: list[Tool],
+        approval: str | Callable[[ToolCall], bool | tuple[bool, bool]] = "manual",
+        conversation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        thinking: bool = False,
+        search: bool = False,
+        max_iterations: int = 8,
+    ) -> Iterator[tuple[PartKind, str]]:
+        """Streaming variant of chat_with_tools yielding (kind, text) events."""
+        tools_schema_str = json.dumps([t.schema() for t in tools], indent=2)
+        current_prompt = (
+            TOOL_SYSTEM_PREAMBLE.format(tools_schema=tools_schema_str)
+            + "\n\nUser: "
+            + prompt
+        )
+
+        current_cid = conversation_id
+        current_model = model
+        always_approved_tools: set[str] = set()
+        self._last_stream_cid: Optional[str] = current_cid
+
+        for iteration in range(max_iterations):
+            s = self.stream(
+                current_prompt,
+                conversation_id=current_cid,
+                model=current_model if iteration == 0 else None,
+                thinking=thinking,
+                search=search,
+            )
+            for kind, text in s.iter_parts():
+                yield (kind, text)
+
+            current_cid = s.conversation_id
+            self._last_stream_cid = current_cid
+
+            if s.tool_call is None:
+                return
+
+            call = s.tool_call
+            approved = False
+
+            if call.name in always_approved_tools:
+                approved = True
+            elif approval == "auto":
+                approved = True
+            elif approval == "manual":
+                appr, remember = self._default_manual_approval(call)
+                approved = appr
+                if remember and approved:
+                    always_approved_tools.add(call.name)
+            elif callable(approval):
+                res = approval(call)
+                if isinstance(res, tuple):
+                    approved, remember = res
+                    if remember and approved:
+                        always_approved_tools.add(call.name)
+                else:
+                    approved = bool(res)
+
+            if approved:
+                result = execute_tool(call, tools)
+            else:
+                result = "User rejected this tool call."
+
+            yield ("tool_result", result)
+
+            call_raw = call.raw if call.raw else json.dumps({"name": call.name, "arguments": call.arguments})
+            current_prompt = (
+                f"<tool_call>{call_raw}</tool_call>\n\n"
+                f"TOOL RESULT for {call.name}:\n{result}"
+            )
 
     def close(self) -> None:
         self._http.close()
@@ -187,8 +363,8 @@ class DeepSeekClient:
 
 class _Stream:
     """Streamed reply. Iterating yields answer text; `.iter_parts()` yields
-    (kind, text) tuples with both thinking and answer. After consumption,
-    `.conversation_id` holds the resume token."""
+    (kind, text) tuples with thinking, answer, and tool_call. After consumption,
+    `.conversation_id` holds the resume token and `.tool_call` holds any tool call."""
 
     def __init__(self, client: "DeepSeekClient", prompt: str, session_id: str,
                  parent_id: Optional[int], model: Optional[str],
@@ -201,6 +377,7 @@ class _Stream:
         self._thinking = thinking
         self._search = search
         self._message_id: Optional[int] = None
+        self.tool_call: Optional[ToolCall] = None
 
     def iter_parts(self) -> Iterator[tuple[PartKind, str]]:
         body = {
@@ -221,11 +398,24 @@ class _Stream:
             "POST", COMPLETION_PATH, json=body, headers=headers
         ) as resp:
             resp.raise_for_status()
-            yield from _parse_sse(resp.iter_lines(), meta)
+            for kind, text in _parse_sse(resp.iter_lines(), meta):
+                if kind == "tool_call":
+                    try:
+                        data = json.loads(text)
+                        self.tool_call = ToolCall(
+                            name=data.get("name", ""),
+                            arguments=data.get("arguments", {}),
+                            raw=text,
+                        )
+                    except Exception as e:
+                        _dlog(f"Failed to parse tool_call JSON: {e}")
+                yield (kind, text)
+
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
 
     def __iter__(self) -> Iterator[str]:
+        """Yield ONLY answer text (backwards compatible with plain iteration)."""
         for kind, text in self.iter_parts():
             if kind == "answer":
                 yield text
@@ -243,6 +433,9 @@ _RESPONSE_TYPES = {"RESPONSE", "ANSWER", "TEXT", "CONTENT", "FINAL", "OUTPUT"}
 # Matches ".../fragments/<N>/..." or ".../fragments/<N>" at end; N may be -1.
 _FRAG_INDEX_RE = re.compile(r"fragments/(-?\d+)(?:/|$)")
 
+_OPEN_TAG = "<tool_call>"
+_CLOSE_TAG = "</tool_call>"
+
 
 def _fragment_kind(frag: dict) -> Optional[PartKind]:
     t = (frag.get("type") or "").upper()
@@ -256,25 +449,7 @@ def _fragment_kind(frag: dict) -> Optional[PartKind]:
 def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, str]]:
     """Turn DeepSeek's SSE completion stream into (kind, text) tuples.
 
-    The stream carries up to three kinds of events (all in the standard
-    `data: {...}` envelope):
-
-      1. Snapshot:      `{"v": {"response": {"fragments": [...]}}}`
-         Full state of every fragment. Registers fragment types and emits any
-         new content since the previous snapshot.
-
-      2. Fragment reg:  `{"p": ".../fragments", "v": {"type": "RESPONSE", ...}}`
-         A new fragment was appended. The fragment dict tells us its kind. We
-         also accept `{"p": ".../fragments/N", ...}` with an explicit index and
-         `-1` meaning "append at the end".
-
-      3. Content delta: `{"p": ".../fragments/N/content", "v": " hi"}` or
-         `{"v": "!"}` (bare append to the current fragment). `-1` resolves to
-         the highest known fragment index — the "current" one.
-
-    Tracking the highest known index — and updating it the moment we learn a
-    new fragment exists — is what keeps the RESPONSE content from being
-    appended to the THINK fragment.
+    Recognizes thinking, answer, and tool_call blocks (<tool_call>...</tool_call>).
     """
     fragment_kinds: dict[int, PartKind] = {}
     last_seen: dict[int, str] = {}     # cumulative content per fragment index
@@ -286,9 +461,6 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, s
         if kind is not None:
             fragment_kinds[idx] = kind
         elif idx not in fragment_kinds:
-            # No type available; infer by alternation from the previous fragment
-            # (THINK → RESPONSE → THINK → …), defaulting fragment 0 to thinking
-            # since DeepThink always puts reasoning first.
             if idx == 0:
                 fragment_kinds[idx] = "thinking"
             elif (idx - 1) in fragment_kinds:
@@ -298,16 +470,59 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, s
                 fragment_kinds[idx] = "answer"
 
     def _absorb_full(idx: int, full: str) -> Optional[str]:
-        """Update cumulative content for a fragment; return the new suffix."""
         prev = last_seen.get(idx, "")
         if not full or full == prev:
             return None
         if prev and full.startswith(prev):
             delta = full[len(prev):]
         else:
-            delta = full  # fragment reset / replaced
+            delta = full
         last_seen[idx] = full
         return delta
+
+    # Tool call parsing state machine
+    # We buffer answer chunks to detect <tool_call> ... </tool_call>
+    answer_buffer = ""
+    in_tool_call = False
+    tool_call_buffer = ""
+
+    def process_answer_chunk(text: str) -> Iterator[tuple[PartKind, str]]:
+        nonlocal answer_buffer, in_tool_call, tool_call_buffer
+        combined = answer_buffer + text
+        answer_buffer = ""
+
+        pos = 0
+        while pos < len(combined):
+            if not in_tool_call:
+                tag_idx = combined.find(_OPEN_TAG, pos)
+                if tag_idx != -1:
+                    # Emit everything before <tool_call> as answer
+                    if tag_idx > pos:
+                        yield ("answer", combined[pos:tag_idx])
+                    in_tool_call = True
+                    pos = tag_idx + len(_OPEN_TAG)
+                else:
+                    # No <tool_call> tag found. Keep up to 32 chars in answer_buffer
+                    # to handle <tool_call> tag split across chunks.
+                    safe_len = len(combined) - pos
+                    if safe_len > 32:
+                        emit_len = safe_len - 32
+                        yield ("answer", combined[pos:pos + emit_len])
+                        pos += emit_len
+                    answer_buffer = combined[pos:]
+                    break
+            else:
+                close_idx = combined.find(_CLOSE_TAG, pos)
+                if close_idx != -1:
+                    tool_call_buffer += combined[pos:close_idx]
+                    tc_json = tool_call_buffer.strip()
+                    tool_call_buffer = ""
+                    in_tool_call = False
+                    pos = close_idx + len(_CLOSE_TAG)
+                    yield ("tool_call", tc_json)
+                else:
+                    tool_call_buffer += combined[pos:]
+                    break
 
     for line in lines:
         if not line or not line.startswith("data:"):
@@ -334,10 +549,14 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, s
                 _register(i, _fragment_kind(frag))
                 delta = _absorb_full(i, frag.get("content") or "")
                 if delta:
-                    yield (fragment_kinds.get(i, "answer"), delta)
+                    kind = fragment_kinds.get(i, "answer")
+                    if kind == "answer":
+                        yield from process_answer_chunk(delta)
+                    else:
+                        yield (kind, delta)
             continue
 
-        # --- 2. Fragment registration / update (v is a fragment dict or list of fragment dicts) ---
+        # --- 2. Fragment registration / update ---
         frags_to_register = []
         if isinstance(v, list) and p.endswith("fragments"):
             frags_to_register = [item for item in v if isinstance(item, dict)]
@@ -351,42 +570,60 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, s
                     raw = int(m.group(1))
                     idx = (_highest() + 1) if raw < 0 else raw
                 else:
-                    # New fragment(s) appended at the end
-                    idx = (_highest() + 1) if fragment_kinds else 0
+                    idx = (_highest() + 1) if (fragment_kinds and 0 in fragment_kinds) else 0
                 _register(idx, _fragment_kind(item))
                 content = item.get("content") or ""
                 if content:
                     last_seen[idx] = content
-                    yield (fragment_kinds[idx], content)
+                    kind = fragment_kinds[idx]
+                    if kind == "answer":
+                        yield from process_answer_chunk(content)
+                    else:
+                        yield (kind, content)
             continue
 
-        # --- 3. message_id capture (path ends with "message_id") ---
+        # --- 3. message_id capture ---
         if p.endswith("message_id") and isinstance(v, int):
             if meta is not None:
                 meta["message_id"] = v
             continue
 
-        # --- 4. Content delta (v is a string) ---
+        # --- 4. Content delta ---
         if isinstance(v, str):
             if p:
                 if not p.endswith("content"):
-                    continue  # ignore other string-valued path updates
+                    continue
                 m = _FRAG_INDEX_RE.search(p)
                 if m:
                     raw = int(m.group(1))
                     idx = _highest() if raw < 0 else raw
                 else:
-                    # Path is a content path but with no explicit index — attach
-                    # to the currently-highest fragment.
                     idx = _highest()
             else:
-                # Bare append: attach to the currently-highest fragment.
                 idx = _highest()
             if idx not in fragment_kinds:
                 _register(idx, None)
             last_seen[idx] = last_seen.get(idx, "") + v
-            yield (fragment_kinds[idx], v)
+            kind = fragment_kinds[idx]
+            if kind == "answer":
+                yield from process_answer_chunk(v)
+            else:
+                yield (kind, v)
             continue
+
+    # Flush remaining answer buffer & tool call buffer
+    if in_tool_call and tool_call_buffer:
+        close_idx = tool_call_buffer.find(_CLOSE_TAG)
+        if close_idx != -1:
+            tc_json = tool_call_buffer[:close_idx].strip()
+            yield ("tool_call", tc_json)
+            after = tool_call_buffer[close_idx + len(_CLOSE_TAG):]
+            if after:
+                yield ("answer", after)
+        else:
+            _dlog(f"Warning: unclosed <tool_call> block discarded: {tool_call_buffer}")
+    if answer_buffer:
+        yield ("answer", answer_buffer)
 
 
 def _capture_message_id(meta: dict, snapshot: dict) -> None:
