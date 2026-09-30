@@ -543,6 +543,8 @@ def build_parser() -> UsageErrorParser:
                    help="skip memory auto-injection")
     p.add_argument("--no-agents", action="store_true",
                    help="skip AGENTS.md discovery")
+    p.add_argument("--no-skills", action="store_true",
+                   help="skip skills discovery and preamble listing")
     p.add_argument("--generate-agents", action="store_true",
                    help="generate AGENTS.md for the current repository and exit")
     p.add_argument("--show-preamble", action="store_true",
@@ -565,6 +567,7 @@ class DeepSeekCLI:
         self.no_diff = bool(args.no_diff)
         self.no_memory = bool(args.no_memory)
         self.no_agents = bool(args.no_agents)
+        self.no_skills = bool(args.no_skills)
         self.generate_agents = bool(args.generate_agents)
         self.show_preamble = bool(args.show_preamble)
         self.show_thinking = bool(args.show_thinking)
@@ -828,9 +831,12 @@ class DeepSeekCLI:
         set_agent_runtime(self.runtime)
 
     def _load_context_layers(self) -> None:
-        self.skills_text, warning = skills_preamble()
-        if warning:
-            sys.stderr.write(warning + "\n")
+        if self.no_skills:
+            self.skills_text = ""
+        else:
+            self.skills_text, warning = skills_preamble()
+            if warning:
+                sys.stderr.write(warning + "\n")
         if not self.no_agents:
             found = discover_agents()
             if found:

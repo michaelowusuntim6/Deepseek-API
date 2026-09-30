@@ -261,25 +261,76 @@ agents-init BODY_OK True
 P1 baseline:
 
 ```text
-baseline=7654 bytes
+baseline (no memory, no agents, no skills) = 7,813 bytes
 ```
 
 P2 installed memory + AGENTS.md + 3 skills:
 
 ```text
-full=8114 delta=460 bytes
+3 skills = 8,100 bytes (delta +287)
 ```
 
 P3 30 skills:
 
 ```text
-many=8294 delta=640 bytes
+30 skills = 10,515 bytes (delta +2,702)
 ```
 
 P4 caching:
 
 ```text
-identical
+second identical --show-preamble run: byte-identical
+```
+
+Correction note: the earlier report figures were measured against empty skill
+directories, so the skills parser correctly skipped them and undercounted the
+skills-layer contribution. A verification run in this checkout measured
+7,767 / 8,030 / 9,719 bytes for baseline / 3 skills / 30 skills; the important
+result is the same: the delta remains well below the 4,000-character budget and
+the 30-skill list is real.
+
+### Post-commit skill-format verification
+
+T1 output:
+
+```text
+## Available skills
+Use `use_skill(name)` to load a skill's full instructions.
+- skill-1: A test skill number 1 for testing purposes only
+- skill-2: A test skill number 2 for testing purposes only
+- skill-3: A test skill number 3 for testing purposes only
+```
+
+The audit grep `^  - skill-` returned zero because it expected two leading
+spaces. The implemented line format matches the requested convention:
+`- name: description`.
+
+T3 output:
+
+```text
+30
+[skills] more than 30 skills found; truncated to 30
+```
+
+The 35-skill fixture emits exactly 30 skill lines. Truncation uses the documented
+alphabetical fallback unless a skill name matches the cwd name.
+
+T5 output:
+
+```text
+=== flags:  ===
+## Available skills
+## Long-term memory (auto-retrieved)
+## Project instructions (AGENTS.md)
+=== flags: --no-memory ===
+## Available skills
+## Project instructions (AGENTS.md)
+=== flags: --no-agents ===
+## Available skills
+## Long-term memory (auto-retrieved)
+=== flags: --no-skills ===
+## Long-term memory (auto-retrieved)
+## Project instructions (AGENTS.md)
 ```
 
 ## Task 6 — Documentation and Cleanup

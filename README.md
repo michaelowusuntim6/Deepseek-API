@@ -136,6 +136,7 @@ context estimate, followed by a dim status footer before each prompt.
 | `--no-diff` | flag | Suppress `apply_patch` diff previews |
 | `--no-memory` | flag | Skip memory auto-injection |
 | `--no-agents` | flag | Skip AGENTS.md discovery |
+| `--no-skills` | flag | Skip skills discovery and preamble listing |
 | `--generate-agents` | flag | Generate AGENTS.md and exit |
 | `--show-preamble` | flag | Print the assembled preamble to stderr and exit |
 

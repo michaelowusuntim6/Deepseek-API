@@ -32,6 +32,7 @@ def test_skills() -> None:
         write_skill(base, "hello", "Say hello")
         context, warning = skills.skills_preamble(tmpdir)
         assert "hello: Say hello" in context and warning is None
+        assert "- hello: Say hello" in context.splitlines()
         body = skills.use_skill.fn("hello")
         assert "Body for hello" in body
         assert "Body for hello" in skills.read_skill_file.fn("hello", "SKILL.md")
@@ -41,6 +42,9 @@ def test_skills() -> None:
             write_skill(base, f"s{i:02d}", "x" * 100)
         _, warning = skills.skills_preamble(tmpdir)
         assert warning and "truncated" in warning
+        truncated, _ = skills.skills_preamble(tmpdir)
+        skill_lines = [line for line in truncated.splitlines() if line.startswith("- ")]
+        assert len(skill_lines) == 30
     print("all skills tests passed")
 
 
