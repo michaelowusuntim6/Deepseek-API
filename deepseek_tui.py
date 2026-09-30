@@ -33,8 +33,23 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from deepseek import DeepSeekClient, tool, Tool, ToolCall
+from deepseek import (
+    DeepSeekClient,
+    tool,
+    Tool,
+    ToolCall,
+    load_extensions,
+    load_extension_commands,
+    extension_report,
+    reload_extensions,
+)
 from deepseek.auth import LoginRequired
+
+
+_BUILTIN_TOOL_NAMES = frozenset({
+    "read_file", "list_dir", "write_file", "run_shell",
+    "edit_file", "grep", "find_files", "fetch_url",
+})
 
 
 # ----- Built-in Tools -----
@@ -155,7 +170,6 @@ def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = F
         if size > 1024 * 1024:
             return f"error: file '{path}' is {size} bytes — exceeds 1 MB limit"
         raw = p.read_bytes()
-        # Detect newline style for preservation — we work in bytes to be safe
         content = raw.decode("utf-8", errors="replace")
         count = content.count(old_string)
         if count == 0:
@@ -173,7 +187,6 @@ def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = F
         return f"error editing file '{path}': {type(e).__name__}: {e}"
 
 
-# Directories to skip during grep / find_files traversal
 _SKIP_DIRS = {"__pycache__", ".git", "venv", "node_modules", ".venv", ".mypy_cache", ".tox"}
 
 
@@ -200,13 +213,11 @@ def grep(pattern: str, path: str = ".", glob: str = "*", max_results: int = 100)
         truncated = False
 
         for dirpath, dirnames, filenames in os.walk(root):
-            # Prune skip dirs in-place so os.walk doesn't descend into them
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
             for fname in sorted(filenames):
                 if not fnmatch.fnmatch(fname, glob):
                     continue
                 fpath = Path(dirpath) / fname
-                # Skip binary files by reading a small chunk and checking for null bytes
                 try:
                     with open(fpath, "rb") as fb:
                         chunk = fb.read(8192)
@@ -304,11 +315,9 @@ def fetch_url(url: str, max_bytes: int = 8000) -> str:
         body = raw[:max_bytes].decode("utf-8", errors="replace")
         if truncated:
             body += "… (truncated)"
-        # Crude HTML strip: remove <script>…</script>, <style>…</style>, then all tags
         body = re.sub(r"<script[^>]*>.*?</script>", " ", body, flags=re.DOTALL | re.IGNORECASE)
         body = re.sub(r"<style[^>]*>.*?</style>", " ", body, flags=re.DOTALL | re.IGNORECASE)
         body = re.sub(r"<[^>]+>", " ", body)
-        # Collapse whitespace
         body = re.sub(r"\s+", " ", body).strip()
         return body
     except urllib.error.HTTPError as e:
@@ -322,21 +331,36 @@ def fetch_url(url: str, max_bytes: int = 8000) -> str:
 
 
 def default_tools() -> list[Tool]:
-    return [read_file, list_dir, write_file, run_shell,
-            edit_file, grep, find_files, fetch_url]
+    builtins: list[Tool] = [read_file, list_dir, write_file, run_shell,
+                            edit_file, grep, find_files, fetch_url]
+    builtin_names = {t.name for t in builtins}
+
+    ext_tools = load_extensions()
+    added: list[str] = []
+    for t in ext_tools:
+        if t.name not in builtin_names:
+            builtins.append(t)
+            added.append(t.name)
+
+    if added:
+        sys.stderr.write(f"[tui] loaded {len(added)} extension tool(s): {', '.join(added)}\n")
+
+    return builtins
 
 
 SLASH_COMMANDS = [
-    ("/help",     "show commands and key bindings"),
-    ("/model",    "switch model — /model chat  or  /model expert"),
-    ("/thinking", "toggle DeepThink reasoning"),
-    ("/search",   "toggle web search"),
-    ("/mode",     "set tool mode — /mode manual  or  /mode auto"),
-    ("/tools",    "toggle/list tools — /tools on | off | list"),
-    ("/new",      "start a fresh thread"),
-    ("/clear",    "clear the chat pane"),
-    ("/thread",   "print the current conversation_id"),
-    ("/exit",     "quit"),
+    ("/help",       "show commands and key bindings"),
+    ("/model",      "switch model — /model (menu) or chat|expert"),
+    ("/thinking",   "toggle DeepThink reasoning"),
+    ("/search",     "toggle web search"),
+    ("/mode",       "set tool mode — /mode (menu) or manual|auto"),
+    ("/tools",      "toggle/list tools — /tools (menu) or on|off|list"),
+    ("/extensions", "list loaded extensions and their tools"),
+    ("/reload",     "reload extensions from disk"),
+    ("/new",        "start a fresh thread"),
+    ("/clear",      "clear the chat pane"),
+    ("/thread",     "print the current conversation_id"),
+    ("/exit",       "quit"),
 ]
 
 
@@ -379,18 +403,7 @@ class ThinkingBlock(Collapsible):
         self.collapsed = True
 
 
-class ToolCallBlock(Static):
-    """Widget rendering a requested tool call and approval prompt."""
-    def __init__(self, call: ToolCall, mode: str):
-        short_args = str(call.arguments)
-        if len(short_args) > 100:
-            short_args = short_args[:97] + "..."
-        super().__init__(f"⚙ Tool call: [bold]{call.name}[/]({short_args})")
-        self.add_class("tool-call-block")
-
-
 class ToolResultBlock(Static):
-    """Widget rendering the result of a tool call."""
     def __init__(self, result: str, is_error: bool = False):
         short_res = result.strip().replace("\n", " ")
         if len(short_res) > 200:
@@ -455,6 +468,61 @@ class SlashMenu(OptionList):
             return None
 
 
+class ChoiceMenu(OptionList):
+    """Inline sub-menu shown for commands that take a fixed set of arguments.
+
+    Driven entirely through the App's on_key; this widget never takes focus.
+    """
+    can_focus = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.add_class("choice-menu")
+        self.display = False
+        self._on_pick = None
+
+    def present(self, choices: list[tuple[str, str]], on_pick, current: str | None = None) -> None:
+        """choices: list of (value, label). on_pick(value) is called on select."""
+        self.clear_options()
+        self._on_pick = on_pick
+        for value, label in choices:
+            marker = "● " if value == current else "  "
+            self.add_option(Option(f"{marker}{label}", id=value))
+        if current is not None:
+            for i, (v, _label) in enumerate(choices):
+                if v == current:
+                    self.highlighted = i
+                    break
+            else:
+                self.highlighted = 0
+        else:
+            self.highlighted = 0 if self.option_count else None
+        self.display = True
+
+    @property
+    def highlighted_value(self) -> str | None:
+        idx = self.highlighted
+        if idx is None:
+            return None
+        try:
+            return self.get_option_at_index(idx).id
+        except Exception:
+            return None
+
+    def pick_highlighted(self) -> None:
+        value = self.highlighted_value
+        if value is None or self._on_pick is None:
+            return
+        cb = self._on_pick
+        self.display = False
+        self._on_pick = None
+        cb(value)
+
+    def cancel(self) -> None:
+        self.display = False
+        self._on_pick = None
+
+
 # ---------------- App ----------------
 
 class DeepSeekTUI(App):
@@ -495,19 +563,12 @@ class DeepSeekTUI(App):
         padding: 0 1;
     }
 
-    .tool-call-block {
-        margin: 0 0 1 0;
-        border-left: thick $accent;
-        background: $panel;
-        padding: 0 1;
-    }
-
     .tool-result-block {
         margin: 0 0 1 0;
         padding: 0 1;
     }
 
-    .slash-menu {
+    .slash-menu, .choice-menu {
         display: none;
         height: auto;
         max-height: 10;
@@ -549,6 +610,7 @@ class DeepSeekTUI(App):
         self.tool_mode: str = "manual"
         self.tools_enabled: bool = True
         self.tools: list[Tool] = default_tools()
+        self._ext_commands: dict[str, object] = load_extension_commands()
 
         self._pending_approval: dict | None = None
         self._approved_tools: set[str] = set()
@@ -561,6 +623,7 @@ class DeepSeekTUI(App):
         yield Header(show_clock=True)
         yield VerticalScroll(id="chat")
         yield SlashMenu(id="slash-menu")
+        yield ChoiceMenu(id="choice-menu")
         yield Input(placeholder="Ask DeepSeek…   (type / for commands)", id="input")
         yield StatusBar(id="status")
 
@@ -610,7 +673,7 @@ class DeepSeekTUI(App):
         self._chat().mount(UserMessage(text))
         self._chat().scroll_end(animate=False)
 
-    # ----- slash menu -----
+    # ----- menus -----
 
     def _show_slash_menu(self, prefix: str) -> None:
         menu = self.query_one(SlashMenu)
@@ -625,12 +688,22 @@ class DeepSeekTUI(App):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         v = event.value
+
+        # CRITICAL: dismiss the choice sub-menu only when the user is actively
+        # typing something. Setting the input to "" (which happens right after
+        # submit, to clear the typed command) fires this handler with an EMPTY
+        # value — cancelling the sub-menu there would hide it the instant it
+        # was opened, because the submit handler has already presented it.
+        if v:
+            self.query_one(ChoiceMenu).cancel()
+
         if v.startswith("/") and " " not in v:
             self._show_slash_menu(v)
         else:
             self._hide_slash_menu()
 
     def on_key(self, event: events.Key) -> None:
+        # 1) Tool approval takes priority over everything.
         if self._pending_approval is not None:
             key = event.key
             if key == "y":
@@ -645,6 +718,23 @@ class DeepSeekTUI(App):
             event.prevent_default()
             return
 
+        # 2) Choice sub-menu (from /mode, /model, /tools with no arg).
+        choice = self.query_one(ChoiceMenu)
+        if choice.display:
+            if event.key == "down":
+                choice.action_cursor_down()
+            elif event.key == "up":
+                choice.action_cursor_up()
+            elif event.key in ("enter", "right", "tab"):
+                choice.pick_highlighted()
+            elif event.key == "escape":
+                choice.cancel()
+                self._add_system("[dim]cancelled[/]")
+            event.stop()
+            event.prevent_default()
+            return
+
+        # 3) Slash-command autocomplete menu.
         menu = self.query_one(SlashMenu)
         if menu.display:
             if event.key == "down":
@@ -682,11 +772,15 @@ class DeepSeekTUI(App):
         if pa is not None:
             pa["slot"]["result"] = "no"
             pa["event"].set()
+        # Clear any visible sub-menu so Ctrl+C exits cleanly.
+        try:
+            self.query_one(ChoiceMenu).cancel()
+        except Exception:
+            pass
 
     # ----- approval plumbing -----
 
     def _request_approval(self, call: ToolCall) -> str:
-        """Called from the WORKER thread. Blocks until the UI resolves it."""
         if call.name in self._approved_tools:
             return "always"
 
@@ -704,7 +798,6 @@ class DeepSeekTUI(App):
         return result
 
     def _resolve_approval(self, result: str) -> None:
-        """Called from the UI thread (on_key). Signals the worker."""
         pa = self._pending_approval
         if pa is None:
             return
@@ -714,7 +807,6 @@ class DeepSeekTUI(App):
         pa["event"].set()
 
     def _enter_approval_ui(self, call: ToolCall) -> None:
-        """Runs on the UI thread. Shows the prompt and routes keys."""
         args_short = str(call.arguments)
         if len(args_short) > 120:
             args_short = args_short[:117] + "..."
@@ -730,7 +822,6 @@ class DeepSeekTUI(App):
         self.set_focus(None)
 
     def _exit_approval_ui(self, result: str, got: bool) -> None:
-        """Runs on the UI thread after the decision is resolved."""
         inp = self.query_one("#input", Input)
         inp.disabled = False
         inp.focus()
@@ -745,7 +836,6 @@ class DeepSeekTUI(App):
         self._add_system(f"  {label}")
 
     def _approval_callback(self, call: ToolCall) -> bool:
-        """Called from the worker thread by chat_with_tools / stream_with_tools."""
         decision = self._request_approval(call)
         return decision in ("yes", "always")
 
@@ -755,6 +845,7 @@ class DeepSeekTUI(App):
         text = event.value.strip()
         event.input.value = ""
         self._hide_slash_menu()
+        self.query_one(ChoiceMenu).cancel()
         if not text:
             return
         if self._streaming:
@@ -775,31 +866,37 @@ class DeepSeekTUI(App):
         if cmd in ("help", "?"):
             self._add_system(
                 "[bold]Commands[/]\n"
-                "  [cyan]/model chat|expert[/]   pick the answering model\n"
-                "  [cyan]/thinking[/]            toggle DeepThink reasoning\n"
-                "  [cyan]/search[/]              toggle web search\n"
-                "  [cyan]/mode manual|auto[/]    set tool call approval mode\n"
-                "  [cyan]/tools on|off|list[/]   toggle or list registered tools\n"
-                "  [cyan]/new[/]                 start a fresh thread\n"
-                "  [cyan]/clear[/]               clear the chat pane\n"
-                "  [cyan]/thread[/]              print current conversation_id\n"
-                "  [cyan]/exit[/]                quit\n"
+                "  [cyan]/model[/]                pick the answering model (menu)\n"
+                "  [cyan]/mode[/]                 set tool call approval mode (menu)\n"
+                "  [cyan]/tools[/]                toggle/list tools (menu)\n"
+                "  [cyan]/thinking[/]             toggle DeepThink reasoning\n"
+                "  [cyan]/search[/]               toggle web search\n"
+                "  [cyan]/extensions[/]           list loaded extensions and their tools\n"
+                "  [cyan]/reload[/]               reload extensions from disk\n"
+                "  [cyan]/new[/]                  start a fresh thread\n"
+                "  [cyan]/clear[/]                clear the chat pane\n"
+                "  [cyan]/thread[/]               print current conversation_id\n"
+                "  [cyan]/exit[/]                 quit\n"
+                "\n[bold]Arg shortcuts[/]\n"
+                "  [cyan]/model chat|expert[/]    skip the menu\n"
+                "  [cyan]/mode manual|auto[/]     skip the menu\n"
+                "  [cyan]/tools on|off|list[/]    skip the menu\n"
                 "\n[bold]Keys[/]  ctrl+y mode · ctrl+t think · ctrl+s search · "
                 "ctrl+m model · ctrl+n new · ctrl+l clear · ctrl+c quit"
             )
         elif cmd == "model":
             if arg in ("chat", "deepseek-chat", "default"):
                 self.model = "deepseek-chat"
+                self._update_status()
+                self._add_system(f"Model → [bold]{self.model}[/]")
             elif arg in ("expert", "deepseek-expert"):
                 self.model = "deepseek-expert"
+                self._update_status()
+                self._add_system(f"Model → [bold]{self.model}[/]")
             elif arg == "":
-                self._cycle_model()
-                return
+                self._present_choice("model")
             else:
                 self._add_system("[red]Usage: /model chat  or  /model expert[/]")
-                return
-            self._update_status()
-            self._add_system(f"Model → [bold]{self.model}[/]")
         elif cmd == "thinking":
             self.thinking = not self.thinking
             self._update_status()
@@ -811,30 +908,45 @@ class DeepSeekTUI(App):
         elif cmd == "mode":
             if arg == "auto":
                 self.tool_mode = "auto"
+                self._update_status()
+                self._add_system(f"Tool mode → [bold]{self.tool_mode}[/]")
             elif arg == "manual":
                 self.tool_mode = "manual"
+                self._update_status()
+                self._add_system(f"Tool mode → [bold]{self.tool_mode}[/]")
             elif arg == "":
-                self._add_system(f"Tool mode is currently: [bold]{self.tool_mode}[/]")
-                return
+                self._present_choice("mode")
             else:
                 self._add_system("[red]Usage: /mode manual  or  /mode auto[/]")
-                return
-            self._update_status()
-            self._add_system(f"Tool mode → [bold]{self.tool_mode}[/]")
         elif cmd == "tools":
             if arg == "on":
                 self.tools_enabled = True
+                self._update_status()
                 self._add_system("Tools → [bold]on[/]")
             elif arg == "off":
                 self.tools_enabled = False
+                self._update_status()
                 self._add_system("Tools → [bold]off[/]")
             elif arg == "list":
-                tool_lines = [f"  [bold cyan]{t.name}[/]: {t.description}" for t in self.tools]
-                self._add_system("[bold]Registered Tools:[/]\n" + "\n".join(tool_lines))
+                self._show_tools_list()
+            elif arg == "":
+                self._present_choice("tools")
             else:
                 self._add_system("[red]Usage: /tools on | off | list[/]")
-                return
-            self._update_status()
+        elif cmd == "extensions":
+            self._add_system(extension_report())
+        elif cmd == "reload":
+            reload_extensions()
+            self.tools = default_tools()
+            self._ext_commands = load_extension_commands()
+            ext_tool_names = [t.name for t in self.tools if t.name not in _BUILTIN_TOOL_NAMES]
+            if ext_tool_names:
+                self._add_system(
+                    f"[green]Extensions reloaded.[/] "
+                    f"Tools: [cyan]{', '.join(ext_tool_names)}[/]"
+                )
+            else:
+                self._add_system("[green]Extensions reloaded.[/] No extension tools loaded.")
         elif cmd == "new":
             self.conversation_id = None
             self._approved_tools.clear()
@@ -848,8 +960,67 @@ class DeepSeekTUI(App):
             )
         elif cmd in ("exit", "quit"):
             self.exit()
+        elif f"/{cmd}" in self._ext_commands:
+            try:
+                self._ext_commands[f"/{cmd}"]()
+            except Exception as e:
+                self._add_system(f"[red]Extension command /{cmd} failed:[/] {e}")
         else:
             self._add_system(f"[red]Unknown command /{cmd}[/]  — try /help")
+
+    # ----- choice sub-menus -----
+
+    def _present_choice(self, which: str) -> None:
+        menu = self.query_one(ChoiceMenu)
+        self._hide_slash_menu()
+
+        if which == "mode":
+            current = self.tool_mode
+            def pick(value: str) -> None:
+                self.tool_mode = value
+                self._update_status()
+                self._add_system(f"Tool mode → [bold]{value}[/]")
+            choices = [
+                ("manual", "manual   [dim]— prompt before each tool call[/]"),
+                ("auto",   "auto     [dim]— run every tool without prompting (YOLO)[/]"),
+            ]
+            menu.present(choices, pick, current)
+
+        elif which == "model":
+            current = self.model
+            def pick(value: str) -> None:
+                self.model = value
+                self._update_status()
+                self._add_system(f"Model → [bold]{value}[/]")
+            choices = [
+                ("deepseek-chat",   "deepseek-chat    [dim]— fast default (Instant)[/]"),
+                ("deepseek-expert", "deepseek-expert  [dim]— stronger, slower (Expert)[/]"),
+            ]
+            menu.present(choices, pick, current)
+
+        elif which == "tools":
+            current = "on" if self.tools_enabled else "off"
+            def pick(value: str) -> None:
+                if value == "on":
+                    self.tools_enabled = True
+                    self._update_status()
+                    self._add_system("Tools → [bold]on[/]")
+                elif value == "off":
+                    self.tools_enabled = False
+                    self._update_status()
+                    self._add_system("Tools → [bold]off[/]")
+                elif value == "list":
+                    self._show_tools_list()
+            choices = [
+                ("on",   "on     [dim]— enable tool calling[/]"),
+                ("off",  "off    [dim]— disable tool calling[/]"),
+                ("list", "list   [dim]— show all registered tools[/]"),
+            ]
+            menu.present(choices, pick, current)
+
+    def _show_tools_list(self) -> None:
+        tool_lines = [f"  [bold cyan]{t.name}[/]: {t.description}" for t in self.tools]
+        self._add_system("[bold]Registered Tools:[/]\n" + "\n".join(tool_lines))
 
     def _cycle_model(self) -> None:
         self.model = (
@@ -918,13 +1089,12 @@ class DeepSeekTUI(App):
         elif kind == "tool_call":
             if self._thinking_block is not None and not self._thinking_block.finished:
                 self._thinking_block.finish()
-            # If parsed in stream_with_tools, note it's handled via callback
+            # Rendering for the call itself happens in the approval UI.
         elif kind == "tool_result":
             if self._thinking_block is not None and not self._thinking_block.finished:
                 self._thinking_block.finish()
             is_err = chunk.startswith("Error") or "rejected" in chunk
             self._chat().mount(ToolResultBlock(chunk, is_error=is_err))
-            # Reset answer block so subsequent narration gets a fresh Markdown bubble
             self._answer_md = None
         else:  # answer
             if self._thinking_block is not None and not self._thinking_block.finished:
@@ -955,7 +1125,7 @@ class DeepSeekTUI(App):
 
     def action_new_thread(self) -> None:
         self.conversation_id = None
-        self.always_approved_tools.clear()
+        self._approved_tools.clear()
         self._update_status()
         self._add_system("[green]Started a new thread.[/]")
 
