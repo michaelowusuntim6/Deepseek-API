@@ -1,6 +1,6 @@
-# DeepSeek TUI Extensions
+# DeepSeek CLI Extensions
 
-This directory contains example extensions for the DeepSeek TUI plugin system.
+This directory contains example extensions for the DeepSeek CLI plugin system.
 
 ---
 
@@ -32,15 +32,21 @@ def register():
 
 ### 2. `COMMANDS` — optional
 
-A `dict` mapping slash-command names to zero-argument callables:
+A `dict` mapping slash-command names to callables. New commands should accept
+the CLI app instance, or a first parameter named `emit`/`output`/`write`/`console`
+to receive an emit callback. Legacy zero-argument commands still work; their
+stdout is captured and displayed by the CLI.
 
 ```python
+def show_status(app):
+    app.emit("hello from my command")
+
 COMMANDS = {
-    "/mycommand": lambda: print("hello from my command"),
+    "/mycommand": show_status,
 }
 ```
 
-> **Note**: Built-in TUI commands (`/help`, `/mode`, `/tools`, `/new`, `/clear`,
+> **Note**: Built-in CLI commands (`/help`, `/mode`, `/tools`, `/new`, `/clear`,
 > `/thread`, `/exit`, `/extensions`, `/reload`, `/model`, `/thinking`, `/search`)
 > always take priority. If your command name clashes, a warning is printed and
 > your command is skipped.
@@ -51,7 +57,7 @@ COMMANDS = {
 
 ```python
 """
-my_extension.py — DeepSeek TUI extension: <brief description>.
+my_extension.py — DeepSeek CLI extension: <brief description>.
 
 Drop into ~/.deepseek-tui/extensions/ and restart or /reload.
 """
@@ -105,6 +111,11 @@ Files whose names start with `_` are skipped (use them for helper modules).
 |------|-------------|
 | [`weather.py`](weather.py) | Fetches current temperature via free Open-Meteo API (no key needed). |
 | [`notes.py`](notes.py) | Saves and lists Markdown notes; also demonstrates `COMMANDS`. |
+| [`image_view.py`](image_view.py) | Renders local images inline with `rich-pixels`. |
+
+`image_view.py` is the reference terminal-image extension. After copying it into
+an extension directory, use `/reload`, then ask the CLI to show an image. The
+tool is deferred, so the model should discover it through `search_tools`.
 
 ---
 
@@ -116,11 +127,11 @@ Files whose names start with `_` are skipped (use them for helper modules).
    cp examples/extensions/weather.py ~/.deepseek-tui/extensions/
    ```
 
-2. **Restart** `python deepseek_tui.py`, or type `/reload` if already running.
+2. **Restart** `python deepseek_cli.py`, or type `/reload` if already running.
 
 3. The startup log (`stderr`) will confirm: `[tui] loaded N extension tool(s): ...`
 
-4. Type `/extensions` in the TUI to see a summary of all loaded extensions.
+4. Type `/extensions` in the CLI to see a summary of all loaded extensions.
 
 5. Use the tool in a conversation — in `/mode auto` the model can call it
    automatically; in `/mode manual` you approve each call.

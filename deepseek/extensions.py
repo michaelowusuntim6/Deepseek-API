@@ -1,5 +1,5 @@
 """
-deepseek/extensions.py — Pi-style plugin/extension loader for the DeepSeek TUI.
+deepseek/extensions.py — plugin/extension loader for the DeepSeek CLI.
 
 Drop .py files into:
   ~/.deepseek-tui/extensions/
@@ -10,6 +10,10 @@ Each file may define:
       return [tool_a, tool_b]   # one Tool or a list of Tools
 
   COMMANDS = {"/name": callable, ...}   # optional slash commands
+
+Command callables may be zero-argument (stdout is captured by the CLI) or may
+accept the CLI app instance as their first argument. A first argument named
+`emit`/`output`/`write`/`console` receives an emit callback instead.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from typing import Callable
 
 from .tools import Tool
 
-# Built-in TUI slash commands that extensions must NOT override.
+# Built-in CLI slash commands that extensions must NOT override.
 _BUILTIN_COMMANDS: frozenset[str] = frozenset({
     "/mode", "/tools", "/help", "/new", "/clear",
     "/thread", "/exit", "/extensions", "/reload",
@@ -47,7 +51,6 @@ def _search_paths() -> list[Path]:
 
 def _collect_py_files() -> list[tuple[str, Path]]:
     """Return (label, path) pairs for all candidate extension files."""
-    seen_names: dict[str, Path] = {}
     results: list[tuple[str, Path]] = []
 
     for search_dir in _search_paths():
@@ -57,11 +60,6 @@ def _collect_py_files() -> list[tuple[str, Path]]:
             if py_file.name.startswith("_"):
                 continue
             name = py_file.stem
-            if name in seen_names:
-                # Later path overrides earlier; record override silently
-                # (the load loop will handle tool-name dedup with a warning)
-                pass
-            seen_names[name] = py_file
             results.append((name, py_file))
 
     return results

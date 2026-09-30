@@ -1,11 +1,11 @@
 """
-notes.py — DeepSeek TUI extension: simple markdown note storage.
+notes.py — DeepSeek CLI extension: simple markdown note storage.
 
 Drop this file into ~/.deepseek-tui/extensions/ and restart (or /reload).
 
 Notes are stored as Markdown files in $DEEPSEEK_NOTES_DIR (default: ~/notes).
 
-Also demonstrates COMMANDS: adding /notes as a custom TUI slash command.
+Also demonstrates COMMANDS: adding /notes as a custom CLI slash command.
 """
 
 from __future__ import annotations
@@ -72,11 +72,16 @@ def list_notes() -> str:
 
 
 # ── COMMANDS dict ────────────────────────────────────────────────────────────
-# Each key is a slash command name; each value is a zero-argument callable.
+# Each key is a slash command name. Commands may take the CLI app instance (or
+# an emit callback); zero-argument commands still work and their stdout is shown.
 # Built-in commands take priority — if /notes were built-in it would be skipped.
 
+def _show_notes(app):
+    app.emit("(notes command — see the list_notes tool to list saved notes)")
+
+
 COMMANDS = {
-    "/notes": lambda: print("(notes command — see list_notes tool to list saved notes)"),
+    "/notes": _show_notes,
 }
 
 

@@ -1,14 +1,29 @@
-# DeepSeek Unofficial — library, TUI, and OpenAI-compatible server
+# DeepSeek Unofficial — library, CLI, and OpenAI-compatible server
 
 > **Unofficial project.** Not affiliated with or endorsed by DeepSeek. It automates the consumer experience at [chat.deepseek.com](https://chat.deepseek.com) using **your own signed-in account**. No API key, no credits, no billing. Use it responsibly and within DeepSeek's terms.
 
 Turn your free DeepSeek web chat into three things:
 
 - 🐍 **A Python library** — `client.chat("Hi")` returns text, reasoning trace, and a resumable `conversation_id`.
-- 🖥️ **A terminal UI** — a Claude Code / Codex-style TUI with streaming Markdown, collapsible DeepThink reasoning, and web search.
+- 🖥️ **A terminal CLI** — a Codex-style Rich interface with streaming output, tool-call visibility, DeepThink reasoning, and web search.
 - 🔌 **A local OpenAI-compatible API** — runs at `http://localhost:8000/v1` so any OpenAI SDK or app works as a drop-in.
 
 You sign in once in a browser; the session is captured and refreshed automatically.
+
+---
+
+## What's new
+
+- Fixed `BrokenPipeError` when piping JSON output into tools like `head`.
+  Truncated pipes now exit `141` cleanly without tracebacks.
+- Removed the text-only `view_image` metadata stub.
+- Added `examples/extensions/image_view.py`, which renders local images inline
+  with `rich-pixels`.
+- Added line-buffered streaming Markdown rendering for TTY output.
+- Added `apply_patch` diff previews in the terminal and `file_change` JSONL
+  events.
+- Added batched manual approval prompts with `y/n/a/A/q`.
+- Tightened JSONL/event parity and stdout/stderr separation.
 
 ---
 
@@ -17,7 +32,7 @@ You sign in once in a browser; the session is captured and refreshed automatical
 - [Why use this](#why-use-this)
 - [Requirements](#requirements)
 - [Setup (2 minutes)](#setup-2-minutes)
-- [Usage 1 — Terminal UI](#usage-1--terminal-ui)
+- [Usage 1 — Terminal CLI](#usage-1--terminal-cli)
 - [Usage 2 — Python library](#usage-2--python-library)
 - [Usage 3 — OpenAI-compatible server](#usage-3--openai-compatible-server)
 - [Models, DeepThink, and web search](#models-deepthink-and-web-search)
@@ -32,7 +47,7 @@ You sign in once in a browser; the session is captured and refreshed automatical
 ## Why use this
 
 - **Free.** Uses your normal signed-in DeepSeek account — no API billing, no credits.
-- **Three front-ends.** Library, terminal UI, and HTTP server all share the same core client.
+- **Three front-ends.** Library, terminal CLI, and HTTP server all share the same core client.
 - **Full DeepSeek toolset.** Fast (Instant) and Expert models, plus DeepThink reasoning and web search as orthogonal toggles.
 - **Real streaming.** Token-by-token output with the reasoning trace kept separate from the answer.
 - **Drop-in OpenAI replacement.** Point any OpenAI client at `localhost` and existing code just works.
@@ -74,48 +89,120 @@ The login window handles the human-check and captures your session (bearer token
 
 ---
 
-## Usage 1 — Terminal UI
+## Usage 1 — Terminal CLI
 
-The friendliest way to talk to DeepSeek from the terminal.
+The Rich CLI supports one-shot prompts, piped stdin, and an interactive REPL.
 
 ```bash
-python deepseek_tui.py
+# One-shot
+python deepseek_cli.py "say hello in one word"
+
+# Piped stdin
+echo "hi" | python deepseek_cli.py
+
+# Interactive REPL
+python deepseek_cli.py
 ```
 
-You get a proper chat interface with:
+Interactive startup shows a bordered banner, a compact session panel with model,
+directory, permissions, DeepThink/search/tool state, short thread id, and a live
+context estimate, followed by a dim status footer before each prompt.
 
-- **Streaming Markdown replies** with syntax highlighting
-- **Collapsible DeepThink block** that streams reasoning, then auto-collapses the moment the answer starts
-- **Live toggles** for model, DeepThink, and web search
-- **Multi-turn threads** tracked automatically via `conversation_id`
+### Command-line reference
 
-### Key bindings
+| Flag | Values | Effect |
+| --- | --- | --- |
+| `--model` | `chat`, `expert` | Select DeepSeek Instant or Expert |
+| `--thinking` | flag | Enable DeepThink reasoning |
+| `--show-thinking` | flag | Display the reasoning trace during streaming |
+| `--search` | flag | Enable DeepSeek web search |
+| `--tools` | `off`, `manual`, `auto` | Strip tools, approve each call, or run unattended |
+| `--json` | flag | Emit one JSON object per line on stdout |
+| `--resume` | conversation id | Continue an existing thread |
+| `--no-stream` | flag | Buffer the answer instead of streaming tokens |
+| `--legacy-tools` | flag | Re-enable the legacy file-oriented tool tier |
+| `--compact-at` | tokens | Compact context above this estimated token threshold |
+| `--plan-mode` | flag | Enable structured `request_user_input` questions |
+| `--mode` | `normal`, `agent` | Agent mode enables persistent plan tracking |
+| `--no-markdown` | flag | Disable Markdown rendering during streaming |
+| `--no-diff` | flag | Suppress `apply_patch` diff previews |
 
-| Key | Action |
+Exit codes are `0` success, `1` runtime error, `2` auth required, `3` usage
+error, and `141` for a truncated pipe (`SIGPIPE` convention).
+
+### Agent tool set
+
+By default the CLI exposes the Codex-style tools:
+
+| Tool | Purpose |
 | --- | --- |
-| `Ctrl+T` | Toggle DeepThink reasoning |
-| `Ctrl+S` | Toggle web search |
-| `Ctrl+M` | Cycle model (`chat` ↔ `expert`) |
-| `Ctrl+N` | Start a new thread |
-| `Ctrl+L` | Clear the chat pane |
-| `Ctrl+C` | Quit |
+| `exec_command` | Run commands with pipes or a PTY; long-running processes return a session id |
+| `write_stdin` | Send input to an existing `exec_command` session |
+| `apply_patch` | Apply Codex-style Update/Add/Delete patches |
+| `search_tools` | Search deferred extension/capability tools |
+| `update_plan` | Maintain a persistent step-by-step plan |
+| `request_user_input` | Ask structured plan-mode questions |
+
+Extension tools are deferred by default. The model must call `search_tools`
+before using them, and matched tools stay available for one turn only.
+Local image viewing is provided by the optional `examples/extensions/image_view.py`
+extension, which renders pixels in the terminal with `rich-pixels`; it does not
+send images to DeepSeek.
+
+Auto-compaction runs before a new user turn when accumulated estimated context
+exceeds `--compact-at` or `DEEPSEEK_COMPACT_AT`. It summarizes the thread,
+stores the summary under `~/.deepseek-cli/summaries/`, and restarts with a new
+DeepSeek session. Active plans are carried across compaction.
+
+### Diff rendering
+
+Every `apply_patch` change is diffed before/after. On a terminal, the CLI renders
+a syntax-highlighted unified diff panel titled with the changed file path. In
+`--json` mode it emits a `file_change` event with `path`, `additions`,
+`deletions`, and the unified diff. Piped non-JSON output receives plain diff
+text. Use `--no-diff` to suppress all diff previews.
+
+### Streaming markdown
+
+On an interactive terminal, assistant output is line-buffered: completed lines
+are rendered through Rich Markdown, while the last partial line stays plain
+until the stream ends. Non-TTY output and `--json` skip Markdown entirely, so
+JSONL stays ANSI-free. Use `--no-markdown` to force raw terminal output.
+
+### Image viewing
+
+The optional [`examples/extensions/image_view.py`](examples/extensions/image_view.py)
+extension renders local PNG/JPEG/GIF/WebP files in the terminal with
+`rich-pixels`. It is deferred, so the model finds it through `search_tools`.
+
+```bash
+cp examples/extensions/image_view.py ~/.deepseek-tui/extensions/
+python deepseek_cli.py --tools auto "show tests/fixtures/test_image.png"
+```
 
 ### Slash commands
 
-Type `/` at the start of the input to pop up an autocomplete menu.
+Slash commands are available in the REPL. Tab completion is provided through
+`readline`.
 
 | Command | Effect |
 | --- | --- |
-| `/help` | Show all commands and keys |
-| `/model chat` \| `/model expert` | Switch model |
-| `/thinking` | Toggle DeepThink |
-| `/search` | Toggle web search |
-| `/new` | Fresh thread |
-| `/clear` | Wipe the pane |
+| `/help` | Show commands and usage |
+| `/new` | Start a fresh thread |
 | `/thread` | Print the current `conversation_id` |
+| `/clear` | Clear the terminal display |
+| `/model [chat\|expert]` | Show or set the model |
+| `/thinking [on\|off]` | Toggle DeepThink |
+| `/search [on\|off]` | Toggle web search |
+| `/mode manual\|auto` | Set tool approval mode |
+| `/tools off\|manual\|auto\|list` | Configure tools or list them |
+| `/compact` | Manually summarize and restart the context window |
+| `/plan [clear\|resume]` | Show, clear, or resume the persistent plan |
+| `/extensions` | List loaded extensions and tools |
+| `/reload` | Reload extensions from disk |
 | `/exit` | Quit |
 
-The bottom status bar shows the current model, both toggle states, and a short thread id.
+Extensions may also register their own slash commands through `COMMANDS`.
 
 ---
 
@@ -254,7 +341,7 @@ A self-imposed sliding-window limiter caps requests per client IP (default `30/m
 | Path | What it does |
 | --- | --- |
 | [`deepseek/`](deepseek/) | Core library: `DeepSeekClient`, auth (`auth.py`), HTTP driver (`client.py`), PoW solver (`pow.py`) |
-| [`deepseek_tui.py`](deepseek_tui.py) | Textual-based terminal UI |
+| [`deepseek_cli.py`](deepseek_cli.py) | Rich terminal CLI |
 | [`server/`](server/) | FastAPI OpenAI-compatible server |
 | [`app.py`](app.py) | Server entry point |
 | [`examples/`](examples/) | Runnable examples for every feature |
@@ -264,6 +351,9 @@ A self-imposed sliding-window limiter caps requests per client IP (default `30/m
 
 ## Notes & limitations
 
+- **Piped output to `head`:** If the downstream pipe closes early, the CLI exits
+  `141` and suppresses further stdout writes. This is expected SIGPIPE behavior,
+  not a crash; stderr should remain traceback-free.
 - **Sign in once, then reuse.** The cached session refreshes automatically; you only re-sign-in if it fully expires.
 - **Be reasonable.** Use it in moderation; don't spam or bulk-automate.
 - **No real token counts.** `usage` in server responses is a rough ~4-chars/token estimate.
@@ -277,4 +367,3 @@ A self-imposed sliding-window limiter caps requests per client IP (default `30/m
 
 Released under the [MIT License](LICENSE). As this is an unofficial project, you remain responsible for complying with DeepSeek's terms of service.
 ```
-

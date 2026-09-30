@@ -1,6 +1,9 @@
 # --- Core ---
 playwright>=1.44        # browser automation: login + PoW solving
-httpx>=0.27             # async HTTP client for chat streaming
+httpx>=0.27             # HTTP client for chat streaming
+rich>=13.7              # terminal UI, panels, tables, and styled output
+rich-pixels>=3.0        # terminal image rendering for the image_view extension
+pillow>=10.0            # image decoding used by rich-pixels/test fixtures
 fastapi>=0.111          # OpenAI-compatible server
 uvicorn[standard]>=0.30 # ASGI server
 pydantic>=2.7           # request/response models

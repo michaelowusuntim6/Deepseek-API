@@ -1,0 +1,1544 @@
+#!/usr/bin/env python3
+"""
+DeepSeek CLI — a Rich terminal client for chat.deepseek.com.
+
+Examples:
+    python deepseek_cli.py "say hello in one word"
+    echo "hi" | python deepseek_cli.py
+    python deepseek_cli.py
+    python deepseek_cli.py --json "hi"
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fnmatch
+import inspect
+import io
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from collections import deque
+from pathlib import Path
+from typing import Any, Callable
+
+try:
+    import readline
+except ImportError:  # pragma: no cover - Windows without pyreadline
+    readline = None  # type: ignore[assignment]
+
+from rich import box
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from deepseek import (
+    DeepSeekClient,
+    Tool,
+    ToolCall,
+    extension_report,
+    load_extension_commands,
+    load_extensions,
+    reload_extensions,
+    tool,
+)
+from deepseek.agent_tools import (
+    AgentRuntime,
+    ToolExecutor,
+    apply_patch,
+    exec_command,
+    request_user_input,
+    set_agent_runtime,
+    update_plan,
+    write_stdin,
+)
+from deepseek.auth import LoginRequired
+from deepseek.compaction import CompactionManager
+from deepseek.plan_store import PlanStore, render_checklist
+from deepseek.tool_search import DeferredToolRegistry, search_tools
+
+
+__version__ = "0.4.0"
+
+EXIT_OK = 0
+EXIT_RUNTIME = 1
+EXIT_AUTH = 2
+EXIT_USAGE = 3
+EXIT_INTERRUPTED = 130
+EXIT_SIGPIPE = 141
+
+MODEL_CHOICES = {
+    "chat": ("deepseek-chat", "default"),
+    "expert": ("deepseek-expert", "expert"),
+}
+
+_BUILTIN_TOOL_NAMES = frozenset({
+    "exec_command", "write_stdin", "apply_patch", "search_tools",
+    "update_plan", "request_user_input",
+    "read_file", "list_dir", "write_file", "run_shell",
+    "edit_file", "grep", "find_files", "fetch_url",
+})
+
+_SKIP_DIRS = {
+    "__pycache__", ".git", "venv", "node_modules", ".venv",
+    ".mypy_cache", ".tox",
+}
+
+
+class UsageErrorParser(argparse.ArgumentParser):
+    """ArgumentParser variant that uses exit code 3 for usage errors."""
+
+    json_errors = False
+
+    def error(self, message: str) -> None:
+        if self.json_errors:
+            sys.stdout.write(json.dumps({"kind": "error", "message": message}) + "\n")
+            self.exit(EXIT_USAGE)
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
+
+
+# ----- Built-in tools --------------------------------------------------------
+
+@tool
+def read_file(path: str) -> str:
+    """Read contents of a local file (capped at 32KB).
+
+    Args:
+        path: Path to the file.
+    """
+    try:
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            return f"Error: File '{path}' does not exist."
+        if not p.is_file():
+            return f"Error: '{path}' is not a file."
+        size = p.stat().st_size
+        max_bytes = 32 * 1024
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(max_bytes)
+        if size > max_bytes:
+            content += f"\n\n[Notice: File truncated from {size} bytes to 32KB]"
+        return content
+    except Exception as e:
+        return f"Error reading file '{path}': {type(e).__name__}: {e}"
+
+
+@tool
+def list_dir(path: str = ".") -> str:
+    """List directory contents (sorted, capped at 200 entries).
+
+    Args:
+        path: Directory path to list.
+    """
+    try:
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            return f"Error: Directory '{path}' does not exist."
+        if not p.is_dir():
+            return f"Error: '{path}' is not a directory."
+        entries = sorted([e.name + ("/" if e.is_dir() else "") for e in p.iterdir()])
+        count = len(entries)
+        if count > 200:
+            entries = entries[:200]
+            entries.append(f"... ({count - 200} more entries omitted)")
+        return "\n".join(entries)
+    except Exception as e:
+        return f"Error listing directory '{path}': {type(e).__name__}: {e}"
+
+
+@tool
+def write_file(path: str, content: str) -> str:
+    """Write string content to a file.
+
+    Args:
+        path: Path to the target file.
+        content: Text content to write.
+    """
+    try:
+        p = Path(path).expanduser().resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"wrote {len(content.encode('utf-8'))} bytes to {path}"
+    except Exception as e:
+        return f"Error writing file '{path}': {type(e).__name__}: {e}"
+
+
+@tool
+def run_shell(command: str) -> str:
+    """Run a shell command with a 30s timeout and output capped at 8KB.
+
+    Args:
+        command: Shell command string to execute.
+    """
+    try:
+        res = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+        output = f"Exit Code: {res.returncode}\n"
+        if res.stdout:
+            output += f"STDOUT:\n{res.stdout}\n"
+        if res.stderr:
+            output += f"STDERR:\n{res.stderr}\n"
+        output_bytes = output.encode("utf-8")
+        max_bytes = 8 * 1024
+        if len(output_bytes) > max_bytes:
+            output = (
+                output_bytes[:max_bytes].decode("utf-8", errors="replace")
+                + "\n[Output truncated at 8KB]"
+            )
+        return output
+    except subprocess.TimeoutExpired:
+        return "Error: Command timed out after 30 seconds."
+    except Exception as e:
+        return f"Error running shell command: {type(e).__name__}: {e}"
+
+
+@tool
+def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """Edit a file by replacing old_string with new_string (max 1 MB).
+
+    Args:
+        path: Path to the file to edit.
+        old_string: Exact text to find and replace.
+        new_string: Replacement text.
+        replace_all: If True, replace all occurrences; otherwise error if more than one found.
+    """
+    try:
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            return f"error: file '{path}' does not exist"
+        if not p.is_file():
+            return f"error: '{path}' is not a file"
+        size = p.stat().st_size
+        if size > 1024 * 1024:
+            return f"error: file '{path}' is {size} bytes — exceeds 1 MB limit"
+        content = p.read_bytes().decode("utf-8", errors="replace")
+        count = content.count(old_string)
+        if count == 0:
+            return f"error: old_string not found in {path}"
+        if count > 1 and not replace_all:
+            return (
+                f"error: old_string appears {count} times in {path}; "
+                f"pass replace_all=True or provide more context"
+            )
+        updated = (
+            content.replace(old_string, new_string)
+            if replace_all
+            else content.replace(old_string, new_string, 1)
+        )
+        p.write_bytes(updated.encode("utf-8"))
+        replaced = count if replace_all else 1
+        return f"edited {path}: replaced {replaced} occurrence(s)"
+    except Exception as e:
+        return f"error editing file '{path}': {type(e).__name__}: {e}"
+
+
+@tool
+def grep(pattern: str, path: str = ".", glob: str = "*", max_results: int = 100) -> str:
+    """Search text files recursively for a regex pattern (case-sensitive, like grep).
+
+    Args:
+        pattern: Regular expression to search for.
+        path: Root directory to search (default: current directory).
+        glob: Shell glob to filter filenames (default: '*' matches all).
+        max_results: Maximum number of matching lines to return (default 100).
+    """
+    try:
+        root = Path(path).expanduser().resolve()
+        if not root.exists():
+            return f"error: path '{path}' does not exist"
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            return f"error: invalid regex '{pattern}': {e}"
+
+        results: list[str] = []
+        truncated = False
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for fname in sorted(filenames):
+                if not fnmatch.fnmatch(fname, glob):
+                    continue
+                fpath = Path(dirpath) / fname
+                try:
+                    with open(fpath, "rb") as fb:
+                        chunk = fb.read(8192)
+                    if b"\x00" in chunk:
+                        continue
+                except OSError:
+                    continue
+                try:
+                    relpath = fpath.relative_to(root)
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        for lineno, line in enumerate(f, 1):
+                            if rx.search(line):
+                                entry = f"{relpath}:{lineno}: {line.rstrip()}"
+                                results.append(entry[:300])
+                                if len(results) >= max_results:
+                                    truncated = True
+                                    break
+                    if truncated:
+                        break
+                except OSError:
+                    continue
+            if truncated:
+                break
+
+        if not results:
+            return f"no matches for '{pattern}' in {path}"
+        out = "\n".join(results)
+        return out + "\n… (truncated)" if truncated else out
+    except Exception as e:
+        return f"error during grep: {type(e).__name__}: {e}"
+
+
+@tool
+def find_files(pattern: str, path: str = ".", max_results: int = 200) -> str:
+    """Recursively find files whose name matches a shell glob pattern.
+
+    Args:
+        pattern: Shell glob pattern to match against filenames (e.g. '*.py').
+        path: Root directory to search (default: current directory).
+        max_results: Maximum number of results to return (default 200).
+    """
+    try:
+        root = Path(path).expanduser().resolve()
+        if not root.exists():
+            return f"error: path '{path}' does not exist"
+
+        matches: list[str] = []
+        truncated = False
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+            for fname in sorted(filenames):
+                if fnmatch.fnmatch(fname, pattern):
+                    fpath = Path(dirpath) / fname
+                    try:
+                        matches.append(str(fpath.relative_to(root)))
+                    except ValueError:
+                        matches.append(str(fpath))
+                    if len(matches) >= max_results:
+                        truncated = True
+                        break
+            if truncated:
+                break
+
+        if not matches:
+            return f"no files matching '{pattern}' found in {path}"
+        matches.sort()
+        out = "\n".join(matches)
+        return out + f"\n… (truncated at {max_results})" if truncated else out
+    except Exception as e:
+        return f"error during find_files: {type(e).__name__}: {e}"
+
+
+@tool
+def fetch_url(url: str, max_bytes: int = 8000) -> str:
+    """Fetch a URL via HTTP/HTTPS and return stripped text content.
+
+    Args:
+        url: The URL to fetch (http:// or https:// only).
+        max_bytes: Maximum response body bytes to return (default 8000).
+    """
+    try:
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return f"error: unsupported scheme in '{url}' — only http:// and https:// are allowed"
+        req = urllib.request.Request(url, headers={"User-Agent": "DeepSeek-CLI/0.3"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read(max_bytes + 1)
+        truncated = len(raw) > max_bytes
+        body = raw[:max_bytes].decode("utf-8", errors="replace")
+        if truncated:
+            body += "… (truncated)"
+        body = re.sub(r"<script[^>]*>.*?</script>", " ", body, flags=re.DOTALL | re.IGNORECASE)
+        body = re.sub(r"<style[^>]*>.*?</style>", " ", body, flags=re.DOTALL | re.IGNORECASE)
+        body = re.sub(r"<[^>]+>", " ", body)
+        return re.sub(r"\s+", " ", body).strip()
+    except urllib.error.HTTPError as e:
+        return f"error: HTTP {e.code} {e.reason} fetching '{url}'"
+    except urllib.error.URLError as e:
+        return f"error: URL error fetching '{url}': {e.reason}"
+    except TimeoutError:
+        return f"error: timed out fetching '{url}'"
+    except Exception as e:
+        return f"error fetching '{url}': {type(e).__name__}: {e}"
+
+
+def legacy_tools() -> list[Tool]:
+    """Return the legacy file-oriented tool tier."""
+    tools = [
+        read_file,
+        list_dir,
+        write_file,
+        run_shell,
+        edit_file,
+        grep,
+        find_files,
+        fetch_url,
+    ]
+    for tool_obj in tools:
+        tool_obj.eager = True
+        tool_obj.deferred = False
+    return tools
+
+
+def codex_default_tools(plan_enabled: bool = False,
+                        plan_mode: bool = False) -> list[Tool]:
+    """Return the eager Codex-style tool set."""
+    _ = (plan_enabled, plan_mode)
+    return [
+        exec_command,
+        write_stdin,
+        apply_patch,
+        search_tools,
+        update_plan,
+        request_user_input,
+    ]
+
+
+def build_tool_registry(
+    *,
+    legacy_enabled: bool,
+    plan_enabled: bool,
+    plan_mode: bool,
+    verbose: bool = True,
+) -> DeferredToolRegistry:
+    """Build the eager/deferred tool registry used by the CLI."""
+    eager = codex_default_tools(plan_enabled=plan_enabled, plan_mode=plan_mode)
+    if legacy_enabled:
+        eager.extend(legacy_tools())
+
+    deferred: list[Tool] = []
+    eager_names = {t.name for t in eager}
+    added: list[str] = []
+    for tool_obj in load_extensions():
+        if tool_obj.name in eager_names:
+            continue
+        if tool_obj.eager:
+            tool_obj.deferred = False
+            eager.append(tool_obj)
+            eager_names.add(tool_obj.name)
+        else:
+            tool_obj.deferred = True
+            deferred.append(tool_obj)
+        added.append(tool_obj.name)
+
+    if added and verbose:
+        sys.stderr.write(
+            f"[cli] loaded {len(added)} extension tool(s): {', '.join(added)}\n"
+        )
+    return DeferredToolRegistry(eager, deferred)
+
+
+def default_tools(verbose: bool = True) -> list[Tool]:
+    """Backward-compatible visible-tool helper."""
+    return build_tool_registry(
+        legacy_enabled=False,
+        plan_enabled=False,
+        plan_mode=False,
+        verbose=verbose,
+    ).visible_tools()
+
+
+BUILTIN_SLASH_COMMANDS = {
+    "/help": "show commands and usage",
+    "/new": "start a fresh thread",
+    "/thread": "print the current conversation_id",
+    "/clear": "clear the terminal display",
+    "/model": "show or set model: chat | expert",
+    "/thinking": "toggle DeepThink reasoning",
+    "/search": "toggle web search",
+    "/mode": "set approval mode: manual | auto",
+    "/tools": "set tools: off | manual | auto | list",
+    "/compact": "summarize and restart the context window",
+    "/plan": "show, clear, or resume the persistent plan",
+    "/extensions": "list loaded extensions and their tools",
+    "/reload": "reload extensions from disk",
+    "/exit": "quit",
+}
+
+_TIPS = [
+    "Use --json for one JSON object per line on stdout.",
+    "Use --tools manual to approve every tool call.",
+    "Use --resume <conversation_id> to continue a prior thread.",
+    "Use --thinking --show-thinking to inspect reasoning.",
+    "Type /help to list slash commands.",
+]
+
+
+def build_parser() -> UsageErrorParser:
+    p = UsageErrorParser(
+        prog="deepseek_cli.py",
+        description="Rich terminal client for chat.deepseek.com.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Exit codes:\n"
+            "  0 success   1 runtime error   2 auth required   3 usage error\n\n"
+            "Examples:\n"
+            '  python deepseek_cli.py "say hello"\n'
+            '  echo "hi" | python deepseek_cli.py\n'
+            '  python deepseek_cli.py --tools auto "what is the weather in Tokyo?"\n'
+        ),
+    )
+    p.add_argument("prompt", nargs="?", help="prompt for one-shot mode; omit for the REPL")
+    p.add_argument("--model", choices=sorted(MODEL_CHOICES), help="model alias: chat or expert")
+    p.add_argument("--thinking", action="store_true", help="enable DeepThink reasoning")
+    p.add_argument("--search", action="store_true", help="enable DeepSeek web search")
+    p.add_argument(
+        "--tools",
+        choices=("off", "manual", "auto"),
+        default="manual",
+        help="tool mode: off (strip tools), manual (approve), auto (unattended)",
+    )
+    p.add_argument("--show-thinking", action="store_true", help="display DeepThink reasoning")
+    p.add_argument("--json", action="store_true", help="emit JSONL events on stdout")
+    p.add_argument("--resume", metavar="CONVERSATION_ID", help="resume an existing thread")
+    p.add_argument("--no-stream", action="store_true", help="buffer the answer; do not stream tokens")
+    p.add_argument("--no-markdown", action="store_true",
+                   help="disable Markdown rendering during terminal streaming")
+    p.add_argument("--no-diff", action="store_true",
+                   help="suppress apply_patch diff previews")
+    p.add_argument("--legacy-tools", action="store_true",
+                   help="also expose the legacy file-oriented tool tier")
+    p.add_argument("--compact-at", type=int,
+                   help="compact when estimated context tokens exceed this value")
+    p.add_argument("--plan-mode", action="store_true",
+                   help="enable request_user_input for structured plan questions")
+    p.add_argument("--mode", choices=("normal", "agent"), default="normal",
+                   help="agent mode enables persistent plan tracking")
+    p.add_argument("--version", action="version", version=f"deepseek-cli {__version__}")
+    return p
+
+
+class DeepSeekCLI:
+    """Stateful Rich CLI shared by one-shot, piped, and interactive modes."""
+
+    def __init__(self, args: argparse.Namespace, parser: UsageErrorParser,
+                 interactive: bool, prompt: str | None):
+        self.args = args
+        self.parser = parser
+        self.interactive = interactive
+        self.json_mode = bool(args.json)
+        self.stream = not args.no_stream
+        self.no_markdown = bool(args.no_markdown)
+        self.no_diff = bool(args.no_diff)
+        self.show_thinking = bool(args.show_thinking)
+        self.model_alias = args.model or "chat"
+        self.model = MODEL_CHOICES[self.model_alias][0]
+        self.wire_model_first = MODEL_CHOICES[self.model_alias][1]
+        self.thinking = bool(args.thinking)
+        self.search = bool(args.search)
+        self.tools_mode = args.tools
+        self.mode = args.mode
+        self.legacy_tools_enabled = bool(args.legacy_tools)
+        self.autonomous = bool(args.tools == "auto" or args.mode == "agent")
+        self.plan_mode = bool(args.plan_mode or args.mode == "agent")
+        self.plan_enabled = bool(self.autonomous or self.plan_mode)
+        self.conversation_id = args.resume
+        self.context_chars = 0
+        self.client: DeepSeekClient | None = None
+        self.tools: list[Tool] = []
+        self.registry = DeferredToolRegistry()
+        self.plan_store = PlanStore()
+        self.compaction = CompactionManager(args.compact_at, plan_store=self.plan_store)
+        self.runtime = AgentRuntime(
+            conversation_id=self.conversation_id,
+            plan_mode=self.plan_mode,
+            autonomous=self.autonomous,
+            json_mode=bool(args.json),
+            interactive=interactive,
+            approval="auto" if self.tools_mode == "auto" else "manual",
+            ask=self._runtime_ask,
+            emit_plan=self._render_plan,
+            emit_file_change=self._render_file_change,
+            plan_store=self.plan_store,
+        )
+        self.extension_commands: dict[str, Callable] = {}
+        self.approved_tools: set[str] = set()
+        self._pending_tool_names: deque[str] = deque()
+        self._answer_parts: list[str] = []
+        self._thinking_parts: list[str] = []
+        self._answer_line_open = False
+        self._thinking_line_open = False
+        self._answer_line_buffer = ""
+        self._pending_compaction_prefix: str | None = None
+        self._summary_prefix_for_next_request: str | None = None
+        self._plan_injected_cid: str | None = None
+        self._turn_tool_result_chars = 0
+        self._json_tool_event_seen = False
+        self._json_answer_buffer = ""
+
+        stderr_ui = (not self.interactive) or self.json_mode
+        self.ui = Console(stderr=stderr_ui, highlight=False, soft_wrap=True)
+        self.out = Console(highlight=False, soft_wrap=True)
+
+    # ----- output ----------------------------------------------------------
+
+    def emit(self, message: str = "", kind: str = "system", **fields: Any) -> None:
+        """Public extension-friendly helper: emit a system or JSON event."""
+        if kind != "system":
+            self.emit_event(kind, message, **fields)
+        else:
+            self._render_system(str(message))
+
+    def emit_event(self, kind: str, text: str = "", **fields: Any) -> None:
+        if self.json_mode:
+            if kind == "answer" and not self._json_tool_event_seen:
+                self._json_answer_buffer += text
+                return
+            event = {"kind": kind, **fields}
+            if kind in {"answer", "thinking"}:
+                event["text"] = text
+            elif kind == "tool_result":
+                event["result"] = text
+            elif kind == "error":
+                event["message"] = fields.get("message", text)
+            elif kind == "system":
+                event["text"] = text
+            if kind in {"tool_call", "tool_result"}:
+                self._json_tool_event_seen = True
+            try:
+                sys.stdout.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+                sys.stdout.flush()
+            except BrokenPipeError:
+                raise
+            return
+
+        if kind == "answer":
+            if not self._answer_line_open:
+                self._close_thinking_line()
+                self.out.print("\n[bold green]Assistant[/]")
+                self._answer_line_open = True
+            self._emit_answer_text(text)
+        elif kind == "thinking":
+            if self.show_thinking:
+                if not self._thinking_line_open:
+                    self.ui.print("\n[dim]Thinking[/]")
+                    self._thinking_line_open = True
+                self.ui.print(text, end="", markup=False, highlight=False)
+        elif kind == "tool_call":
+            self._close_answer_line()
+            args = json.dumps(fields.get("arguments", {}), ensure_ascii=False)
+            self.ui.print(
+                f"\n[bold yellow]tool[/] [cyan]{fields.get('name', 'unknown')}[/] "
+                f"[dim]{args}[/]"
+            )
+        elif kind == "tool_result":
+            result = self._short_result(text)
+            self.ui.print(
+                f"[dim]  result[/] [cyan]{fields.get('name', 'unknown')}[/] "
+                f"[dim]{result}[/]"
+            )
+        elif kind == "system":
+            self._render_system(text)
+        elif kind == "error":
+            self._render_error(fields.get("message", text))
+
+    def _render_system(self, message: str) -> None:
+        if self.json_mode:
+            return
+        if message:
+            self.ui.print(message)
+
+    def _render_error(self, message: str) -> None:
+        if self.json_mode:
+            return
+        self.ui.print(f"[bold red]error:[/] {message}")
+
+    def _close_answer_line(self) -> None:
+        if self._answer_line_buffer:
+            self.out.print(Markdown(self._answer_line_buffer))
+            self._answer_line_buffer = ""
+        if self._answer_line_open:
+            self.out.print()
+            self._answer_line_open = False
+
+    def _markdown_streaming_enabled(self) -> bool:
+        return (
+            not self.json_mode
+            and not self.no_markdown
+            and sys.stdout.isatty()
+        )
+
+    def _emit_answer_text(self, text: str) -> None:
+        if not self._markdown_streaming_enabled():
+            self.out.print(text, end="", markup=False, highlight=False)
+            return
+        self._answer_line_buffer += text
+        while "\n" in self._answer_line_buffer:
+            line, self._answer_line_buffer = self._answer_line_buffer.split("\n", 1)
+            self.out.print(Markdown(line.rstrip("\r")))
+
+    def _close_thinking_line(self) -> None:
+        if self._thinking_line_open:
+            self.ui.print()
+            self._thinking_line_open = False
+
+    @staticmethod
+    def _short_result(result: str, limit: int = 220) -> str:
+        first = (result or "").strip().splitlines()[0] if (result or "").strip() else ""
+        return first if len(first) <= limit else first[: limit - 1] + "…"
+
+    # ----- startup UI ------------------------------------------------------
+
+    def render_startup(self) -> None:
+        if self.json_mode:
+            return
+        try:
+            width = min(self.ui.width, 100)
+        except Exception:
+            width = 80
+        version_line = f"deepseek-cli v{__version__}  ·  model {self.model}"
+        update = os.getenv("DEEPSEEK_CLI_UPDATE_NOTICE")
+        body = version_line
+        if update:
+            body += f"\n[bold yellow]update:[/] {update}"
+        self.ui.print(Panel(body, title="DeepSeek CLI", box=box.ROUNDED, width=width))
+
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="bold")
+        table.add_column()
+        table.add_row("Model", self.model)
+        table.add_row("Directory", str(Path.cwd()))
+        table.add_row("Permissions", f"tools={self.tools_mode}")
+        table.add_row("DeepThink", "on" if self.thinking else "off")
+        table.add_row("Web search", "on" if self.search else "off")
+        table.add_row("Tool mode", self.tools_mode)
+        table.add_row("Agent mode", self.mode)
+        table.add_row("Deferred tools", str(len(self.registry.deferred_tools)))
+        table.add_row("Compact at", f"{self.compaction.threshold:,} tokens")
+        table.add_row("Thread", self.short_thread())
+        table.add_row("Context", self.context_estimate())
+        self.ui.print(Panel(table, title="Session", box=box.SQUARE, width=width))
+        self.ui.print(f"[dim]Tip: {random.choice(_TIPS)}[/]")
+
+    def short_thread(self) -> str:
+        if not self.conversation_id:
+            return "(new)"
+        sid = self.conversation_id.split(":", 1)[0]
+        return sid[:12] + "…" if len(sid) > 12 else sid
+
+    def context_estimate(self) -> str:
+        tokens = max(0, self.context_chars // 4)
+        return f"~{tokens:,} tokens (estimate)"
+
+    def render_status(self) -> None:
+        if self.json_mode:
+            return
+        text = Text()
+        text.append(self.model, style="bold")
+        text.append(f" · {self.mode}/{self.tools_mode} · {self.short_thread()} · ")
+        text.append(f"ctx ~{max(0, self.context_chars // 4):,} tok · ", style="dim")
+        text.append("/help · /new · /exit", style="dim")
+        self.ui.print(text)
+
+    # ----- auth/client -----------------------------------------------------
+
+    def session_refreshed(self, message: str) -> None:
+        self._render_system(f"[yellow]{message}[/]")
+
+    def init_client(self) -> None:
+        try:
+            if self.json_mode:
+                with contextlib.redirect_stdout(sys.stderr):
+                    self.client = DeepSeekClient(
+                        allow_interactive=True,
+                        on_session_refresh=self.session_refreshed,
+                    )
+            else:
+                self.client = DeepSeekClient(
+                    allow_interactive=True,
+                    on_session_refresh=self.session_refreshed,
+                )
+        except LoginRequired as e:
+            self.emit_event("error", message=str(e))
+            raise SystemExit(EXIT_AUTH)
+        except Exception as e:
+            self.emit_event("error", message=f"failed to initialise session: {e}")
+            raise SystemExit(EXIT_RUNTIME)
+
+        self.reload_tools()
+        self.extension_commands = load_extension_commands()
+        self.runtime.conversation_id = self.conversation_id
+        self.runtime.tool_registry = self.registry
+        set_agent_runtime(self.runtime)
+        self._load_and_show_resumed_plan()
+        self.configure_readline()
+
+    def reload_tools(self) -> None:
+        self.registry = build_tool_registry(
+            legacy_enabled=self.legacy_tools_enabled,
+            plan_enabled=self.plan_enabled,
+            plan_mode=self.plan_mode,
+            verbose=not self.json_mode,
+        )
+        self.tools = self.registry.visible_tools()
+        self.runtime.tool_registry = self.registry
+        set_agent_runtime(self.runtime)
+
+    def _runtime_ask(self, prompt: str) -> str:
+        if self.json_mode:
+            sys.stderr.write(prompt)
+            sys.stderr.flush()
+            return sys.stdin.readline().strip()
+        try:
+            return input(prompt).strip()
+        except EOFError:
+            return ""
+
+    def _render_plan(self, plan: list[dict[str, Any]]) -> None:
+        self._plan_injected_cid = self.conversation_id
+        checklist = render_checklist(plan)
+        if self.json_mode:
+            self.emit_event("plan", plan=plan)
+        else:
+            self._render_system(f"[bold]Plan[/]\n{checklist}")
+
+    def _render_file_change(self, path: str, additions: int,
+                            deletions: int, diff_text: str) -> None:
+        if self.no_diff:
+            return
+        if self.json_mode:
+            self.emit_event(
+                "file_change",
+                path=path,
+                additions=additions,
+                deletions=deletions,
+                diff=diff_text,
+            )
+            return
+        if sys.stdout.isatty():
+            self.ui.print(
+                Panel(
+                    Syntax(diff_text or "(no textual diff)", "diff", theme="monokai"),
+                    title=path,
+                )
+            )
+            return
+        if diff_text:
+            self.out.print(diff_text, markup=False, highlight=False)
+
+    def _load_and_show_resumed_plan(self) -> None:
+        if not self.conversation_id:
+            return
+        data = self.plan_store.load(self.conversation_id)
+        if data and data.get("plan"):
+            self._render_plan(data["plan"])
+            self._plan_injected_cid = None
+
+    def configure_readline(self) -> None:
+        if readline is None:
+            return
+        commands = sorted(set(BUILTIN_SLASH_COMMANDS) | set(self.extension_commands))
+
+        def completer(text: str, state: int) -> str | None:
+            if not text.startswith("/"):
+                return None
+            options = [cmd for cmd in commands if cmd.startswith(text)]
+            return options[state] if state < len(options) else None
+
+        readline.set_completer(completer)
+        readline.set_completer_delims(" \t\n")
+        try:
+            readline.parse_and_bind("tab: complete")
+        except Exception:
+            pass
+
+    # ----- turn execution --------------------------------------------------
+
+    def run_prompt(self, prompt: str) -> int:
+        if self.client is None:
+            self.init_client()
+        assert self.client is not None
+
+        self._pending_tool_names.clear()
+        self._answer_parts = []
+        self._thinking_parts = []
+        self._answer_line_open = False
+        self._thinking_line_open = False
+        self._json_tool_event_seen = False
+        self._json_answer_buffer = ""
+        self._turn_tool_result_chars = 0
+
+        if not self.json_mode and not self.interactive:
+            self.render_startup()
+            self.render_status()
+
+        self._maybe_compact_before_turn()
+        prompt = self._prepare_prompt(prompt)
+
+        try:
+            if self.tools_mode == "off" or not self.tools:
+                return self._run_plain_turn(prompt)
+            return self._run_agent_turn(prompt)
+        except KeyboardInterrupt:
+            self._close_answer_line()
+            self.emit_event("error", message="interrupted")
+            return EXIT_INTERRUPTED
+        except BrokenPipeError:
+            raise
+        except LoginRequired as e:
+            self.emit_event("error", message=str(e))
+            return EXIT_AUTH
+        except Exception as e:
+            self._close_answer_line()
+            self.emit_event("error", message=f"{type(e).__name__}: {e}")
+            return EXIT_RUNTIME
+
+    def _run_plain_turn(self, prompt: str) -> int:
+        assert self.client is not None
+        if self._summary_prefix_for_next_request:
+            prompt = self._summary_prefix_for_next_request + "\n\n" + prompt
+            self._summary_prefix_for_next_request = None
+        wire_model = self.wire_model_first if self.conversation_id is None else None
+        if self.stream:
+            stream = self.client.stream(
+                prompt,
+                conversation_id=self.conversation_id,
+                model=wire_model,
+                thinking=self.thinking,
+                search=self.search,
+            )
+            for kind, text in stream.iter_parts():
+                self._handle_part(kind, text)
+            new_cid = stream.conversation_id
+        else:
+            reply = self.client.chat(
+                prompt,
+                conversation_id=self.conversation_id,
+                model=wire_model,
+                thinking=self.thinking,
+                search=self.search,
+            )
+            if reply.thinking:
+                self._handle_part("thinking", reply.thinking)
+            self._handle_part("answer", reply.text)
+            new_cid = reply.conversation_id
+        self._finish_turn(prompt, new_cid)
+        return EXIT_OK
+
+    def _run_agent_turn(self, prompt: str) -> int:
+        assert self.client is not None
+        approval: str | Callable[[ToolCall], bool | tuple[bool, bool]]
+        approval = "auto" if self.tools_mode == "auto" else self._approval_callback
+        executor = ToolExecutor(approval=approval)
+        current_prompt = prompt
+        current_cid = self.conversation_id
+        wire_model = self.wire_model_first if current_cid is None else None
+        turn_prompt_chars = 0
+        summary_prefix = self._summary_prefix_for_next_request
+        self._summary_prefix_for_next_request = None
+
+        for iteration in range(8):
+            visible = self.registry.visible_tools()
+            schema = json.dumps([tool_obj.schema() for tool_obj in visible], indent=2)
+            tool_prompt = (
+                self.client._tool_prompt(current_prompt, schema, current_cid)
+                if visible
+                else current_prompt
+            )
+            request_prompt = (
+                summary_prefix + "\n\n" + tool_prompt
+                if iteration == 0 and summary_prefix
+                else tool_prompt
+            )
+            turn_prompt_chars += len(request_prompt)
+
+            stream = self.client.stream(
+                request_prompt,
+                conversation_id=current_cid,
+                model=wire_model if iteration == 0 else None,
+                thinking=self.thinking,
+                search=self.search,
+            )
+            for kind, text in stream.iter_parts():
+                self._handle_part(kind, text)
+
+            current_cid = stream.conversation_id
+            self.conversation_id = current_cid
+            self.runtime.conversation_id = current_cid
+            if visible:
+                self.client._remember_tool_prompt(schema, current_cid)
+
+            if not stream.tool_calls:
+                self.registry.finish_iteration()
+                break
+
+            if self.tools_mode == "manual":
+                decisions = self._approve_tool_batch(stream.tool_calls)
+                results = executor.execute(stream.tool_calls, visible, decisions=decisions)
+            else:
+                results = executor.execute(stream.tool_calls, visible)
+            for call, result in results:
+                self._turn_tool_result_chars += len(result)
+                self._emit_tool_result(call, result)
+            self.registry.finish_iteration()
+            current_prompt = self.client._tool_result_prompt(results)
+            wire_model = None
+
+        self._finish_turn(prompt, current_cid, prefix_chars=turn_prompt_chars)
+        return EXIT_OK
+
+    def _finish_turn(self, prompt: str, new_cid: str | None,
+                     prefix_chars: int | None = None) -> None:
+        if not self.stream:
+            thinking = "".join(self._thinking_parts)
+            answer = "".join(self._answer_parts)
+            if thinking:
+                self.emit_event("thinking", thinking)
+            if answer:
+                self.emit_event("answer", answer)
+
+        self._close_answer_line()
+        self._close_thinking_line()
+        self._flush_json_answer()
+        if new_cid:
+            self.conversation_id = new_cid
+            self.runtime.conversation_id = new_cid
+            if not self.interactive and not self.json_mode:
+                self.ui.print(f"[dim]conversation_id = {new_cid}[/]")
+        prompt_chars = prefix_chars if prefix_chars is not None else len(prompt)
+        self.context_chars += (
+            prompt_chars
+            + len("".join(self._answer_parts))
+            + len("".join(self._thinking_parts))
+            + self._turn_tool_result_chars
+        )
+
+    def _flush_json_answer(self) -> None:
+        if not self.json_mode or not self._json_answer_buffer:
+            return
+        text = self._json_answer_buffer
+        self._json_answer_buffer = ""
+        event = {"kind": "answer", "text": text}
+        try:
+            sys.stdout.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+            sys.stdout.flush()
+        except BrokenPipeError:
+            raise
+
+    def _emit_tool_result(self, call: ToolCall, result: str) -> None:
+        self.emit_event("tool_result", self._short_result(result, limit=500), name=call.name)
+
+    def _maybe_compact_before_turn(self) -> None:
+        if not self.conversation_id:
+            return
+        if not self.compaction.should_compact(self.context_chars):
+            return
+        self._run_compaction()
+
+    def _run_compaction(self) -> bool:
+        assert self.client is not None
+        try:
+            result = self.compaction.compact(
+                self.client,
+                self.conversation_id,
+                plan_enabled=self.plan_enabled,
+            )
+        except Exception as exc:
+            self.emit_event("error", message=f"Compaction failed: {type(exc).__name__}: {exc}")
+            return False
+        if result is None:
+            return False
+        self.conversation_id = result.new_conversation_id
+        self.runtime.conversation_id = result.new_conversation_id
+        self._pending_compaction_prefix = result.prefix
+        self.context_chars = len(result.prefix)
+        self._plan_injected_cid = None
+        self._render_system(
+            "Context compacted. New thread: "
+            f"[bold]{result.new_conversation_id}[/]. Previous summary saved to "
+            f"[bold]{result.summary_path}[/]."
+        )
+        self.emit_event(
+            "compaction",
+            old_cid=result.old_conversation_id,
+            new_cid=result.new_conversation_id,
+            summary_path=str(result.summary_path),
+        )
+        if result.warning:
+            self._render_system(f"[yellow]{result.warning}[/]")
+        return True
+
+    def _prepare_prompt(self, prompt: str) -> str:
+        if self._pending_compaction_prefix:
+            self._summary_prefix_for_next_request = self._pending_compaction_prefix
+            self._pending_compaction_prefix = None
+            if not self.json_mode:
+                self._render_system(
+                    "[dim]Prepended previous-conversation summary to the new session.[/]"
+                )
+            else:
+                sys.stderr.write("[compaction] summary prepended to new session\n")
+        if self.conversation_id and self._plan_injected_cid != self.conversation_id:
+            plan_prompt = self.plan_store.make_resume_prompt(self.conversation_id)
+            if plan_prompt:
+                prompt = plan_prompt + "\n\nUser: " + prompt
+                self._plan_injected_cid = self.conversation_id
+                if not self.json_mode:
+                    self._render_system("[dim]Injected active plan from previous session.[/]")
+        return prompt
+
+    def _handle_part(self, kind: str, text: str) -> None:
+        if kind == "answer":
+            text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
+            if not text:
+                return
+            self._answer_parts.append(text)
+            if self.stream:
+                self.emit_event("answer", text)
+        elif kind == "thinking":
+            self._thinking_parts.append(text)
+            if self.stream:
+                self.emit_event("thinking", text)
+        elif kind == "tool_call":
+            name, arguments = self._parse_tool_call(text)
+            self._pending_tool_names.append(name)
+            self.emit_event("tool_call", name=name, arguments=arguments)
+        elif kind == "tool_result":
+            name = self._pending_tool_names.popleft() if self._pending_tool_names else "unknown"
+            result = self._short_result(text, limit=500)
+            self.emit_event("tool_result", result, name=name)
+        else:
+            self._render_system(f"[dim]{text}[/]")
+
+    @staticmethod
+    def _parse_tool_call(text: str) -> tuple[str, dict]:
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return str(data.get("name", "unknown")), dict(data.get("arguments", {}))
+        except Exception:
+            pass
+        return "unknown", {"raw": text}
+
+    def _approval_callback(self, call: ToolCall) -> tuple[bool, bool]:
+        if call.name in self.approved_tools:
+            return True, False
+        arg_text = json.dumps(call.arguments, ensure_ascii=False)
+        prompt = (
+            f"Approve {call.name}({arg_text})? "
+            "[y]es / [n]o / [a]lways: "
+        )
+        if self.json_mode:
+            sys.stderr.write(prompt)
+            sys.stderr.flush()
+            response = sys.stdin.readline().strip().lower()
+        else:
+            try:
+                response = input(prompt).strip().lower()
+            except EOFError:
+                response = ""
+        if response in ("y", "yes"):
+            return True, False
+        if response in ("a", "always"):
+            self.approved_tools.add(call.name)
+            return True, True
+        return False, False
+
+    def _prompt_approval(self, prompt: str) -> str:
+        if self.json_mode:
+            sys.stderr.write(prompt)
+            sys.stderr.flush()
+            return sys.stdin.readline().strip()
+        try:
+            return input(prompt).strip()
+        except EOFError:
+            return ""
+
+    def _approve_tool_batch(self, calls: list[ToolCall]) -> list[bool]:
+        if not calls:
+            return []
+        headers = []
+        for idx, call in enumerate(calls, 1):
+            args = json.dumps(call.arguments, ensure_ascii=False)
+            headers.append(f"{idx}. {call.name} {args}")
+        batch_text = "Pending tool calls:\n" + "\n".join(headers)
+        if self.json_mode:
+            sys.stderr.write(batch_text + "\n")
+            sys.stderr.flush()
+        else:
+            self.ui.print(batch_text)
+
+        metadata = {"update_plan", "request_user_input"}
+        always_names: set[str] = set()
+        approve_all = False
+        reject_all = False
+        decisions: list[bool] = []
+        for call in calls:
+            if call.name in metadata:
+                decisions.append(True)
+                continue
+            if approve_all:
+                decisions.append(True)
+                continue
+            if reject_all:
+                decisions.append(False)
+                continue
+            if call.name in always_names:
+                decisions.append(True)
+                continue
+            response = self._prompt_approval(
+                f"Approve {call.name}? [y]es/[n]o/[a]lways/[A]ll/[q]uit: "
+            )
+            if response == "y":
+                decisions.append(True)
+            elif response == "n":
+                decisions.append(False)
+            elif response == "a":
+                always_names.add(call.name)
+                decisions.append(True)
+            elif response == "A":
+                approve_all = True
+                decisions.append(True)
+            elif response == "q":
+                reject_all = True
+                decisions.append(False)
+            else:
+                decisions.append(False)
+        return decisions
+
+    # ----- REPL and slash commands ----------------------------------------
+
+    def run_repl(self) -> int:
+        self.init_client()
+        self.render_startup()
+        if readline is not None:
+            hist = Path.home() / ".deepseek_cli_history"
+            try:
+                if hist.exists():
+                    readline.read_history_file(str(hist))
+                readline.set_history_length(1000)
+            except Exception:
+                pass
+        try:
+            while True:
+                self.render_status()
+                try:
+                    raw = input("> ")
+                except EOFError:
+                    self.ui.print()
+                    break
+                except KeyboardInterrupt:
+                    self.ui.print("\n[dim]Use /exit to quit.[/]")
+                    continue
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("/"):
+                    code = self.handle_command(line)
+                    if code is not None:
+                        return code
+                else:
+                    code = self.run_prompt(line)
+                    if code == EXIT_AUTH:
+                        return code
+                    if code not in (EXIT_OK, EXIT_INTERRUPTED):
+                        self.emit_event("error", message=f"turn failed with exit code {code}")
+        finally:
+            if readline is not None:
+                hist = Path.home() / ".deepseek_cli_history"
+                try:
+                    readline.write_history_file(str(hist))
+                except Exception:
+                    pass
+            if self.client is not None:
+                self.client.close()
+        return EXIT_OK
+
+    def handle_command(self, line: str) -> int | None:
+        cmd, _, arg = line.partition(" ")
+        cmd = cmd.lower()
+        arg = arg.strip()
+
+        if cmd in ("/exit", "/quit"):
+            return EXIT_OK
+        if cmd in ("/help", "/?"):
+            self.show_help()
+        elif cmd == "/new":
+            self.conversation_id = None
+            self.approved_tools.clear()
+            self.context_chars = 0
+            self._pending_compaction_prefix = None
+            self._plan_injected_cid = None
+            self.runtime.conversation_id = None
+            self._render_system("[green]Started a new thread.[/]")
+        elif cmd == "/thread":
+            self._render_system(
+                f"conversation_id = [bold]{self.conversation_id or '(none yet)'}[/]"
+            )
+        elif cmd == "/clear":
+            self.ui.clear()
+            self.out.clear()
+            self._render_system("[green]Display cleared.[/]")
+        elif cmd == "/compact":
+            if not self.conversation_id:
+                self._render_system("[yellow]No active conversation to compact.[/]")
+            else:
+                self._run_compaction()
+                self._render_system(
+                    "[green]Compaction complete.[/] The summary will prefix the next user message."
+                )
+        elif cmd == "/plan":
+            self.command_plan(arg)
+        elif cmd == "/model":
+            self.command_model(arg)
+        elif cmd == "/thinking":
+            self.command_toggle("thinking", arg)
+        elif cmd == "/search":
+            self.command_toggle("search", arg)
+        elif cmd == "/mode":
+            self.command_mode(arg)
+        elif cmd == "/tools":
+            self.command_tools(arg)
+        elif cmd == "/extensions":
+            self.ui.print(extension_report())
+        elif cmd == "/reload":
+            reload_extensions()
+            self.reload_tools()
+            self.extension_commands = load_extension_commands()
+            self.configure_readline()
+            self._render_system("[green]Extensions reloaded.[/]")
+        elif cmd in self.extension_commands:
+            self.run_extension_command(cmd, arg)
+        else:
+            self._render_system(f"[red]Unknown command {cmd}[/] — try /help")
+        return None
+
+    def show_help(self) -> None:
+        table = Table(title="Slash commands", box=box.SIMPLE)
+        table.add_column("Command", style="bold cyan")
+        table.add_column("Effect")
+        for cmd, desc in BUILTIN_SLASH_COMMANDS.items():
+            table.add_row(cmd, desc)
+        for cmd in sorted(self.extension_commands):
+            table.add_row(cmd, "extension command")
+        self.ui.print(table)
+        self.ui.print(
+            "[dim]Flags are available on startup: --model, --thinking, --search, "
+            "--tools, --show-thinking, --json, --resume, --no-stream, "
+            "--legacy-tools, --compact-at, --plan-mode, --mode.[/]"
+        )
+
+    def command_model(self, arg: str) -> None:
+        if not arg:
+            self._render_system(
+                f"model = [bold]{self.model}[/] (aliases: chat, expert)"
+            )
+            return
+        if arg not in MODEL_CHOICES:
+            self._render_system("[red]Usage: /model chat | expert[/]")
+            return
+        self.model_alias = arg
+        self.model = MODEL_CHOICES[arg][0]
+        self.wire_model_first = MODEL_CHOICES[arg][1]
+        suffix = (
+            " [dim](current thread keeps its original model; use /new to switch)[/]"
+            if self.conversation_id
+            else ""
+        )
+        self._render_system(f"Model → [bold]{self.model}[/]{suffix}")
+
+    def command_toggle(self, attr: str, arg: str) -> None:
+        if arg in ("on", "off"):
+            value = arg == "on"
+        elif arg:
+            self._render_system(f"[red]Usage: /{attr} on | off[/]")
+            return
+        else:
+            value = not getattr(self, attr)
+        setattr(self, attr, value)
+        label = "DeepThink" if attr == "thinking" else "Web search"
+        self._render_system(f"{label} → [bold]{'on' if value else 'off'}[/]")
+
+    def command_mode(self, arg: str) -> None:
+        if arg in ("manual", "auto"):
+            self.tools_mode = arg
+            self.autonomous = bool(arg == "auto" or self.mode == "agent")
+            self.plan_enabled = bool(self.autonomous or self.plan_mode)
+            self.reload_tools()
+            self._render_system(f"Tool mode → [bold]{arg}[/]")
+        elif not arg:
+            self._render_system(f"tool mode = [bold]{self.tools_mode}[/]")
+        else:
+            self._render_system("[red]Usage: /mode manual | auto[/]")
+
+    def command_plan(self, arg: str) -> None:
+        cid = self.conversation_id
+        if arg == "clear":
+            removed = self.plan_store.clear(cid)
+            self._render_system(
+                "[green]Plan cleared.[/]" if removed else "[yellow]No plan to clear.[/]"
+            )
+            return
+        if arg == "resume":
+            data = self.plan_store.load(cid)
+            if not data or not data.get("plan"):
+                self._render_system("[yellow]No plan found.[/]")
+                return
+            plan = list(data["plan"])
+            if not any(item.get("status") == "in_progress" for item in plan):
+                for item in plan:
+                    if item.get("status") == "pending":
+                        item["status"] = "in_progress"
+                        break
+                self.plan_store.save(cid, plan, explanation="/plan resume")
+            self._plan_injected_cid = None
+            self._render_plan(plan)
+            self._plan_injected_cid = None
+            return
+        if arg:
+            self._render_system("[red]Usage: /plan [clear|resume][/]")
+            return
+        data = self.plan_store.load(cid)
+        if not data or not data.get("plan"):
+            self._render_system("[yellow]No active plan.[/]")
+            return
+        self._render_plan(data["plan"])
+
+    def command_tools(self, arg: str) -> None:
+        if arg in ("off", "manual", "auto"):
+            self.tools_mode = arg
+            self.autonomous = bool(arg == "auto" or self.mode == "agent")
+            self.plan_enabled = bool(self.autonomous or self.plan_mode)
+            self.reload_tools()
+            self._render_system(f"Tools → [bold]{arg}[/]")
+        elif arg == "list" or not arg:
+            table = Table(title="Registered tools", box=box.SIMPLE)
+            table.add_column("Tool", style="bold cyan")
+            table.add_column("Tier")
+            table.add_column("Description")
+            for tool_obj in self.registry.eager_tools:
+                tier = "eager"
+                table.add_row(tool_obj.name, tier, tool_obj.description or "")
+            for tool_obj in self.registry.deferred_tools:
+                table.add_row(tool_obj.name, "deferred", tool_obj.description or "")
+            self.ui.print(table)
+        else:
+            self._render_system("[red]Usage: /tools off | manual | auto | list[/]")
+
+    def run_extension_command(self, cmd: str, arg: str) -> None:
+        fn = self.extension_commands[cmd]
+        stdout = io.StringIO()
+        result: Any = None
+        try:
+            with contextlib.redirect_stdout(stdout):
+                sig = inspect.signature(fn)
+                params = list(sig.parameters.values())
+                if any(p.kind is p.VAR_POSITIONAL for p in params):
+                    result = fn(self)
+                else:
+                    positional = [
+                        p for p in params
+                        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                    ]
+                    required = [p for p in positional if p.default is p.empty]
+                    if positional and (required or len(positional) == 1):
+                        first_name = positional[0].name
+                        context = (
+                            self.emit
+                            if first_name in {"emit", "output", "write", "console"}
+                            else self
+                        )
+                        result = fn(context)
+                    else:
+                        result = fn()
+        except Exception as e:
+            self._render_system(f"[red]{cmd} failed:[/] {type(e).__name__}: {e}")
+            return
+        captured = stdout.getvalue().strip()
+        if captured:
+            self._render_system(captured)
+        if result is not None:
+            self._render_system(str(result))
+        if not captured and result is None:
+            self._render_system(f"[dim]{cmd} completed.[/]")
+
+
+def read_prompt(args: argparse.Namespace, parser: UsageErrorParser) -> tuple[bool, str | None]:
+    """Return (interactive, prompt). Raise parser.error on invalid combinations."""
+    if args.resume and args.model:
+        parser.error("--model cannot be combined with --resume; a thread's model is fixed")
+    if args.json and args.prompt is None and sys.stdin.isatty():
+        parser.error("--json requires a prompt or piped stdin")
+    if args.show_thinking and not args.thinking:
+        # This is legal, but almost always a mistake. Keep it non-fatal and
+        # explicit instead of silently enabling DeepThink.
+        sys.stderr.write("[cli] note: --show-thinking has no effect without --thinking\n")
+
+    if args.prompt is not None:
+        return False, args.prompt
+    if not sys.stdin.isatty():
+        prompt = sys.stdin.read().strip()
+        if not prompt:
+            parser.error("no prompt provided on stdin")
+        return False, prompt
+    return True, None
+
+
+def _redirect_stdout_to_devnull() -> None:
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.close(devnull)
+    except OSError:
+        pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if "--json" in argv_list and ("--help" in argv_list or "-h" in argv_list):
+        parser = build_parser()
+        text = parser.format_help()
+        try:
+            sys.stdout.write(json.dumps({"kind": "help", "text": text}) + "\n")
+            sys.stdout.flush()
+            return EXIT_OK
+        except BrokenPipeError:
+            _redirect_stdout_to_devnull()
+            return EXIT_SIGPIPE
+    parser = build_parser()
+    parser.json_errors = "--json" in argv_list
+    args = parser.parse_args(argv_list)
+    interactive, prompt = read_prompt(args, parser)
+    app = DeepSeekCLI(args, parser, interactive=interactive, prompt=prompt)
+    try:
+        if interactive:
+            return app.run_repl()
+        assert prompt is not None
+        return app.run_prompt(prompt)
+    except KeyboardInterrupt:
+        app.emit_event("error", message="interrupted")
+        return EXIT_INTERRUPTED
+    except BrokenPipeError:
+        _redirect_stdout_to_devnull()
+        return EXIT_SIGPIPE
+    finally:
+        if app.client is not None:
+            app.client.close()
+
+
+if __name__ == "__main__":
+    try:
+        _exit_code = main()
+    except BrokenPipeError:
+        _redirect_stdout_to_devnull()
+        _exit_code = EXIT_SIGPIPE
+    raise SystemExit(_exit_code)

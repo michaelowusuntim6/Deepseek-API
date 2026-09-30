@@ -1,5 +1,5 @@
 """
-weather.py — DeepSeek TUI extension: get current weather via Open-Meteo.
+weather.py — DeepSeek CLI extension: get current weather via Open-Meteo.
 
 Drop this file into ~/.deepseek-tui/extensions/ and restart (or /reload).
 
@@ -41,7 +41,7 @@ def get_weather(city: str, unit: str = "celsius") -> str:
             "format": "json",
         })
         geo_url = f"https://geocoding-api.open-meteo.com/v1/search?{geo_params}"
-        req = urllib.request.Request(geo_url, headers={"User-Agent": "DeepSeek-TUI-ext/1.0"})
+        req = urllib.request.Request(geo_url, headers={"User-Agent": "DeepSeek-CLI-ext/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             geo_data = json.loads(resp.read().decode("utf-8"))
 
@@ -64,7 +64,7 @@ def get_weather(city: str, unit: str = "celsius") -> str:
             "timezone": "auto",
         })
         wx_url = f"https://api.open-meteo.com/v1/forecast?{wx_params}"
-        req = urllib.request.Request(wx_url, headers={"User-Agent": "DeepSeek-TUI-ext/1.0"})
+        req = urllib.request.Request(wx_url, headers={"User-Agent": "DeepSeek-CLI-ext/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             wx_data = json.loads(resp.read().decode("utf-8"))
 

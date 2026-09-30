@@ -8,6 +8,7 @@ import functools
 import inspect
 import json
 import sys
+import types
 import typing
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, get_type_hints
@@ -33,6 +34,9 @@ class Tool:
     description: str
     parameters: dict
     fn: Callable
+    deferred: bool = True
+    eager: bool = False
+    read_only: Optional[bool] = None
 
     def call(self, **kwargs) -> str:
         """Invoke fn, coercing the result to a string."""
@@ -100,13 +104,17 @@ def _type_to_schema(tp: Any, tool_name: str, param_name: str) -> dict:
     if tp is bool:
         return {"type": "boolean"}
     if tp is list or typing.get_origin(tp) is list:
-        return {"type": "array"}
+        item_args = typing.get_args(tp)
+        schema: dict[str, Any] = {"type": "array"}
+        if item_args:
+            schema["items"] = _type_to_schema(item_args[0], tool_name, param_name)
+        return schema
     if tp is dict or typing.get_origin(tp) is dict:
         return {"type": "object"}
 
     # Handle Optional[X] or Union[X, None]
     origin = typing.get_origin(tp)
-    if origin is typing.Union:
+    if origin is typing.Union or origin is types.UnionType:
         args = [a for a in typing.get_args(tp) if a is not type(None)]
         if args:
             return _type_to_schema(args[0], tool_name, param_name)
@@ -168,7 +176,22 @@ def tool(fn_or_name: Any = None, **kwargs) -> Any:
         if required:
             parameters["required"] = required
 
-        t = Tool(name=name, description=description, parameters=parameters, fn=fn)
+        eager = bool(kwargs.get("eager", False))
+        deferred = kwargs.get("deferred")
+        if deferred is None:
+            deferred = not eager
+        if eager:
+            deferred = False
+        read_only = kwargs.get("read_only")
+        t = Tool(
+            name=name,
+            description=description,
+            parameters=parameters,
+            fn=fn,
+            deferred=bool(deferred),
+            eager=eager,
+            read_only=read_only,
+        )
         return t
 
     if callable(fn_or_name):
@@ -180,7 +203,11 @@ def execute_tool(call: ToolCall, tools: list[Tool]) -> str:
     """Look up tool by name, call it with arguments, and return string result or error."""
     tool_map = {t.name: t for t in tools}
     if call.name not in tool_map:
-        raise KeyError(f"Tool '{call.name}' is not registered.")
+        available = ", ".join(sorted(tool_map)) or "(none)"
+        return (
+            f"Error: tool '{call.name}' is not registered. "
+            f"Available tools: {available}"
+        )
     target_tool = tool_map[call.name]
     try:
         return target_tool.call(**call.arguments)

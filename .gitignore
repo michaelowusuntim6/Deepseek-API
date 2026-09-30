@@ -1,25 +1,26 @@
-# --- Python ---
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-venv/
-.venv/
+*.py[cod]
 *.egg-info/
 
-# --- Environment ---
+# Virtual environments
+venv/
+.venv/
+
+# Local state and secrets
 .env
 .env.*
 !.env.example
-
-# --- Local session (bearer token + cookies — NEVER commit) ---
 session/
-session.json
-
-# --- Logs and scratch ---
-*.log
+.deepseek-cli/
+.tpu-orchestrator/
+CLAUDE.md
 test_sdk.py
 
-# --- Agent-generated working documents ---
-*_REPORT.md
-CLAUDE.md
+# Logs and OS/editor scratch
+*.log
+*.bak
+.DS_Store
+
+# Generated image fixtures
+tests/fixtures/*.png
