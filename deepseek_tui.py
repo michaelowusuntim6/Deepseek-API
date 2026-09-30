@@ -11,11 +11,15 @@ Run:           python deepseek_tui.py
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -131,8 +135,195 @@ def run_shell(command: str) -> str:
         return f"Error running shell command: {type(e).__name__}: {e}"
 
 
+@tool
+def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """Edit a file by replacing old_string with new_string (max 1 MB).
+
+    Args:
+        path: Path to the file to edit.
+        old_string: Exact text to find and replace.
+        new_string: Replacement text.
+        replace_all: If True, replace all occurrences; otherwise error if more than one found.
+    """
+    try:
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            return f"error: file '{path}' does not exist"
+        if not p.is_file():
+            return f"error: '{path}' is not a file"
+        size = p.stat().st_size
+        if size > 1024 * 1024:
+            return f"error: file '{path}' is {size} bytes — exceeds 1 MB limit"
+        raw = p.read_bytes()
+        # Detect newline style for preservation — we work in bytes to be safe
+        content = raw.decode("utf-8", errors="replace")
+        count = content.count(old_string)
+        if count == 0:
+            return f"error: old_string not found in {path}"
+        if count > 1 and not replace_all:
+            return (
+                f"error: old_string appears {count} times in {path}; "
+                f"pass replace_all=True or provide more context"
+            )
+        updated = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
+        p.write_bytes(updated.encode("utf-8"))
+        replaced = count if replace_all else 1
+        return f"edited {path}: replaced {replaced} occurrence(s)"
+    except Exception as e:
+        return f"error editing file '{path}': {type(e).__name__}: {e}"
+
+
+# Directories to skip during grep / find_files traversal
+_SKIP_DIRS = {"__pycache__", ".git", "venv", "node_modules", ".venv", ".mypy_cache", ".tox"}
+
+
+@tool
+def grep(pattern: str, path: str = ".", glob: str = "*", max_results: int = 100) -> str:
+    """Search text files recursively for a regex pattern (case-sensitive, like grep).
+
+    Args:
+        pattern: Regular expression to search for.
+        path: Root directory to search (default: current directory).
+        glob: Shell glob to filter filenames (default: '*' matches all).
+        max_results: Maximum number of matching lines to return (default 100).
+    """
+    try:
+        root = Path(path).expanduser().resolve()
+        if not root.exists():
+            return f"error: path '{path}' does not exist"
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            return f"error: invalid regex '{pattern}': {e}"
+
+        results: list[str] = []
+        truncated = False
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Prune skip dirs in-place so os.walk doesn't descend into them
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for fname in sorted(filenames):
+                if not fnmatch.fnmatch(fname, glob):
+                    continue
+                fpath = Path(dirpath) / fname
+                # Skip binary files by reading a small chunk and checking for null bytes
+                try:
+                    with open(fpath, "rb") as fb:
+                        chunk = fb.read(8192)
+                    if b"\x00" in chunk:
+                        continue
+                except OSError:
+                    continue
+                try:
+                    relpath = fpath.relative_to(root)
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        for lineno, line in enumerate(f, 1):
+                            if rx.search(line):
+                                entry = f"{relpath}:{lineno}: {line.rstrip()}"
+                                if len(entry) > 300:
+                                    entry = entry[:300]
+                                results.append(entry)
+                                if len(results) >= max_results:
+                                    truncated = True
+                                    break
+                    if truncated:
+                        break
+                except OSError:
+                    continue
+            if truncated:
+                break
+
+        if not results:
+            return f"no matches for '{pattern}' in {path}"
+        out = "\n".join(results)
+        if truncated:
+            out += "\n… (truncated)"
+        return out
+    except Exception as e:
+        return f"error during grep: {type(e).__name__}: {e}"
+
+
+@tool
+def find_files(pattern: str, path: str = ".", max_results: int = 200) -> str:
+    """Recursively find files whose name matches a shell glob pattern.
+
+    Args:
+        pattern: Shell glob pattern to match against filenames (e.g. '*.py').
+        path: Root directory to search (default: current directory).
+        max_results: Maximum number of results to return (default 200).
+    """
+    try:
+        root = Path(path).expanduser().resolve()
+        if not root.exists():
+            return f"error: path '{path}' does not exist"
+
+        matches: list[str] = []
+        truncated = False
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+            for fname in sorted(filenames):
+                if fnmatch.fnmatch(fname, pattern):
+                    fpath = Path(dirpath) / fname
+                    try:
+                        matches.append(str(fpath.relative_to(root)))
+                    except ValueError:
+                        matches.append(str(fpath))
+                    if len(matches) >= max_results:
+                        truncated = True
+                        break
+            if truncated:
+                break
+
+        if not matches:
+            return f"no files matching '{pattern}' found in {path}"
+        matches.sort()
+        out = "\n".join(matches)
+        if truncated:
+            out += f"\n… (truncated at {max_results})"
+        return out
+    except Exception as e:
+        return f"error during find_files: {type(e).__name__}: {e}"
+
+
+@tool
+def fetch_url(url: str, max_bytes: int = 8000) -> str:
+    """Fetch a URL via HTTP/HTTPS and return stripped text content.
+
+    Args:
+        url: The URL to fetch (http:// or https:// only).
+        max_bytes: Maximum response body bytes to return (default 8000).
+    """
+    try:
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return f"error: unsupported scheme in '{url}' — only http:// and https:// are allowed"
+        req = urllib.request.Request(url, headers={"User-Agent": "DeepSeek-TUI/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read(max_bytes + 1)
+        truncated = len(raw) > max_bytes
+        body = raw[:max_bytes].decode("utf-8", errors="replace")
+        if truncated:
+            body += "… (truncated)"
+        # Crude HTML strip: remove <script>…</script>, <style>…</style>, then all tags
+        body = re.sub(r"<script[^>]*>.*?</script>", " ", body, flags=re.DOTALL | re.IGNORECASE)
+        body = re.sub(r"<style[^>]*>.*?</style>", " ", body, flags=re.DOTALL | re.IGNORECASE)
+        body = re.sub(r"<[^>]+>", " ", body)
+        # Collapse whitespace
+        body = re.sub(r"\s+", " ", body).strip()
+        return body
+    except urllib.error.HTTPError as e:
+        return f"error: HTTP {e.code} {e.reason} fetching '{url}'"
+    except urllib.error.URLError as e:
+        return f"error: URL error fetching '{url}': {e.reason}"
+    except TimeoutError:
+        return f"error: timed out fetching '{url}'"
+    except Exception as e:
+        return f"error fetching '{url}': {type(e).__name__}: {e}"
+
+
 def default_tools() -> list[Tool]:
-    return [read_file, list_dir, write_file, run_shell]
+    return [read_file, list_dir, write_file, run_shell,
+            edit_file, grep, find_files, fetch_url]
 
 
 SLASH_COMMANDS = [
