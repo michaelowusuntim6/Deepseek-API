@@ -112,6 +112,7 @@ Files whose names start with `_` are skipped (use them for helper modules).
 | [`weather.py`](weather.py) | Fetches current temperature via free Open-Meteo API (no key needed). |
 | [`notes.py`](notes.py) | Saves and lists Markdown notes; also demonstrates `COMMANDS`. |
 | [`image_view.py`](image_view.py) | Renders local images inline with `rich-pixels`. |
+| [`memory.py`](memory.py) | Markdown memory with BM25 retrieval and auto-injection. |
 
 `image_view.py` is the reference terminal-image extension. After copying it into
 an extension directory, use `/reload`, then ask the CLI to show an image. The

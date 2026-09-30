@@ -38,6 +38,7 @@ _MODULE_PREFIX = "dsx_ext_"
 # Cached results — cleared by reload_extensions().
 _cached_tools: list[Tool] | None = None
 _cached_commands: dict[str, Callable] | None = None
+_cached_context_providers: list[Callable] | None = None
 _load_report: list[str] = []  # human-readable lines for extension_report()
 
 
@@ -77,7 +78,7 @@ def _import_module(stem: str, path: Path):
     return mod
 
 
-def _load_all() -> tuple[list[Tool], dict[str, Callable]]:
+def _load_all() -> tuple[list[Tool], dict[str, Callable], list[Callable]]:
     """
     Internal: scan all extension paths, import, call register(), collect COMMANDS.
     Returns (tools, commands).  Errors are caught and printed to stderr.
@@ -87,6 +88,7 @@ def _load_all() -> tuple[list[Tool], dict[str, Callable]]:
 
     tools_by_name: dict[str, Tool] = {}
     commands: dict[str, Callable] = {}
+    context_providers: list[Callable] = []
 
     for stem, path in _collect_py_files():
         label = path.name
@@ -150,29 +152,41 @@ def _load_all() -> tuple[list[Tool], dict[str, Callable]]:
                     continue
                 commands[cmd_key] = cmd_fn
 
+        provider = getattr(mod, "context_provider", None)
+        if callable(provider):
+            context_providers.append(provider)
+
         _load_report.append(
             f"[green]✓[/] [bold]{label}[/]: tools=[cyan]{', '.join(loaded_names) or '(none)'}[/]"
         )
 
-    return list(tools_by_name.values()), commands
+    return list(tools_by_name.values()), commands, context_providers
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
 def load_extensions() -> list[Tool]:
     """Discover, import, and return tools from every extension (cached)."""
-    global _cached_tools, _cached_commands
+    global _cached_tools, _cached_commands, _cached_context_providers
     if _cached_tools is None:
-        _cached_tools, _cached_commands = _load_all()
+        _cached_tools, _cached_commands, _cached_context_providers = _load_all()
     return list(_cached_tools)
 
 
 def load_extension_commands() -> dict[str, Callable]:
     """Return merged slash-command dict from all extensions (cached)."""
-    global _cached_tools, _cached_commands
+    global _cached_tools, _cached_commands, _cached_context_providers
     if _cached_commands is None:
-        _cached_tools, _cached_commands = _load_all()
+        _cached_tools, _cached_commands, _cached_context_providers = _load_all()
     return dict(_cached_commands)
+
+
+def load_context_providers() -> list[Callable]:
+    """Return extension context providers for startup preamble injection."""
+    global _cached_tools, _cached_commands, _cached_context_providers
+    if _cached_context_providers is None:
+        _cached_tools, _cached_commands, _cached_context_providers = _load_all()
+    return list(_cached_context_providers)
 
 
 def extension_report() -> str:
@@ -211,7 +225,7 @@ def extension_report() -> str:
 
 def reload_extensions() -> None:
     """Clear cached state; the next load_* call re-scans the disk."""
-    global _cached_tools, _cached_commands, _load_report
+    global _cached_tools, _cached_commands, _cached_context_providers, _load_report
 
     # Remove previously imported extension modules from sys.modules
     to_remove = [k for k in sys.modules if k.startswith(_MODULE_PREFIX)]
@@ -220,4 +234,5 @@ def reload_extensions() -> None:
 
     _cached_tools = None
     _cached_commands = None
+    _cached_context_providers = None
     _load_report = []

@@ -65,8 +65,18 @@ from deepseek.agent_tools import (
 )
 from deepseek.auth import LoginRequired
 from deepseek.compaction import CompactionManager
+from deepseek.client import TOOL_SYSTEM_PREAMBLE
+from deepseek.agents_md import discover_agents, generate_draft
 from deepseek.plan_store import PlanStore, render_checklist
+from deepseek.skills import (
+    clear_active_skills,
+    list_skills,
+    read_skill_file,
+    skills_preamble,
+    use_skill,
+)
 from deepseek.tool_search import DeferredToolRegistry, search_tools
+from deepseek.extensions import load_context_providers
 
 
 __version__ = "0.4.0"
@@ -410,6 +420,9 @@ def codex_default_tools(plan_enabled: bool = False,
         search_tools,
         update_plan,
         request_user_input,
+        list_skills,
+        use_skill,
+        read_skill_file,
     ]
 
 
@@ -469,6 +482,9 @@ BUILTIN_SLASH_COMMANDS = {
     "/tools": "set tools: off | manual | auto | list",
     "/compact": "summarize and restart the context window",
     "/plan": "show, clear, or resume the persistent plan",
+    "/agents": "show the loaded AGENTS.md path and line count",
+    "/agents-reload": "reload AGENTS.md from disk",
+    "/agents-init": "generate AGENTS.md for the current repository",
     "/extensions": "list loaded extensions and their tools",
     "/reload": "reload extensions from disk",
     "/exit": "quit",
@@ -523,6 +539,14 @@ def build_parser() -> UsageErrorParser:
                    help="enable request_user_input for structured plan questions")
     p.add_argument("--mode", choices=("normal", "agent"), default="normal",
                    help="agent mode enables persistent plan tracking")
+    p.add_argument("--no-memory", action="store_true",
+                   help="skip memory auto-injection")
+    p.add_argument("--no-agents", action="store_true",
+                   help="skip AGENTS.md discovery")
+    p.add_argument("--generate-agents", action="store_true",
+                   help="generate AGENTS.md for the current repository and exit")
+    p.add_argument("--show-preamble", action="store_true",
+                   help="print the assembled system preamble and exit")
     p.add_argument("--version", action="version", version=f"deepseek-cli {__version__}")
     return p
 
@@ -539,6 +563,10 @@ class DeepSeekCLI:
         self.stream = not args.no_stream
         self.no_markdown = bool(args.no_markdown)
         self.no_diff = bool(args.no_diff)
+        self.no_memory = bool(args.no_memory)
+        self.no_agents = bool(args.no_agents)
+        self.generate_agents = bool(args.generate_agents)
+        self.show_preamble = bool(args.show_preamble)
         self.show_thinking = bool(args.show_thinking)
         self.model_alias = args.model or "chat"
         self.model = MODEL_CHOICES[self.model_alias][0]
@@ -584,6 +612,11 @@ class DeepSeekCLI:
         self._turn_tool_result_chars = 0
         self._json_tool_event_seen = False
         self._json_answer_buffer = ""
+        self.agents_path: Path | None = None
+        self.agents_text = ""
+        self.memory_text = ""
+        self.skills_text = ""
+        self._preamble_loaded = False
 
         stderr_ui = (not self.interactive) or self.json_mode
         self.ui = Console(stderr=stderr_ui, highlight=False, soft_wrap=True)
@@ -776,6 +809,7 @@ class DeepSeekCLI:
 
         self.reload_tools()
         self.extension_commands = load_extension_commands()
+        self._load_context_layers()
         self.runtime.conversation_id = self.conversation_id
         self.runtime.tool_registry = self.registry
         set_agent_runtime(self.runtime)
@@ -792,6 +826,51 @@ class DeepSeekCLI:
         self.tools = self.registry.visible_tools()
         self.runtime.tool_registry = self.registry
         set_agent_runtime(self.runtime)
+
+    def _load_context_layers(self) -> None:
+        self.skills_text, warning = skills_preamble()
+        if warning:
+            sys.stderr.write(warning + "\n")
+        if not self.no_agents:
+            found = discover_agents()
+            if found:
+                self.agents_path, self.agents_text = found
+                line_count = len(self.agents_text.splitlines())
+                sys.stderr.write(f"[agents] loaded {self.agents_path} ({line_count} lines)\n")
+        self.memory_text = ""
+        if not self.no_memory:
+            summary = ""
+            if self.agents_text:
+                summary = self.agents_text.splitlines()[0] if self.agents_text.splitlines() else ""
+            memories = []
+            for provider in load_context_providers():
+                try:
+                    text = provider(cwd=str(Path.cwd()), agents_summary=summary)
+                except TypeError:
+                    try:
+                        text = provider(str(Path.cwd()), summary)
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+                if text:
+                    memories.append(text)
+            if memories:
+                self.memory_text = "\n".join(memories)[:2000]
+        self._preamble_loaded = True
+
+    def _reload_memory(self) -> None:
+        self._load_context_layers()
+
+    def _context_sections(self) -> list[str]:
+        sections = []
+        if self.skills_text:
+            sections.append(self.skills_text)
+        if self.memory_text:
+            sections.append("## Long-term memory (auto-retrieved)\n" + self.memory_text)
+        if self.agents_text:
+            sections.append("## Project instructions (AGENTS.md)\n" + self.agents_text)
+        return sections
 
     def _runtime_ask(self, prompt: str) -> str:
         if self.json_mode:
@@ -950,7 +1029,10 @@ class DeepSeekCLI:
             visible = self.registry.visible_tools()
             schema = json.dumps([tool_obj.schema() for tool_obj in visible], indent=2)
             tool_prompt = (
-                self.client._tool_prompt(current_prompt, schema, current_cid)
+                self.client._tool_prompt(
+                    current_prompt, schema, current_cid,
+                    extra_sections=self._context_sections(),
+                )
                 if visible
                 else current_prompt
             )
@@ -1009,6 +1091,7 @@ class DeepSeekCLI:
         self._close_answer_line()
         self._close_thinking_line()
         self._flush_json_answer()
+        clear_active_skills()
         if new_cid:
             self.conversation_id = new_cid
             self.runtime.conversation_id = new_cid
@@ -1279,6 +1362,7 @@ class DeepSeekCLI:
             self._pending_compaction_prefix = None
             self._plan_injected_cid = None
             self.runtime.conversation_id = None
+            self._reload_memory()
             self._render_system("[green]Started a new thread.[/]")
         elif cmd == "/thread":
             self._render_system(
@@ -1298,6 +1382,21 @@ class DeepSeekCLI:
                 )
         elif cmd == "/plan":
             self.command_plan(arg)
+        elif cmd == "/agents":
+            if self.agents_path:
+                self._render_system(
+                    f"AGENTS.md: [bold]{self.agents_path}[/] "
+                    f"({len(self.agents_text.splitlines())} lines)"
+                )
+            else:
+                self._render_system("[yellow]No AGENTS.md loaded.[/]")
+        elif cmd == "/agents-reload":
+            self.agents_path = None
+            self.agents_text = ""
+            self._load_context_layers()
+            self._render_system("[green]AGENTS.md reloaded.[/]")
+        elif cmd == "/agents-init":
+            self.command_agents_init()
         elif cmd == "/model":
             self.command_model(arg)
         elif cmd == "/thinking":
@@ -1413,6 +1512,19 @@ class DeepSeekCLI:
             return
         self._render_plan(data["plan"])
 
+    def command_agents_init(self) -> None:
+        target = Path.cwd() / "AGENTS.md"
+        draft = generate_draft(Path.cwd())
+        self.ui.print(Panel(draft, title="AGENTS.md draft", box=box.SQUARE))
+        response = self._prompt_approval(f"Write {target}? [y/N]: ").lower()
+        if response not in {"y", "yes"}:
+            self._render_system("[yellow]AGENTS.md generation cancelled.[/]")
+            return
+        target.write_text(draft, encoding="utf-8")
+        self.agents_path = target
+        self.agents_text = draft
+        self._render_system(f"[green]Wrote {target}[/]")
+
     def command_tools(self, arg: str) -> None:
         if arg in ("off", "manual", "auto"):
             self.tools_mode = arg
@@ -1517,6 +1629,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     parser.json_errors = "--json" in argv_list
     args = parser.parse_args(argv_list)
+    if args.show_preamble:
+        app = DeepSeekCLI(args, parser, interactive=False, prompt=None)
+        app.reload_tools()
+        app._load_context_layers()
+        schema = json.dumps([t.schema() for t in app.registry.visible_tools()], indent=2)
+        text = TOOL_SYSTEM_PREAMBLE.format(tools_schema=schema)
+        sections = app._context_sections()
+        if sections:
+            text += "\n\n" + "\n\n".join(sections)
+        sys.stderr.write(text + "\n")
+        return EXIT_OK
+    if args.generate_agents:
+        app = DeepSeekCLI(args, parser, interactive=False, prompt=None)
+        app.command_agents_init()
+        return EXIT_OK
     interactive, prompt = read_prompt(args, parser)
     app = DeepSeekCLI(args, parser, interactive=interactive, prompt=prompt)
     try:

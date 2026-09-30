@@ -66,6 +66,7 @@ Some tools are not listed. Use search_tools to find tools by capability. If the 
 Example: if the user asks for weather and no weather tool is listed above, your next response must be only:
 <tool_call>{{"name":"search_tools","arguments":{{"query":"weather"}}}}</tool_call>
 If the user asks to display or render an image, first call search_tools with query "image".
+If the user asks you to remember, recall, forget, or search memory, first call search_tools with query "memory".
 
 Use update_plan to keep an up-to-date, step-by-step plan. Provide a short list of 1-sentence steps (no more than 5-7 words each) with a status for each step (pending, in_progress, or completed). There should always be exactly one in_progress step until everything is done.
 
@@ -255,17 +256,18 @@ class DeepSeekClient:
         return True
 
     def _tool_prompt(self, prompt: str, tools_schema_str: str,
-                     conversation_id: Optional[str]) -> str:
+                     conversation_id: Optional[str],
+                     extra_sections: Optional[list[str]] = None) -> str:
         """Prefix the tool preamble only when it is not already in this thread."""
         fingerprint = hashlib.sha256(tools_schema_str.encode("utf-8")).hexdigest()
         session_id, _ = _decode_cid(conversation_id)
         if session_id and self._tool_preamble_fingerprints.get(session_id) == fingerprint:
             return prompt
-        return (
-            TOOL_SYSTEM_PREAMBLE.format(tools_schema=tools_schema_str)
-            + "\n\nUser: "
-            + prompt
-        )
+        preamble = TOOL_SYSTEM_PREAMBLE.format(tools_schema=tools_schema_str)
+        sections = [section for section in (extra_sections or []) if section.strip()]
+        if sections:
+            preamble += "\n\n" + "\n\n".join(sections)
+        return preamble + "\n\nUser: " + prompt
 
     def _remember_tool_prompt(self, tools_schema_str: str,
                               conversation_id: Optional[str]) -> None:

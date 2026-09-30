@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import json
-import math
 import re
-from collections import Counter
 from typing import Any, Iterable
 
 from .agent_tools import get_agent_runtime
+from .bm25 import BM25, tokenize
 from .tools import Tool, tool
 
 
-def tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
+BM25Index = BM25
 
 
 def _parameter_names(parameters: dict[str, Any]) -> list[str]:
@@ -28,46 +26,6 @@ def _parameter_names(parameters: dict[str, Any]) -> list[str]:
             if isinstance(items, dict):
                 names.extend(_parameter_names({"properties": {"item": items}}))
     return names
-
-
-class BM25Index:
-    """Small BM25 implementation over tool metadata documents."""
-
-    def __init__(self, documents: list[list[str]], k1: float = 1.5, b: float = 0.75):
-        self.documents = documents
-        self.k1 = k1
-        self.b = b
-        self.doc_freqs: list[Counter[str]] = [Counter(doc) for doc in documents]
-        self.doc_lengths = [len(doc) for doc in documents]
-        self.avgdl = (sum(self.doc_lengths) / len(self.doc_lengths)) if documents else 0.0
-        df: Counter[str] = Counter()
-        for doc in self.doc_freqs:
-            df.update(doc.keys())
-        n = len(documents)
-        self.idf = {
-            term: math.log((n - freq + 0.5) / (freq + 0.5) + 1.0)
-            for term, freq in df.items()
-        }
-
-    def score(self, query: str, index: int) -> float:
-        if not self.documents:
-            return 0.0
-        terms = tokenize(query)
-        freq = self.doc_freqs[index]
-        dl = self.doc_lengths[index] or 1
-        score = 0.0
-        for term in terms:
-            if term not in freq:
-                continue
-            idf = self.idf.get(term, 0.0)
-            tf = freq[term]
-            denom = tf + self.k1 * (1 - self.b + self.b * dl / (self.avgdl or 1.0))
-            score += idf * (tf * (self.k1 + 1)) / denom
-        return score
-
-    def rank(self, query: str) -> list[tuple[int, float]]:
-        scored = [(idx, self.score(query, idx)) for idx in range(len(self.documents))]
-        return sorted(scored, key=lambda item: (-item[1], item[0]))
 
 
 class DeferredToolRegistry:
@@ -120,14 +78,10 @@ class DeferredToolRegistry:
         return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
     def _exact_matches(self, query: str) -> list[Tool]:
-        query_norm = self._normalize_name(query)
-        query_tokens = set(tokenize(query))
-        matches: list[Tool] = []
-        for tool_obj in self.deferred_tools:
-            name_norm = self._normalize_name(tool_obj.name)
-            if name_norm == query_norm or name_norm in query_tokens:
-                matches.append(tool_obj)
-        return matches
+        indices = BM25.exact_name_matches(
+            query, [tool_obj.name for tool_obj in self.deferred_tools]
+        )
+        return [self.deferred_tools[idx] for idx in indices]
 
     def search(self, query: str, limit: int = 5) -> list[Tool]:
         self._ensure_index()

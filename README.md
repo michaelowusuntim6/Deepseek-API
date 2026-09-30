@@ -14,6 +14,14 @@ You sign in once in a browser; the session is captured and refreshed automatical
 
 ## What's new
 
+- Added a Markdown memory extension with BM25 retrieval and capped
+  session-start injection.
+- Added AGENTS.md discovery, `/agents`, `/agents-reload`, and `/agents-init`.
+- Added a progressive-disclosure skills system with `list_skills`,
+  `use_skill`, and `read_skill_file`.
+- Added three example skills: `skill-creator`, `review`, and `agents-init`.
+- Added `--no-memory`, `--no-agents`, `--generate-agents`, and
+  `--show-preamble`.
 - Fixed `BrokenPipeError` when piping JSON output into tools like `head`.
   Truncated pipes now exit `141` cleanly without tracebacks.
 - Removed the text-only `view_image` metadata stub.
@@ -126,6 +134,10 @@ context estimate, followed by a dim status footer before each prompt.
 | `--mode` | `normal`, `agent` | Agent mode enables persistent plan tracking |
 | `--no-markdown` | flag | Disable Markdown rendering during streaming |
 | `--no-diff` | flag | Suppress `apply_patch` diff previews |
+| `--no-memory` | flag | Skip memory auto-injection |
+| `--no-agents` | flag | Skip AGENTS.md discovery |
+| `--generate-agents` | flag | Generate AGENTS.md and exit |
+| `--show-preamble` | flag | Print the assembled preamble to stderr and exit |
 
 Exit codes are `0` success, `1` runtime error, `2` auth required, `3` usage
 error, and `141` for a truncated pipe (`SIGPIPE` convention).
@@ -198,11 +210,59 @@ Slash commands are available in the REPL. Tab completion is provided through
 | `/tools off\|manual\|auto\|list` | Configure tools or list them |
 | `/compact` | Manually summarize and restart the context window |
 | `/plan [clear\|resume]` | Show, clear, or resume the persistent plan |
+| `/agents` | Show loaded AGENTS.md path and line count |
+| `/agents-reload` | Re-read AGENTS.md from disk |
+| `/agents-init` | Generate AGENTS.md for the current repository |
 | `/extensions` | List loaded extensions and tools |
 | `/reload` | Reload extensions from disk |
 | `/exit` | Quit |
 
 Extensions may also register their own slash commands through `COMMANDS`.
+
+### Memory
+
+The optional memory extension stores Markdown memory under
+`~/.deepseek-cli/memory/`:
+
+```bash
+cp examples/extensions/memory.py ~/.deepseek-tui/extensions/
+```
+
+It provides `memory_write`, `memory_read`, `memory_search`, `memory_forget`,
+and `memory_status`. At process start and after `/new`, the CLI retrieves up to
+three BM25-selected paragraphs using the cwd name and AGENTS.md summary, capped
+at 2000 characters. `MEMORY.md` is capped at 200 lines; older lines roll over
+to `archive/YYYY-MM.md`.
+
+### AGENTS.md
+
+At startup the CLI searches upward from the current directory for the first
+`AGENTS.md`, `.agents/AGENTS.md`, `CLAUDE.md`, or `.agents/CLAUDE.md`. It reads
+at most 500 lines and injects them as project instructions. Use `--no-agents`
+to skip discovery, `/agents-reload` to refresh, and `/agents-init` or
+`--generate-agents` to draft a file.
+
+### Skills
+
+Skills live in `~/.deepseek-cli/skills/<name>/SKILL.md` or
+`./.deepseek-cli/skills/<name>/SKILL.md`. The preamble lists only skill names
+and descriptions. The body loads only when the model calls `use_skill(name)`,
+and reference files load only through `read_skill_file(name, path)`.
+
+Copy the default skills when wanted:
+
+```bash
+cp -r examples/skills/* ~/.deepseek-cli/skills/
+```
+
+### Context budget
+
+- Memory injection: 2000 characters maximum.
+- `MEMORY.md`: 200 lines maximum, with 50-line rollover archives.
+- Skill descriptions: 80 characters maximum; 30 skills maximum.
+- AGENTS.md: 500 lines maximum.
+- Memory injects only at process start and after `/new`, never again after
+  compaction.
 
 ---
 
@@ -354,6 +414,10 @@ A self-imposed sliding-window limiter caps requests per client IP (default `30/m
 - **Piped output to `head`:** If the downstream pipe closes early, the CLI exits
   `141` and suppresses further stdout writes. This is expected SIGPIPE behavior,
   not a crash; stderr should remain traceback-free.
+- **AGENTS.md is ignored:** Check that the filename is exactly `AGENTS.md`,
+  that it is not over 500 lines, and that it is in the current directory, a
+  parent up to the git/filesystem root, or `.agents/AGENTS.md`. Use
+  `--no-agents` only if you want discovery disabled.
 - **Sign in once, then reuse.** The cached session refreshes automatically; you only re-sign-in if it fully expires.
 - **Be reasonable.** Use it in moderation; don't spam or bulk-automate.
 - **No real token counts.** `usage` in server responses is a rough ~4-chars/token estimate.
