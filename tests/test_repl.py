@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 from prompt_toolkit.document import Document
 
-from deepseek.repl import SlashCommandCompleter
+from deepseek.repl import PICKER_COMMANDS, SlashCommandCompleter
 
 
 def complete(completer: SlashCommandCompleter, text: str):
@@ -35,6 +35,10 @@ def test_repl_completions() -> None:
     assert complete(tools, "/tools")[0].text == "/tools"
     assert complete(tools, "/thinking")[0].text == "/thinking "
     assert complete(tools, "/help")[0].text == "/help"
+    assert PICKER_COMMANDS == {
+        "/model", "/mode", "/tools", "/thinking", "/search", "/plan",
+    }
+    assert [c.text for c in complete(completer, "/model ")] == ["chat", "expert"]
     assert complete(completer, "plain text") == []
     print("all repl tests passed")
 

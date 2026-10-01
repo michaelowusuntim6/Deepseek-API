@@ -15,6 +15,11 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.shortcuts import CompleteStyle
 
 
+PICKER_COMMANDS = frozenset({
+    "/model", "/mode", "/tools", "/thinking", "/search", "/plan",
+})
+
+
 def claude_style() -> Style:
     return Style.from_dict({
         "completion-menu.completion": "bg:default fg:default",
@@ -92,14 +97,18 @@ def create_session(commands: list[tuple[str, str]],
                    arguments: dict[str, list[tuple[str, str]]]) -> PromptSession:
     completer = SlashCommandCompleter(commands, arguments)
     kb = KeyBindings()
+    selected = {"index": 0}
 
     @kb.add("up")
     def _(event):
         buf = event.current_buffer
         state = buf.complete_state
         if state and state.completions:
-            index = state.complete_index if state.complete_index is not None else 0
-            state.complete_index = (index - 1) % len(state.completions)
+            if state.complete_index is None:
+                selected["index"] = len(state.completions) - 1
+            else:
+                selected["index"] = (state.complete_index - 1) % len(state.completions)
+            state.complete_index = selected["index"]
             event.app.invalidate()
 
     @kb.add("down")
@@ -107,15 +116,27 @@ def create_session(commands: list[tuple[str, str]],
         buf = event.current_buffer
         state = buf.complete_state
         if state and state.completions:
-            index = state.complete_index if state.complete_index is not None else -1
-            state.complete_index = (index + 1) % len(state.completions)
+            if state.complete_index is None:
+                selected["index"] = 1 if len(state.completions) > 1 else 0
+            else:
+                selected["index"] = (state.complete_index + 1) % len(state.completions)
+            state.complete_index = selected["index"]
             event.app.invalidate()
 
     @kb.add("escape")
     def _(event):
         buf = event.current_buffer
-        if buf.complete_state:
+        text = buf.text
+        if buf.complete_state and " " in text.rstrip():
+            command = text.strip().split()[0]
+            buf.text = command + " "
+            buf.cursor_position = len(buf.text)
+            buf.start_completion(select_first=True)
+        elif buf.complete_state:
             buf.cancel_completion()
+        else:
+            buf.text = ""
+            buf.cursor_position = 0
 
     @kb.add("enter")
     def _(event):
@@ -124,14 +145,17 @@ def create_session(commands: list[tuple[str, str]],
         if text.startswith("/"):
             completions = list(completer.get_completions(Document(text, len(text)), None))
             if completions:
-                index = 0
-                if buf.complete_state and buf.complete_state.complete_index is not None:
-                    index = min(buf.complete_state.complete_index, len(completions) - 1)
+                index = min(selected["index"], len(completions) - 1)
                 completion = completions[index]
                 replace_at = len(text) + completion.start_position
                 new_text = text[:replace_at] + completion.text
                 buf.text = new_text
                 buf.cursor_position = len(new_text)
+                if new_text in PICKER_COMMANDS:
+                    selected["index"] = 0
+                    buf.insert_text(" ")
+                    buf.start_completion(select_first=True)
+                    return
         buf.validate_and_handle()
 
     hist_path = Path.home() / ".deepseek-cli" / "repl_history"
