@@ -72,6 +72,15 @@ from deepseek.agent_tools import (
 from deepseek.auth import LoginRequired
 from deepseek.compaction import CompactionManager
 from deepseek.client import TOOL_SYSTEM_PREAMBLE
+from deepseek.response import (
+    DONE_TOKEN,
+    MAX_NUDGES_PER_TURN,
+    NUDGE_MESSAGE,
+    ResponseProcessor,
+    TurnNudger,
+    split_tool_calls,
+    strip_done,
+)
 from deepseek.agents_md import discover_agents, generate_draft
 from deepseek.plan_store import PlanStore, render_checklist
 from deepseek.skills import (
@@ -94,21 +103,13 @@ EXIT_AUTH = 2
 EXIT_USAGE = 3
 EXIT_INTERRUPTED = 130
 EXIT_SIGPIPE = 141
-MAX_NUDGES_PER_TURN = 3
-NUDGE_MESSAGES = [
-    "Continue. Call the next tool now. Do not write prose.",
-    (
-        "You stopped without a tool call. The task requires exec_command. "
-        "Emit ONLY this and nothing else, on one line:\n\n"
-        '<tool_call>{"name":"exec_command","arguments":{"cmd":"ls ~/Downloads/Hugginface/hf_results/"}}</tool_call>\n\n'
-        "Do not write any prose before or after."
-    ),
-    (
-        "FINAL ATTEMPT. You must call a tool to make progress. Reply with "
-        "exactly one <tool_call>...</tool_call> block and nothing else. "
-        "No prose. No explanation. Just the tool call."
-    ),
-]
+PARSE_RETRY_MESSAGE = (
+    "Your previous response contained a tool call that could not be "
+    "parsed. Re-emit ONLY the tool call, using exactly this format "
+    "and nothing else:\n\n"
+    '<tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>\n\n'
+    "Do not include any DSML, XML, closing tags, or prose."
+)
 
 
 def build_tool_result_message(tool_name: str, output: str,
@@ -122,11 +123,12 @@ def build_tool_result_message(tool_name: str, output: str,
         f"Tool calls completed so far: {tool_count}\n\n"
         "Do NOT write a summary of the tool output. Do NOT write a final "
         "answer unless the task is complete. If the task requires more tool "
-        "calls, emit the next <tool_call> block now. If and only if the "
-        "entire task is done, write the final answer and end with the "
-        "literal token TASK COMPLETE on its own line.\n\n"
-        "If you write prose without a tool call and without TASK COMPLETE, "
-        "the harness will nudge you. Do not waste nudges."
+        "calls, emit exactly ONE <tool_call> block now and wait for its "
+        "result. If and only if the entire task is done, write the final "
+        "answer and end with <<DONE>> alone on its own line, preceded and "
+        "followed by a blank line.\n\n"
+        "If you write prose without a tool call and without <<DONE>>, the "
+        "harness will nudge you. Do not waste nudges."
     )
 
 MODEL_CHOICES = {
@@ -811,6 +813,8 @@ class DeepSeekCLI:
         self._pending_tool_names: deque[str] = deque()
         self._answer_parts: list[str] = []
         self._raw_answer_parts: list[str] = []
+        self._answer_tail = ""
+        self._response_processor = ResponseProcessor()
         self._original_prompt: str | None = None
         self._thinking_parts: list[str] = []
         self._answer_line_open = False
@@ -1267,6 +1271,8 @@ class DeepSeekCLI:
         self._pending_tool_names.clear()
         self._answer_parts = []
         self._raw_answer_parts = []
+        self._answer_tail = ""
+        self._response_processor = ResponseProcessor()
         if self._original_prompt is None:
             self._original_prompt = prompt
         self._thinking_parts = []
@@ -1347,7 +1353,7 @@ class DeepSeekCLI:
         turn_prompt_chars = 0
         summary_prefix = self._summary_prefix_for_next_request
         self._summary_prefix_for_next_request = None
-        nudge_count = 0
+        nudger = TurnNudger(MAX_NUDGES_PER_TURN)
         had_tool_call = False
         tool_count = 0
         parse_fail_count = 0
@@ -1372,6 +1378,8 @@ class DeepSeekCLI:
             )
             turn_prompt_chars += len(request_prompt)
 
+            self._response_processor = ResponseProcessor()
+            self._answer_tail = ""
             stream = self.client.stream(
                 request_prompt,
                 conversation_id=current_cid,
@@ -1388,56 +1396,62 @@ class DeepSeekCLI:
             if visible:
                 self.client._remember_tool_prompt(schema, current_cid)
 
-            if not stream.tool_calls:
-                parse_candidate = self._audit_unparsed_tool_call()
+            signal = self._response_processor.signal
+            if signal == "tool_call" and not stream.tool_calls:
+                # A <tool_call> block was seen in a RESPONSE fragment but its
+                # JSON could not be parsed: treat it as a parser failure.
+                signal = None
+
+            if signal is None:
+                parse_candidate = self._audit_unparsed_tool_call(
+                    self._response_processor.raw_answer
+                )
                 if parse_candidate:
                     parse_fail_count += 1
-                    nudge_count = min(MAX_NUDGES_PER_TURN, nudge_count + 1)
+                    nudger.consecutive_failures += 1
+                    nudger.total_nudges += 1
                     if parse_fail_count <= MAX_NUDGES_PER_TURN:
-                        current_prompt = (
-                            "Your previous response contained a tool call that could not be "
-                            "parsed. Re-emit ONLY the tool call, using exactly this format "
-                            "and nothing else:\n\n"
-                            '<tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>\n\n'
-                            "Do not include any DSML, XML, closing tags, or prose."
-                        )
+                        current_prompt = PARSE_RETRY_MESSAGE
                         continue
                     stamp = int(time.time())
                     path = Path(f"/tmp/parse_fail_{stamp}.txt")
                     path.write_text("".join(self._answer_parts), encoding="utf-8")
                     sys.stderr.write(f"[parser] parse retries exhausted; saved raw response to {path}\n")
                     break
-                answer_text = "".join(self._raw_answer_parts).lower()
-                complete = "task complete" in answer_text or any(sig in answer_text for sig in (
-                    "task complete", "task is complete", "finished", "done.",
-                    "no further action", "all steps complete",
-                ))
-                if nudge_count < MAX_NUDGES_PER_TURN and not complete and self.tools_mode == "auto":
-                    nudge_count += 1
-                    self._indicator.show_nudge(nudge_count)
-                    current_prompt = NUDGE_MESSAGES[nudge_count - 1]
-                    continue
-                if not had_tool_call and not complete:
-                    stamp = int(time.time())
-                    path = Path(f"/tmp/prose_stop_{stamp}.txt")
-                    path.write_text("".join(self._answer_parts), encoding="utf-8")
-                    sys.stderr.write(
-                        f"[agent] prose-only stop. session={self.conversation_id} "
-                        f"saved={path}\n"
-                    )
+
+            decision = nudger.note(signal)
+            if decision == "complete":
                 self.registry.finish_iteration()
                 self._indicator.stop()
                 break
 
-            first_tool_this_turn = not had_tool_call
+            if decision in ("nudge", "give_up"):
+                if self.tools_mode != "auto":
+                    decision = "give_up"
+                if decision == "give_up":
+                    path = nudger.write_stop_file("".join(self._answer_parts))
+                    sys.stderr.write(
+                        f"[agent] prose-only stop. session={self.conversation_id} "
+                        f"saved={path}\n"
+                    )
+                    self.registry.finish_iteration()
+                    self._indicator.stop()
+                    break
+                self._indicator.show_nudge(nudger.total_nudges)
+                current_prompt = NUDGE_MESSAGE
+                continue
+
             had_tool_call = True
-            tool_count += len(stream.tool_calls)
+            to_execute, synthetic_errors = split_tool_calls(stream.tool_calls)
+            tool_count += len(to_execute)
 
             if self.tools_mode == "manual":
-                decisions = self._approve_tool_batch(stream.tool_calls)
-                results = executor.execute(stream.tool_calls, visible, decisions=decisions)
+                decisions = self._approve_tool_batch(to_execute)
+                results = executor.execute(
+                    to_execute, visible, decisions=decisions
+                ) + synthetic_errors
             else:
-                results = executor.execute(stream.tool_calls, visible)
+                results = executor.execute(to_execute, visible) + synthetic_errors
             for call, result in results:
                 self._turn_tool_result_chars += len(result)
                 self._emit_tool_result(call, result)
@@ -1456,9 +1470,14 @@ class DeepSeekCLI:
 
     def _finish_turn(self, prompt: str, new_cid: str | None,
                      prefix_chars: int | None = None) -> None:
+        tail = self._flush_answer_tail()
+        if tail:
+            self._answer_parts.append(tail)
+            if self.stream:
+                self.emit_event("answer", tail)
         if not self.stream:
             thinking = "".join(self._thinking_parts)
-            answer = "".join(self._answer_parts)
+            answer = strip_done("".join(self._answer_parts))
             if thinking:
                 self.emit_event("thinking", thinking)
             if answer:
@@ -1496,8 +1515,9 @@ class DeepSeekCLI:
     def _emit_tool_result(self, call: ToolCall, result: str) -> None:
         self.emit_event("tool_result", self._short_result(result, limit=500), name=call.name)
 
-    def _audit_unparsed_tool_call(self) -> bool:
-        raw = "".join(self._answer_parts)
+    def _audit_unparsed_tool_call(self, raw: str | None = None) -> bool:
+        if raw is None:
+            raw = "".join(self._raw_answer_parts)
         lowered = raw.lower()
         candidate = (
             "<tool_call" in lowered
@@ -1574,18 +1594,20 @@ class DeepSeekCLI:
     def _handle_part(self, kind: str, text: str) -> None:
         if kind == "answer":
             self._raw_answer_parts.append(text)
-            text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
-            text = re.sub(r"(?m)^TASK COMPLETE\s*$", "", text)
-            if not text:
+            self._response_processor.feed("answer", text)
+            visible = self._answer_chunk_visible(text)
+            if not visible:
                 return
-            self._answer_parts.append(text)
+            self._answer_parts.append(visible)
             if self.stream:
-                self.emit_event("answer", text)
+                self.emit_event("answer", visible)
         elif kind == "thinking":
             self._thinking_parts.append(text)
+            self._response_processor.feed("thinking", text)
             if self.stream:
                 self.emit_event("thinking", text)
         elif kind == "tool_call":
+            self._response_processor.feed("tool_call", text)
             name, arguments = self._parse_tool_call(text)
             self._pending_tool_names.append(name)
             self.emit_event("tool_call", name=name, arguments=arguments)
@@ -1595,6 +1617,30 @@ class DeepSeekCLI:
             self.emit_event("tool_result", result, name=name)
         else:
             self._render_system(f"[dim]{text}[/]")
+
+    def _answer_chunk_visible(self, text: str) -> str:
+        """Strip tool calls and <<DONE>> from a streamed answer chunk.
+
+        A trailing fragment that could be the start of ``<<DONE>>`` is held
+        back until more text arrives so a split marker never leaks out.
+        """
+        text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
+        combined = self._answer_tail + text
+        hold = 0
+        for n in range(min(len(DONE_TOKEN) - 1, len(combined)), 0, -1):
+            if combined.endswith(DONE_TOKEN[:n]):
+                hold = n
+                break
+        if hold:
+            self._answer_tail = combined[-hold:]
+            combined = combined[:-hold]
+        else:
+            self._answer_tail = ""
+        return combined.replace(DONE_TOKEN, "")
+
+    def _flush_answer_tail(self) -> str:
+        tail, self._answer_tail = self._answer_tail, ""
+        return strip_done(tail) if tail else ""
 
     @staticmethod
     def _parse_tool_call(text: str) -> tuple[str, dict]:

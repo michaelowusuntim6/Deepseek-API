@@ -1,0 +1,6 @@
+{
+  "network_retry": {
+    "response_timeout_minutes": 3,
+    "max_consecutive_retries": 5
+  }
+}

@@ -147,6 +147,54 @@ error, and `141` for a truncated pipe (`SIGPIPE` convention).
 
 ### Agent tool set
 
+### Response protocol
+
+The CLI drives the model through a strict, machine-checked protocol.
+
+**Completion marker.** When a task is complete the model writes a single line
+containing exactly `<<DONE>>`. The marker must be the only content on its line,
+it must be preceded by a blank line, and it must be followed by a blank line or
+the end of the response. A response with a malformed marker (inline text,
+missing blank lines, or more than one occurrence) is not treated as complete.
+The marker is a control signal: it is stripped and never shown to the user.
+
+**One tool call per response.** The model emits at most one
+`<tool_call>...</tool_call>` block per response and waits for the tool result
+before emitting the next call. If a response contains several calls, the
+harness executes only the first and returns a synthetic error result for each
+of the others telling the model to re-emit them separately.
+
+**No dangling preambles.** Prose such as "I'll run..." without a tool call is an
+incomplete turn. If the model intends to call a tool, the tool call must be in
+the same response. A response with neither a tool call nor a valid `<<DONE>>`
+is nudged; after five consecutive nudges the turn is abandoned and the raw
+response is saved to `/tmp/prose_stop_<ts>.txt`.
+
+**Network retry.** Retry behaviour is configured in `config.json` at the
+repository root and is re-read at the start of every request:
+
+```json
+{
+  "network_retry": {
+    "response_timeout_minutes": 3,
+    "max_consecutive_retries": 5
+  }
+}
+```
+
+`response_timeout_minutes` is a **stall detector**, not a wall-clock cap: it
+fires only when no bytes have arrived from the server for that long, so a
+response that keeps streaming for ten minutes never triggers it. When it
+fires, a stall with no bytes at all deletes the previous message and resends the
+input as a fresh message, while a stall after partial bytes reattaches to the
+same message id. The retry counter tracks consecutive failures of either kind
+and any successful response resets it to zero. After
+`max_consecutive_retries` consecutive attempts the CLI prints a
+`Network Connection Error` naming the attempt count, stops the operation, and
+does not retry again.
+
+### Agent tool set
+
 By default the CLI exposes the Codex-style tools:
 
 | Tool | Purpose |

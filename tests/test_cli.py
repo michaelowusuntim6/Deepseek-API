@@ -15,9 +15,35 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from deepseek.auth import Session
-from deepseek.client import DeepSeekClient, Reply, _extract_tool_call_json, _parse_sse
+from deepseek import net
+from deepseek.client import (
+    COMPLETION_PATH,
+    DeepSeekClient,
+    Reply,
+    _Stream,
+    _extract_tool_call_json,
+    _parse_sse,
+)
+from deepseek.response import (
+    DONE_TOKEN,
+    MAX_NUDGES_PER_TURN,
+    NUDGE_MESSAGE,
+    ResponseProcessor,
+    TurnNudger,
+    execute_first_tool_call,
+    has_valid_done,
+    strip_done,
+)
+from deepseek.agent_tools import ToolExecutor
 from deepseek.tools import Tool, ToolCall, execute_tool
-from deepseek_cli import DeepSeekCLI, WorkingIndicator, build_parser, read_file
+from deepseek_cli import (
+    DeepSeekCLI,
+    WorkingIndicator,
+    build_tool_registry,
+    build_parser,
+    codex_default_tools,
+    read_file,
+)
 
 
 def test_unknown_tool_returns_error() -> None:
@@ -93,7 +119,7 @@ def test_reply_tool_calls_list() -> None:
     print("  PASS: B4 Reply.tool_calls and compatibility alias")
 
 
-def test_stream_with_tools_executes_all_calls() -> None:
+def test_stream_with_tools_first_call_only() -> None:
     calls: list[tuple[str, dict]] = []
 
     def make(name: str):
@@ -133,10 +159,13 @@ def test_stream_with_tools_executes_all_calls() -> None:
     events = list(client.stream_with_tools("hi", [make("a"), make("b")], approval="auto"))
     assert [kind for kind, _ in events].count("tool_call") == 2
     assert [kind for kind, _ in events].count("tool_result") == 2
-    assert calls == [("a", {}), ("b", {"x": 1})]
+    assert calls == [("a", {})]
+    results = [text for kind, text in events if kind == "tool_result"]
+    assert any("ERROR: Multiple tool calls" in text and "TOOL RESULT for b" in text
+               for text in results)
     assert events[-1] == ("answer", "done")
     assert "Available tools:" in client.prompts[0]
-    print("  PASS: B4 stream_with_tools executes every requested tool")
+    print("  PASS: stream_with_tools executes only the first requested tool")
 
 
 def test_tool_preamble_cached_per_session() -> None:
@@ -273,12 +302,270 @@ def test_broken_pipe_exit_and_json_help() -> None:
     print("  PASS: JSON help emits JSON and broken pipes exit 141 cleanly")
 
 
+# ----- Strategy.md regression suite -----------------------------------------
+
+
+def test_response_search_excludes_thinking() -> None:
+    think_call = '{"name":"evil_think_call","arguments":{"x":1}}'
+    response_call = '{"name":"good_response_call","arguments":{"y":2}}'
+    lines = [
+        "data: " + json.dumps({
+            "p": "response/fragments",
+            "o": "APPEND",
+            "v": [
+                {"id": 1, "type": "THINK",
+                 "content": f"planning <tool_call>{think_call}</tool_call>\n\n{DONE_TOKEN}\n"},
+                {"id": 2, "type": "RESPONSE",
+                 "content": f"Working.\n<tool_call>{response_call}</tool_call>"},
+            ],
+        }),
+    ]
+    processor = ResponseProcessor().feed_all(_parse_sse(lines))
+    assert "evil_think_call" in processor.thinking
+    assert processor.done is False, "<<DONE>> inside THINK must not be searched"
+    assert len(processor.tool_calls) == 1
+    assert "good_response_call" in processor.tool_calls[0]
+    assert processor.signal == "tool_call"
+    print("  PASS: only RESPONSE fragments are searched for markers")
+
+
+def test_tool_call_takes_priority_over_done() -> None:
+    call = '<tool_call>{"name":"a","arguments":{}}</tool_call>'
+    raw = f"Running it now.\n\n{call}\n\n{DONE_TOKEN}\n"
+    processor = ResponseProcessor().feed_all([("answer", raw)])
+    assert processor.done is True
+    assert processor.signal == "tool_call"
+    print("  PASS: a tool call wins over a valid completion marker")
+
+
+def test_done_alone_ends_turn() -> None:
+    raw = f"All three commands ran.\n\n{DONE_TOKEN}\n"
+    processor = ResponseProcessor().feed_all([("answer", raw)])
+    assert processor.signal == "done"
+    nudger = TurnNudger(MAX_NUDGES_PER_TURN)
+    assert nudger.note(processor.signal) == "complete"
+    assert nudger.total_nudges == 0 and nudger.consecutive_failures == 0
+    print("  PASS: a valid <<DONE>> alone ends the turn without a nudge")
+
+
+def test_done_stripped_from_output() -> None:
+    raw = f"Report:\n\n{DONE_TOKEN}\n"
+    processor = ResponseProcessor().feed_all([("answer", raw)])
+    assert processor.visible_answer() == "Report:"
+
+    parser = build_parser()
+    args = parser.parse_args(["--tools", "off", "hi"])
+    app = DeepSeekCLI(args, parser, interactive=False, prompt="hi")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        app._handle_part("answer", "Report:\n\n<<DO")
+        app._handle_part("answer", "NE>>\n")
+        app._finish_turn("hi", None)
+    assert DONE_TOKEN not in "".join(app._answer_parts)
+    assert DONE_TOKEN not in buf.getvalue()
+    print("  PASS: <<DONE>> never reaches user-visible output")
+
+
+def test_done_malformed_not_complete() -> None:
+    cases = [
+        f"Here is the report. {DONE_TOKEN}\n",
+        f"{DONE_TOKEN}\n\n{DONE_TOKEN}\n",
+        f"Report.\n{DONE_TOKEN}\n",
+        f"{DONE_TOKEN}\n",
+    ]
+    for raw in cases:
+        assert not has_valid_done(raw), raw
+        processor = ResponseProcessor().feed_all([("answer", raw)])
+        assert processor.signal is None, raw
+    print("  PASS: malformed <<DONE>> is not treated as complete")
+
+
+def _tool_set(names: list[str]) -> tuple[list[Tool], list[str]]:
+    executed: list[str] = []
+
+    def make(name: str) -> Tool:
+        def fn(**kwargs) -> str:
+            executed.append(name)
+            return f"{name} result"
+        return Tool(name=name, description=name, parameters={"type": "object"}, fn=fn)
+
+    return [make(name) for name in names], executed
+
+
+def test_multiple_tool_calls_first_only() -> None:
+    tools, executed = _tool_set(["alpha", "beta", "gamma"])
+    calls = [
+        ToolCall("alpha", {}, '{"name":"alpha","arguments":{}}'),
+        ToolCall("beta", {"x": 1}, '{"name":"beta","arguments":{"x":1}}'),
+        ToolCall("gamma", {}, '{"name":"gamma","arguments":{}}'),
+    ]
+    results = execute_first_tool_call(ToolExecutor(approval="auto"), calls, tools)
+    assert executed == ["alpha"]
+    assert len(results) == 3
+    assert results[0] == (calls[0], "alpha result")
+    print("  PASS: only the first of three tool calls executes")
+
+
+def test_multiple_tool_calls_synthetic_errors() -> None:
+    tools, _ = _tool_set(["alpha", "beta", "gamma"])
+    calls = [
+        ToolCall("alpha", {}, "{}"),
+        ToolCall("beta", {}, "{}"),
+        ToolCall("gamma", {}, "{}"),
+    ]
+    results = execute_first_tool_call(ToolExecutor(approval="auto"), calls, tools)
+    assert results[1][0].name == "beta"
+    assert results[1][1].startswith("TOOL RESULT for beta:\nERROR: Multiple tool calls")
+    assert "Only the first was executed" in results[1][1]
+    assert results[2][0].name == "gamma"
+    assert results[2][1].startswith("TOOL RESULT for gamma:\nERROR: Multiple tool calls")
+    print("  PASS: synthetic errors name beta and gamma")
+
+
+def test_nudge_message_has_no_hardcoded_paths() -> None:
+    assert NUDGE_MESSAGE == (
+        "No tool call or <<DONE>> detected. Finish properly: either emit a "
+        "<tool_call> block now, or write <<DONE>> on its own line. Do not write prose."
+    )
+    for banned in ("~/", "Downloads", "hf_results", "ls ", "/home/", "Hugginface"):
+        assert banned not in NUDGE_MESSAGE, banned
+    print("  PASS: nudge text has no hardcoded commands or paths")
+
+
+def test_nudge_counter_resets_on_tool_success() -> None:
+    nudger = TurnNudger(MAX_NUDGES_PER_TURN)
+    trace = [nudger.consecutive_failures]
+    for signal in (None, "tool_call", None):
+        nudger.note(signal)
+        trace.append(nudger.consecutive_failures)
+    assert trace == [0, 1, 0, 1], trace
+    assert nudger.total_nudges == 2
+    print("  PASS: nudge counter resets to 0 after a successful tool call")
+
+
+def test_nudge_counter_dies_after_five_consecutive(tmp_path) -> None:
+    nudger = TurnNudger(MAX_NUDGES_PER_TURN)
+    decisions = [nudger.note(None) for _ in range(MAX_NUDGES_PER_TURN)]
+    assert decisions[:-1] == ["nudge"] * (MAX_NUDGES_PER_TURN - 1)
+    assert decisions[-1] == "give_up"
+    assert nudger.total_nudges == 5 and nudger.gave_up
+    path = nudger.write_stop_file("prose only", directory=tmp_path)
+    assert path.exists() and path.name.startswith("prose_stop_")
+    assert path.read_text() == "prose only"
+    print("  PASS: five consecutive failures nudge five times, then stop")
+
+
+def test_update_plan_still_registered() -> None:
+    names = {t.name for t in codex_default_tools()}
+    assert "update_plan" in names
+    tool_obj = next(t for t in codex_default_tools() if t.name == "update_plan")
+    assert callable(tool_obj.fn)
+    registry = build_tool_registry(
+        legacy_enabled=False, plan_enabled=False, plan_mode=False, verbose=False
+    )
+    assert "update_plan" in {t.name for t in registry.visible_tools()}
+    print("  PASS: update_plan stays registered and callable")
+
+
+def test_update_plan_rule_removed() -> None:
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "Mandatory planning" not in agents
+    assert "update_plan first" not in agents
+    assert DONE_TOKEN in agents
+    from deepseek.client import TOOL_SYSTEM_PREAMBLE
+    assert "call update_plan" not in TOOL_SYSTEM_PREAMBLE
+    assert "TASK COMPLETE" not in TOOL_SYSTEM_PREAMBLE
+    print("  PASS: planning-first rule removed from AGENTS.md and the preamble")
+
+
+def test_config_reloaded_per_request(tmp_path, monkeypatch) -> None:
+    real = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    assert real["network_retry"]["response_timeout_minutes"] == 3
+    assert real["network_retry"]["max_consecutive_retries"] == 5
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"network_retry": {
+        "response_timeout_minutes": 7, "max_consecutive_retries": 2}}))
+    monkeypatch.setattr(net, "DEFAULT_CONFIG_PATH", cfg)
+    first = net.load_network_retry_config()
+    cfg.write_text(json.dumps({"network_retry": {
+        "response_timeout_minutes": 1, "max_consecutive_retries": 9}}))
+    second = net.load_network_retry_config()
+    assert first.stall_timeout_seconds == 420
+    assert first.max_consecutive_retries == 2
+    assert second.stall_timeout_seconds == 60
+    assert second.max_consecutive_retries == 9
+    print("  PASS: config.json is re-read on every request")
+
+
+def test_stall_detector_no_bytes() -> None:
+    cfg = net.NetworkRetryConfig(response_timeout_minutes=3, max_consecutive_retries=5)
+    events: list[str] = []
+    state = {"n": 0}
+
+    def factory():
+        state["n"] += 1
+        if state["n"] == 1:
+            raise net.StallTimeout("no bytes")
+        return iter(["data: hi"])
+
+    retrier = net.StallRetrier(
+        cfg,
+        on_delete_previous=lambda: events.append("delete"),
+        on_reattach=lambda: events.append("reattach"),
+        error_stream=io.StringIO(),
+    )
+    assert list(retrier.run(factory)) == ["data: hi"]
+    assert events == ["delete"]
+    assert state["n"] == 2
+    print("  PASS: a no-bytes stall deletes the previous message and resends")
+
+
+def test_stall_retry_resets_on_success() -> None:
+    cfg = net.NetworkRetryConfig(response_timeout_minutes=3, max_consecutive_retries=5)
+    trace: list[int] = []
+    state: dict = {"n": 0, "retrier": None}
+
+    def factory():
+        trace.append(state["retrier"].consecutive_failures)
+        state["n"] += 1
+        if state["n"] <= 2:
+            raise net.StallTimeout("no bytes")
+        return iter(["data: ok"])
+
+    retrier = net.StallRetrier(cfg, error_stream=io.StringIO())
+    state["retrier"] = retrier
+    list(retrier.run(factory))
+    trace.append(retrier.consecutive_failures)
+    assert trace == [0, 1, 2, 0], trace
+    print("  PASS: retry counter goes 0 -> 1 -> 2 -> 0")
+
+
+def test_stall_max_retries_stops() -> None:
+    cfg = net.NetworkRetryConfig(response_timeout_minutes=3, max_consecutive_retries=5)
+    buf = io.StringIO()
+    attempts = {"n": 0}
+
+    def factory():
+        attempts["n"] += 1
+        raise net.StallTimeout("no bytes")
+
+    retrier = net.StallRetrier(cfg, error_stream=buf)
+    assert list(retrier.run(factory)) == []
+    assert attempts["n"] == 5
+    out = buf.getvalue()
+    assert "Network Connection Error" in out
+    assert "did not respond after 5 consecutive attempts" in out
+    assert "The operation has been stopped." in out
+    print("  PASS: five consecutive stalls stop the operation, no sixth retry")
+
+
 def main() -> None:
     test_unknown_tool_returns_error()
     test_parse_sse_collects_multiple_tool_calls()
     test_parse_sse_native_dsml_tool_call()
     test_reply_tool_calls_list()
-    test_stream_with_tools_executes_all_calls()
+    test_stream_with_tools_first_call_only()
     test_tool_preamble_cached_per_session()
     test_json_tool_result_event_shape()
     test_extension_command_contexts()

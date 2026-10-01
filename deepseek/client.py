@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Callable, Iterator, Literal, Optional
@@ -40,7 +41,9 @@ import httpx
 
 from . import auth
 from .auth import LoginRequired, Session, get_session
+from .net import StallDetector, StallRetrier, StallTimeout, load_network_retry_config
 from .pow import DeepSeekPow
+from .response import split_tool_calls
 from .tools import Tool, ToolCall, execute_tool
 
 BASE = "https://chat.deepseek.com"
@@ -56,21 +59,20 @@ Personality: Concise, direct, friendly. Keep the user informed without unnecessa
 
 ## Response discipline (read every time)
 
-Before you do anything else on a task, call update_plan with 3-5 steps. No exceptions. Even a one-step task gets a plan. The plan is how the harness knows you understood the request.
-
 Every response must be exactly one of:
 
-  A. A single sentence of intent, then one or more <tool_call> blocks.
-  B. A plan update via update_plan.
-  C. A final answer ending with the literal token TASK COMPLETE on its own line.
+  A. A single sentence of intent, then at most ONE <tool_call> block.
+  B. A final answer followed by the completion marker <<DONE>> alone on its own line.
 
-A response that is prose with no tool call and no TASK COMPLETE is incomplete. The harness will nudge you, and each nudge wastes a turn.
+A response that is prose with no tool call and no valid <<DONE>> is incomplete. The harness will nudge you, and each nudge wastes a turn.
+
+The completion marker <<DONE>> must be the only content on its line, with a blank line before it and a blank line after it (or the end of the response). It is a control signal and is never shown to the user.
 
 ## Task scope
 
 Do ONE thing per turn. Do not scaffold multiple files in a single turn unless the user explicitly asked for that. If the task requires more than three tool calls, decompose:
 
-  - First turn: update_plan, then the first atomic step.
+  - First turn: the first atomic step.
   - Next turns: one step at a time, in order.
 
 If the user's request is too broad to be a single atomic step, do the first atomic step and note in the response which step you completed. Do not attempt the whole request in one turn.
@@ -81,7 +83,9 @@ Call tools with exactly this format and nothing else:
 
     <tool_call>{{"name": "tool_name", "arguments": {{...}}}}</tool_call>
 
-Do not wrap the call in DSML, XML, <|tool_calls|>, or any other markup. Do not include more than one sentence of prose before the first <tool_call> block in a turn.
+Emit at most ONE <tool_call> block per response. If you emit more, only the first is executed; the rest get an error telling you to re-emit them separately. Wait for the tool result before emitting the next call.
+
+Do not wrap the call in DSML, XML, <|tool_calls|>, or any other markup. Do not include more than one sentence of prose before the first <tool_call> block in a turn. Never write a preamble like "I'll run..." and then stop without the tool call.
 
 Available tools:
 {tools_schema}
@@ -105,7 +109,7 @@ Example: if the user asks for weather and no weather tool is listed above, your 
 If the user asks to display or render an image, first call search_tools with query "image".
 If the user asks you to remember, recall, forget, or search memory, first call search_tools with query "memory".
 
-Use update_plan to keep an up-to-date, step-by-step plan. Provide a short list of 1-sentence steps (no more than 5-7 words each) with a status for each step (pending, in_progress, or completed). There should always be exactly one in_progress step until everything is done.
+Planning is optional. Use update_plan if it helps you organize your work; it is not required, and the user's explicit instructions always take priority over any planning suggestion.
 
 Shell guidelines: Prefer rg over grep. Read files in chunks of <=250 lines. Output is truncated at 10KB or 256 lines.
 
@@ -203,6 +207,26 @@ def _biz(data: dict) -> dict:
     if biz is None:
         raise RuntimeError(f"Unexpected response shape: {data}")
     return biz
+
+
+def _close_quietly(resp) -> None:
+    """Abort a stalled response so the blocked read unblocks."""
+    if resp is None:
+        return
+    try:
+        resp.close()
+    except Exception:
+        pass
+
+
+def _with_read_timeout(base, read_seconds: float) -> "httpx.Timeout":
+    """Return *base* with only its read timeout replaced (stall detector)."""
+    connect = getattr(base, "connect", None)
+    write = getattr(base, "write", None)
+    pool = getattr(base, "pool", None)
+    if connect is None and write is None and pool is None:
+        return httpx.Timeout(120.0, read=read_seconds)
+    return httpx.Timeout(connect=connect, read=read_seconds, write=write, pool=pool)
 
 
 class DeepSeekClient:
@@ -462,7 +486,8 @@ class DeepSeekClient:
                 return reply
 
             pairs: list[tuple[ToolCall, str]] = []
-            for call in reply.tool_calls:
+            to_execute, synthetic_errors = split_tool_calls(reply.tool_calls)
+            for call in to_execute:
                 tool_calls_made.append(call)
                 approved = self._approval_decision(call, approval, always_approved_tools)
                 result = (
@@ -471,6 +496,7 @@ class DeepSeekClient:
                     else "User rejected this tool call."
                 )
                 pairs.append((call, result))
+            pairs.extend(synthetic_errors)
 
             current_prompt = self._tool_result_prompt(pairs)
 
@@ -516,7 +542,8 @@ class DeepSeekClient:
                 return
 
             pairs: list[tuple[ToolCall, str]] = []
-            for call in s.tool_calls:
+            to_execute, synthetic_errors = split_tool_calls(s.tool_calls)
+            for call in to_execute:
                 approved = self._approval_decision(call, approval, always_approved_tools)
                 result = (
                     execute_tool(call, tools)
@@ -525,6 +552,9 @@ class DeepSeekClient:
                 )
                 pairs.append((call, result))
                 yield ("tool_result", result)
+            for call, error in synthetic_errors:
+                pairs.append((call, error))
+                yield ("tool_result", error)
 
             current_prompt = self._tool_result_prompt(pairs)
 
@@ -549,10 +579,11 @@ class _Stream:
         self._thinking = thinking
         self._search = search
         self._message_id: Optional[int] = None
+        self._attempts = 0
+        self.delete_message_hook: Optional[Callable[[str, Optional[int]], None]] = None
         self.tool_calls: list[ToolCall] = []
 
-    def iter_parts(self) -> Iterator[tuple[PartKind, str]]:
-        self._client._ensure_session_fresh()
+    def _request_body(self) -> dict:
         body = {
             "chat_session_id": self._session_id,
             "parent_message_id": self._parent_id,
@@ -565,6 +596,67 @@ class _Stream:
         }
         if self._model is not None:
             body["model_type"] = self._model
+        return body
+
+    def _delete_previous_message(self) -> None:
+        """Stall with no bytes: drop the failed message and resend it fresh.
+
+        DeepSeek exposes no delete endpoint in this codebase, so the client
+        abandons the local message id and re-POSTs the same input as a brand
+        new message. A host may supply ``delete_message_hook`` to also remove
+        the server-side message.
+        """
+        if self.delete_message_hook is not None:
+            try:
+                self.delete_message_hook(self._session_id, self._message_id)
+            except Exception as exc:  # pragma: no cover - best effort
+                _dlog(f"delete_message_hook failed: {exc}")
+        _dlog(f"stall with no bytes; resending fresh message (session={self._session_id})")
+        self._message_id = None
+
+    def _reattach_message(self) -> None:
+        """Stall after partial bytes: reuse the same message id."""
+        _dlog(
+            "stall after partial bytes; reattaching to message "
+            f"(session={self._session_id}, message={self._message_id})"
+        )
+
+    def _on_network_exhausted(self, attempts: int) -> None:
+        _dlog(f"network retries exhausted after {attempts} consecutive attempts")
+
+    def _open_lines(self, body: dict, headers: dict, timeout_seconds: float) -> Iterator[str]:
+        """Open one SSE attempt; raise :class:`StallTimeout` if it stalls."""
+        holder: dict = {}
+        detector = StallDetector(
+            timeout_seconds,
+            on_stall=lambda: _close_quietly(holder.get("response")),
+        )
+        timeout = _with_read_timeout(self._client._http.timeout, timeout_seconds)
+        with self._client._http.stream(
+            "POST", COMPLETION_PATH, json=body, headers=headers, timeout=timeout
+        ) as resp:
+            holder["response"] = resp
+            resp.raise_for_status()
+            detector.start()
+            try:
+                for line in resp.iter_lines():
+                    detector.feed()
+                    yield line
+            except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError,
+                    httpx.StreamClosed) as exc:
+                raise StallTimeout(
+                    f"no bytes for {timeout_seconds:.0f}s"
+                ) from exc
+            finally:
+                detector.stop()
+            if detector.fired:
+                raise StallTimeout(f"no bytes for {timeout_seconds:.0f}s")
+
+    def iter_parts(self) -> Iterator[tuple[PartKind, str]]:
+        self._client._ensure_session_fresh()
+        # Read the retry policy fresh at the start of every request lifecycle.
+        config = load_network_retry_config()
+        body = self._request_body()
         headers = {"x-ds-pow-response": self._client._pow_header()}
         if _DEBUG_LOG_PATH:
             _dlog(
@@ -573,39 +665,47 @@ class _Stream:
                              ensure_ascii=False)
             )
         meta: dict = {}
-        with self._client._http.stream(
-            "POST", COMPLETION_PATH, json=body, headers=headers
-        ) as resp:
-            resp.raise_for_status()
-            for kind, text in _parse_sse(resp.iter_lines(), meta):
-                if kind == "tool_call":
-                    try:
-                        data = _extract_tool_call_json(text)
-                        name = data.get("name", "")
-                        arguments = data.get("arguments", {})
-                        if isinstance(arguments, str):
-                            try:
-                                arguments = json.loads(arguments)
-                            except json.JSONDecodeError:
-                                pass
-                        if (
-                            isinstance(arguments, dict)
-                            and isinstance(arguments.get("arguments"), dict)
-                            and set(arguments).issubset({"name", "arguments"})
-                        ):
-                            name = arguments.get("name", name) or name
-                            arguments = arguments["arguments"]
-                        self.tool_calls.append(
-                            ToolCall(
-                                name=name,
-                                arguments=arguments,
-                                raw=json.dumps(data, ensure_ascii=False),
-                            )
+        retrier = StallRetrier(
+            config,
+            on_delete_previous=self._delete_previous_message,
+            on_reattach=self._reattach_message,
+            on_exhausted=self._on_network_exhausted,
+            error_stream=sys.stderr,
+        )
+
+        def attempt_lines() -> Iterator[str]:
+            self._attempts += 1
+            return self._open_lines(body, headers, config.stall_timeout_seconds)
+
+        for kind, text in _parse_sse(retrier.run(attempt_lines), meta):
+            if kind == "tool_call":
+                try:
+                    data = _extract_tool_call_json(text)
+                    name = data.get("name", "")
+                    arguments = data.get("arguments", {})
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            pass
+                    if (
+                        isinstance(arguments, dict)
+                        and isinstance(arguments.get("arguments"), dict)
+                        and set(arguments).issubset({"name", "arguments"})
+                    ):
+                        name = arguments.get("name", name) or name
+                        arguments = arguments["arguments"]
+                    self.tool_calls.append(
+                        ToolCall(
+                            name=name,
+                            arguments=arguments,
+                            raw=json.dumps(data, ensure_ascii=False),
                         )
-                        text = json.dumps(data, ensure_ascii=False)
-                    except Exception as e:
-                        _dlog(f"Failed to parse tool_call JSON: {e}")
-                yield (kind, text)
+                    )
+                    text = json.dumps(data, ensure_ascii=False)
+                except Exception as e:
+                    _dlog(f"Failed to parse tool_call JSON: {e}")
+            yield (kind, text)
 
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
