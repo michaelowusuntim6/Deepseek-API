@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - Windows without pyreadline
     readline = None  # type: ignore[assignment]
 
 from rich import box
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -717,6 +717,9 @@ class DeepSeekCLI:
         self._answer_line_open = False
         self._thinking_line_open = False
         self._answer_line_buffer = ""
+        self._in_code_fence = False
+        self._fence_lines: list[str] = []
+        self._fence_language = "text"
         self._pending_compaction_prefix: str | None = None
         self._summary_prefix_for_next_request: str | None = None
         self._plan_injected_cid: str | None = None
@@ -807,6 +810,8 @@ class DeepSeekCLI:
         self.ui.print(f"[bold red]error:[/] {message}")
 
     def _close_answer_line(self) -> None:
+        if self._in_code_fence:
+            self._flush_code_fence()
         if self._answer_line_buffer:
             self.out.print(Markdown(self._answer_line_buffer))
             self._answer_line_buffer = ""
@@ -828,7 +833,35 @@ class DeepSeekCLI:
         self._answer_line_buffer += text
         while "\n" in self._answer_line_buffer:
             line, self._answer_line_buffer = self._answer_line_buffer.split("\n", 1)
-            self.out.print(Markdown(line.rstrip("\r")))
+            self._emit_markdown_line(line.rstrip("\r"))
+
+    def _flush_code_fence(self) -> None:
+        if not self._fence_lines:
+            self._in_code_fence = False
+            return
+        code = "\n".join(self._fence_lines)
+        self.out.print(Panel(
+            Syntax(code, self._fence_language or "text", theme="monokai"),
+            border_style="cyan",
+            expand=False,
+        ))
+        self._fence_lines = []
+        self._fence_language = "text"
+        self._in_code_fence = False
+
+    def _emit_markdown_line(self, line: str) -> None:
+        stripped = line.strip()
+        if not self._in_code_fence and stripped.startswith("```"):
+            self._in_code_fence = True
+            self._fence_language = stripped[3:].strip() or "text"
+            return
+        if self._in_code_fence and stripped.startswith("```"):
+            self._flush_code_fence()
+            return
+        if self._in_code_fence:
+            self._fence_lines.append(line)
+            return
+        self.out.print(Markdown(line))
 
     def _close_thinking_line(self) -> None:
         if self._thinking_line_open:
@@ -1034,10 +1067,24 @@ class DeepSeekCLI:
             )
             return
         if sys.stdout.isatty():
+            rendered = []
+            for line in (diff_text or "").splitlines():
+                if line.startswith("+++") or line.startswith("---"):
+                    rendered.append(Text(line, style="bold"))
+                elif line.startswith("@@"):
+                    rendered.append(Text(line, style="bold cyan"))
+                elif line.startswith("+"):
+                    rendered.append(Text(line, style="bright_green on #0d2818"))
+                elif line.startswith("-"):
+                    rendered.append(Text(line, style="bright_red on #2d0d0d"))
+                else:
+                    rendered.append(Text(line))
             self.ui.print(
                 Panel(
-                    Syntax(diff_text or "(no textual diff)", "diff", theme="monokai"),
-                    title=path,
+                    Group(*rendered) if rendered else Text("(no textual diff)"),
+                    title=path if len(path) <= 60 else path[:57] + "...",
+                    border_style="cyan",
+                    expand=False,
                 )
             )
             return

@@ -208,6 +208,27 @@ def test_toolbar_reads_live_state() -> None:
     print("  PASS: toolbar reads live state")
 
 
+def test_streaming_code_fence_is_consumed() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--tools", "off", "hi"])
+    app = DeepSeekCLI(args, parser, interactive=False, prompt="hi")
+
+    class Capture:
+        def __init__(self):
+            self.items = []
+        def print(self, *args, **kwargs):
+            self.items.append(args[0] if args else "")
+
+    app.out = Capture()  # type: ignore[assignment]
+    app._emit_markdown_line("```python")
+    app._emit_markdown_line("x = 1")
+    assert app.out.items == []
+    app._emit_markdown_line("```")
+    assert len(app.out.items) == 1
+    assert app._in_code_fence is False
+    print("  PASS: streaming code fences are consumed")
+
+
 def test_broken_pipe_exit_and_json_help() -> None:
     cli = str(ROOT / "deepseek_cli.py")
     r = subprocess.run(
@@ -241,6 +262,7 @@ def main() -> None:
     test_json_tool_result_event_shape()
     test_extension_command_contexts()
     test_toolbar_reads_live_state()
+    test_streaming_code_fence_is_consumed()
     test_broken_pipe_exit_and_json_help()
     print("all CLI regression tests passed")
 
