@@ -1319,6 +1319,7 @@ class DeepSeekCLI:
                 self.client._remember_tool_prompt(schema, current_cid)
 
             if not stream.tool_calls:
+                self._audit_unparsed_tool_call()
                 self.registry.finish_iteration()
                 break
 
@@ -1378,6 +1379,28 @@ class DeepSeekCLI:
 
     def _emit_tool_result(self, call: ToolCall, result: str) -> None:
         self.emit_event("tool_result", self._short_result(result, limit=500), name=call.name)
+
+    def _audit_unparsed_tool_call(self) -> None:
+        raw = "".join(self._answer_parts)
+        lowered = raw.lower()
+        candidate = (
+            "<tool_call" in lowered
+            or "｜｜dsml" in lowered
+            or "invoke name=" in lowered
+            or ('"name":' in raw and '"arguments":' in raw)
+        )
+        if not candidate:
+            return
+        timestamp = int(time.time())
+        path = Path(f"/tmp/parser_fail_{timestamp}.txt")
+        path.write_text(raw, encoding="utf-8")
+        sys.stderr.write(
+            "[parser] unparsed tool-call candidate: " + raw[:500].replace("\n", "\\n") + "\n"
+        )
+        sys.stderr.write(
+            "[parser] a tool call was emitted but could not be parsed; turn ended "
+            f"without execution. Raw stream saved to {path}\n"
+        )
 
     def _maybe_compact_before_turn(self) -> None:
         if not self.conversation_id:

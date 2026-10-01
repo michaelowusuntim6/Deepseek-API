@@ -58,6 +58,12 @@ Before tool calls, send a brief 1-2 sentence preamble (8-12 words) explaining wh
 
 You have access to the following tools. When you want to call one or more tools, respond with ONLY <tool_call></tool_call> blocks and nothing else before or after them. Each block must contain one JSON object with keys "name" (string) and "arguments" (object). Wait for the tool results before continuing. If no tool is needed, respond normally without any tool_call tags.
 
+Call tools with exactly this format and nothing else:
+
+    <tool_call>{{"name": "tool_name", "arguments": {{...}}}}</tool_call>
+
+Do not wrap the call in DSML, XML, <|tool_calls|>, or any other markup. Do not include prose before or after the tool call block.
+
 Available tools:
 {tools_schema}
 
