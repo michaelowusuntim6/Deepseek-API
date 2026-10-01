@@ -23,6 +23,7 @@ import random
 import re
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 from collections import deque
@@ -121,6 +122,38 @@ class UsageErrorParser(argparse.ArgumentParser):
             self.exit(EXIT_USAGE)
         self.print_usage(sys.stderr)
         self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
+
+
+class WorkingIndicator:
+    VERBS = ["Triangulating", "Dreaming", "Modelling", "Reasoning",
+             "Cogitating", "Synthesizing", "Consulting", "Formulating", "Weaving"]
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._started = False
+
+    def start(self):
+        if not self._started:
+            self._started = True
+            self._thread.start()
+
+    def stop(self):
+        if not self._started:
+            return
+        self._stop.set()
+        self._thread.join(timeout=2)
+        sys.stderr.write("\r\033[2K")
+        sys.stderr.flush()
+        self._started = False
+
+    def _run(self):
+        idx = 0
+        while not self._stop.is_set():
+            sys.stderr.write(f"\r\033[2K{self.VERBS[idx % len(self.VERBS)]}…")
+            sys.stderr.flush()
+            idx += 1
+            self._stop.wait(1.5)
 
 
 # ----- Built-in tools --------------------------------------------------------
@@ -600,7 +633,7 @@ _TIPS = [
     "Use --json for one JSON object per line on stdout.",
     "Use --tools manual to approve every tool call.",
     "Use --resume <conversation_id> to continue a prior thread.",
-    "Use --thinking --show-thinking to inspect reasoning.",
+    "Use --show-thinking to inspect reasoning.",
     "Type /help to list slash commands.",
 ]
 
@@ -621,13 +654,14 @@ def build_parser() -> UsageErrorParser:
     )
     p.add_argument("prompt", nargs="?", help="prompt for one-shot mode; omit for the REPL")
     p.add_argument("--model", choices=sorted(MODEL_CHOICES), help="model alias: chat or expert")
-    p.add_argument("--thinking", action="store_true", help="enable DeepThink reasoning")
+    p.add_argument("--no-thinking", action="store_true",
+                   help="disable DeepThink reasoning (enabled by default)")
     p.add_argument("--no-search", action="store_true",
                    help="disable DeepSeek model-side web search (enabled by default)")
     p.add_argument(
         "--tools",
         choices=("off", "manual", "auto"),
-        default="manual",
+        default="auto",
         help="tool mode: off (strip tools), manual (approve), auto (unattended)",
     )
     p.add_argument("--show-thinking", action="store_true", help="display DeepThink reasoning")
@@ -681,7 +715,7 @@ class DeepSeekCLI:
         self.model_alias = args.model or "chat"
         self.model = MODEL_CHOICES[self.model_alias][0]
         self.wire_model_first = MODEL_CHOICES[self.model_alias][1]
-        self.thinking = bool(args.thinking)
+        self.thinking = not bool(getattr(args, "no_thinking", False))
         self.search = not bool(getattr(args, "no_search", False))
         self.tools_mode = args.tools
         self.mode = args.mode
@@ -1117,9 +1151,11 @@ class DeepSeekCLI:
                     expand=False,
                 )
             )
+            self.ui.print(f"• Edited {path} (+{additions} -{deletions})")
             return
         if diff_text:
             self.out.print(diff_text, markup=False, highlight=False)
+        self.ui.print(f"• Edited {path} (+{additions} -{deletions})")
 
     def _load_and_show_resumed_plan(self) -> None:
         if not self.conversation_id:
@@ -1212,7 +1248,10 @@ class DeepSeekCLI:
                 thinking=self.thinking,
                 search=self.search,
             )
+            indicator = WorkingIndicator()
+            indicator.start()
             for kind, text in stream.iter_parts():
+                indicator.stop()
                 self._handle_part(kind, text)
             new_cid = stream.conversation_id
         else:
@@ -1267,7 +1306,10 @@ class DeepSeekCLI:
                 thinking=self.thinking,
                 search=self.search,
             )
+            indicator = WorkingIndicator()
+            indicator.start()
             for kind, text in stream.iter_parts():
+                indicator.stop()
                 self._handle_part(kind, text)
 
             current_cid = stream.conversation_id
@@ -1637,7 +1679,7 @@ class DeepSeekCLI:
             table.add_row(cmd, "extension command")
         self.ui.print(table)
         self.ui.print(
-            "[dim]Flags are available on startup: --model, --thinking, --no-search, "
+            "[dim]Flags are available on startup: --model, --no-thinking, --no-search, "
             "--tools, --show-thinking, --json, --resume, --no-stream, "
             "--legacy-tools, --compact-at, --plan-mode, --mode.[/]"
         )
@@ -1799,7 +1841,7 @@ def read_prompt(args: argparse.Namespace, parser: UsageErrorParser) -> tuple[boo
     if args.show_thinking and not args.thinking:
         # This is legal, but almost always a mistake. Keep it non-fatal and
         # explicit instead of silently enabling DeepThink.
-        sys.stderr.write("[cli] note: --show-thinking has no effect without --thinking\n")
+        sys.stderr.write("[cli] note: --show-thinking has no effect with --no-thinking\n")
 
     if args.prompt is not None:
         return False, args.prompt

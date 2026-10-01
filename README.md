@@ -123,10 +123,10 @@ context estimate, followed by a dim status footer before each prompt.
 | Flag | Values | Effect |
 | --- | --- | --- |
 | `--model` | `chat`, `expert` | Select DeepSeek Instant or Expert |
-| `--thinking` | flag | Enable DeepThink reasoning |
+| `--no-thinking` | flag | Disable DeepThink reasoning (enabled by default) |
 | `--show-thinking` | flag | Display the reasoning trace during streaming |
 | `--no-search` | flag | Disable DeepSeek model-side web search (enabled by default) |
-| `--tools` | `off`, `manual`, `auto` | Strip tools, approve each call, or run unattended |
+| `--tools` | `off`, `manual`, `auto` | Strip tools, approve each call, or run unattended (default: `auto`) |
 | `--json` | flag | Emit one JSON object per line on stdout |
 | `--resume` | conversation id | Continue an existing thread |
 | `--no-stream` | flag | Buffer the answer instead of streaming tokens |

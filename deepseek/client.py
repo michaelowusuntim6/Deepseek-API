@@ -648,16 +648,26 @@ def _dsml_calls_to_json(text: str) -> Iterator[str]:
         yield json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False)
 
 
-def _extract_tool_call_json(text: str) -> dict:
+def _extract_tool_call_json(text: str) -> Optional[dict]:
     """Extract the first complete JSON object from a possibly DSML-suffixed string."""
     start = text.find("{")
     if start < 0:
-        raise json.JSONDecodeError("no JSON object found", text, 0)
+        return None
     decoder = json.JSONDecoder()
-    obj, _ = decoder.raw_decode(text[start:])
-    if not isinstance(obj, dict):
-        raise json.JSONDecodeError("tool call JSON is not an object", text, start)
-    return obj
+    try:
+        obj, _ = decoder.raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict) or "name" not in obj:
+        return None
+    if "arguments" not in obj:
+        obj["arguments"] = {}
+    if isinstance(obj["arguments"], str):
+        try:
+            obj["arguments"] = json.loads(obj["arguments"])
+        except json.JSONDecodeError:
+            return None
+    return obj if isinstance(obj["arguments"], dict) else None
 
 
 def _fragment_kind(frag: dict) -> Optional[PartKind]:
