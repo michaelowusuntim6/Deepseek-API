@@ -488,7 +488,6 @@ BUILTIN_SLASH_COMMANDS = {
     "/agents-init": "generate AGENTS.md for the current repository",
     "/extensions": "list loaded extensions and their tools",
     "/reload": "reload extensions from disk",
-    "/refresh": "redraw the session panel",
     "/exit": "quit",
 }
 
@@ -614,7 +613,6 @@ class DeepSeekCLI:
         )
         self.extension_commands: dict[str, Callable] = {}
         self.repl_session = None
-        self._panel_dirty = False
         self.approved_tools: set[str] = set()
         self._pending_tool_names: deque[str] = deque()
         self._answer_parts: list[str] = []
@@ -785,8 +783,14 @@ class DeepSeekCLI:
         table.add_row("Context", self.context_estimate())
         self.ui.print(Panel(table, title="Session", box=box.SQUARE, width=width))
 
-    def mark_panel_dirty(self) -> None:
-        self._panel_dirty = True
+    def toolbar_text(self):
+        return (
+            f" {self.model}  ·  think {'on' if self.thinking else 'off'}"
+            f"  ·  search {'on' if self.search else 'off'}"
+            f"  ·  tools {self.tools_mode}"
+            f"  ·  agent {self.mode}"
+            f"  ·  {self.short_thread()}  ·  ctx ~{max(0, self.context_chars // 4):,} tok "
+        )
 
     def short_thread(self) -> str:
         if not self.conversation_id:
@@ -974,7 +978,11 @@ class DeepSeekCLI:
         commands = dict(BUILTIN_SLASH_COMMANDS)
         for name in sorted(self.extension_commands):
             commands.setdefault(name, "extension command")
-        self.repl_session = create_session(sorted(commands.items()), SLASH_COMMAND_ARGUMENTS)
+        self.repl_session = create_session(
+            sorted(commands.items()),
+            SLASH_COMMAND_ARGUMENTS,
+            bottom_toolbar=self.toolbar_text,
+        )
 
     # ----- turn execution --------------------------------------------------
 
@@ -1140,7 +1148,6 @@ class DeepSeekCLI:
             + len("".join(self._thinking_parts))
             + self._turn_tool_result_chars
         )
-        self.mark_panel_dirty()
 
     def _flush_json_answer(self) -> None:
         if not self.json_mode or not self._json_answer_buffer:
@@ -1182,7 +1189,6 @@ class DeepSeekCLI:
         self._pending_compaction_prefix = result.prefix
         self.context_chars = len(result.prefix)
         self._plan_injected_cid = None
-        self.mark_panel_dirty()
         self._render_system(
             "Context compacted. New thread: "
             f"[bold]{result.new_conversation_id}[/]. Previous summary saved to "
@@ -1344,9 +1350,6 @@ class DeepSeekCLI:
         try:
             while True:
                 self.render_status()
-                if self._panel_dirty:
-                    self.print_session_panel()
-                    self._panel_dirty = False
                 try:
                     if self.repl_session is None:
                         self.refresh_repl_session()
@@ -1392,7 +1395,6 @@ class DeepSeekCLI:
             self._plan_injected_cid = None
             self.runtime.conversation_id = None
             self._reload_memory()
-            self.mark_panel_dirty()
             self._render_system("[green]Started a new thread.[/]")
         elif cmd == "/thread":
             self._render_system(
@@ -1412,8 +1414,6 @@ class DeepSeekCLI:
                 )
         elif cmd == "/plan":
             self.command_plan(arg)
-        elif cmd == "/refresh":
-            self.print_session_panel()
         elif cmd == "/agents":
             if self.agents_path:
                 self._render_system(
@@ -1481,7 +1481,6 @@ class DeepSeekCLI:
         self.model_alias = arg
         self.model = MODEL_CHOICES[arg][0]
         self.wire_model_first = MODEL_CHOICES[arg][1]
-        self.mark_panel_dirty()
         suffix = (
             " [dim](current thread keeps its original model; use /new to switch)[/]"
             if self.conversation_id
@@ -1498,7 +1497,6 @@ class DeepSeekCLI:
         else:
             value = not getattr(self, attr)
         setattr(self, attr, value)
-        self.mark_panel_dirty()
         label = "DeepThink" if attr == "thinking" else "Web search"
         self._render_system(f"{label} → [bold]{'on' if value else 'off'}[/]")
 
@@ -1508,7 +1506,6 @@ class DeepSeekCLI:
             self.autonomous = bool(arg == "auto" or self.mode == "agent")
             self.plan_enabled = bool(self.autonomous or self.plan_mode)
             self.reload_tools()
-            self.mark_panel_dirty()
             self._render_system(f"Tool mode → [bold]{arg}[/]")
         elif not arg:
             self._render_system(f"tool mode = [bold]{self.tools_mode}[/]")
@@ -1567,7 +1564,6 @@ class DeepSeekCLI:
             self.autonomous = bool(arg == "auto" or self.mode == "agent")
             self.plan_enabled = bool(self.autonomous or self.plan_mode)
             self.reload_tools()
-            self.mark_panel_dirty()
             self._render_system(f"Tools → [bold]{arg}[/]")
         elif arg == "list" or not arg:
             table = Table(title="Registered tools", box=box.SIMPLE)

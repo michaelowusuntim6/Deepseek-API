@@ -22,6 +22,7 @@ PICKER_COMMANDS = frozenset({
 
 def claude_style() -> Style:
     return Style.from_dict({
+        "toolbar": "bg:#222222 fg:#bbbbbb",
         "completion-menu.completion": "bg:default fg:default",
         "completion-menu.completion.current": "bg:#3a3a3a fg:#ffffff",
         "completion-menu.meta.completion": "bg:default fg:#888888",
@@ -94,7 +95,8 @@ class SlashCommandCompleter(Completer):
 
 
 def create_session(commands: list[tuple[str, str]],
-                   arguments: dict[str, list[tuple[str, str]]]) -> PromptSession:
+                   arguments: dict[str, list[tuple[str, str]]],
+                   bottom_toolbar=None) -> PromptSession:
     completer = SlashCommandCompleter(commands, arguments)
     kb = KeyBindings()
     selected = {"index": 0}
@@ -167,6 +169,7 @@ def create_session(commands: list[tuple[str, str]],
         complete_style=CompleteStyle.COLUMN,
         history=FileHistory(str(hist_path)),
         style=claude_style(),
+        bottom_toolbar=bottom_toolbar,
         reserve_space_for_menu=8,
     )
     session._deepseek_completer = completer  # type: ignore[attr-defined]
