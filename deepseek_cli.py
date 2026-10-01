@@ -494,7 +494,12 @@ BUILTIN_SLASH_COMMANDS = {
 SLASH_COMMAND_ARGUMENTS = {
     "/model": [("chat", "Fast default"), ("expert", "Stronger, slower")],
     "/mode": [("manual", "Prompt before tools"), ("auto", "Run tools unattended")],
-    "/tools": [("on", "Enable tools"), ("off", "Disable tools"), ("list", "List tools")],
+    "/tools": [
+        ("off", "Disable tool calling"),
+        ("manual", "Prompt before each tool call"),
+        ("auto", "Run without prompting"),
+        ("list", "Show all registered tools"),
+    ],
     "/plan": [("clear", "Delete plan"), ("resume", "Resume in-progress step")],
     "/thinking": [("on", "Enable DeepThink"), ("off", "Disable DeepThink")],
     "/search": [("on", "Enable web search"), ("off", "Disable web search")],
@@ -755,6 +760,7 @@ class DeepSeekCLI:
         version_line = f"deepseek-cli v{__version__}  ·  model {self.model}"
         update = os.getenv("DEEPSEEK_CLI_UPDATE_NOTICE")
         body = version_line
+        body += "\n[dim]By Michael Owusu Ntim[/]"
         if update:
             body += f"\n[bold yellow]update:[/] {update}"
         self.ui.print(Panel(body, title="DeepSeek CLI", box=box.ROUNDED, width=width))
@@ -770,17 +776,14 @@ class DeepSeekCLI:
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold")
         table.add_column()
-        table.add_row("Model", self.model)
-        table.add_row("Directory", str(Path.cwd()))
-        table.add_row("Permissions", f"tools={self.tools_mode}")
-        table.add_row("DeepThink", "on" if self.thinking else "off")
-        table.add_row("Web search", "on" if self.search else "off")
-        table.add_row("Tool mode", self.tools_mode)
-        table.add_row("Agent mode", self.mode)
-        table.add_row("Deferred tools", str(len(self.registry.deferred_tools)))
-        table.add_row("Compact at", f"{self.compaction.threshold:,} tokens")
-        table.add_row("Thread", self.short_thread())
-        table.add_row("Context", self.context_estimate())
+        cwd = str(Path.cwd())
+        home = str(Path.home())
+        if cwd.startswith(home):
+            cwd = "~" + cwd[len(home):]
+        table.add_row("dir", cwd)
+        table.add_row("permissions", f"tools={self.tools_mode}")
+        table.add_row("deferred", str(len(self.registry.deferred_tools)))
+        table.add_row("compact", f"{self.compaction.threshold:,} tokens")
         self.ui.print(Panel(table, title="Session", box=box.SQUARE, width=width))
 
     def toolbar_text(self):

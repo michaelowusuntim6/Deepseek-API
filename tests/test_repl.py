@@ -33,6 +33,11 @@ def test_repl_completions() -> None:
         {"/tools": [("list", "List")]},
     )
     assert complete(tools, "/tools")[0].text == "/tools"
+    tools_args = SlashCommandCompleter(
+        [("/tools", "Tools")],
+        {"/tools": [("off", "off"), ("manual", "manual"), ("auto", "auto"), ("list", "list")]},
+    )
+    assert {c.text for c in complete(tools_args, "/tools ")} == {"off", "manual", "auto", "list"}
     assert complete(tools, "/thinking")[0].text == "/thinking "
     assert complete(tools, "/help")[0].text == "/help"
     assert PICKER_COMMANDS == {
