@@ -214,7 +214,7 @@ argument list after the space, for example `/model ` shows `chat` and `expert`.
 | `/clear` | Clear the terminal display |
 | `/model [chat\|expert]` | Show or set the model |
 | `/thinking [on\|off]` | Toggle DeepThink |
-| `/search [on\|off]` | Toggle web search |
+| `/search [on\|off]` | Toggle DeepSeek model-side web search (not an agent tool) |
 | `/mode manual\|auto` | Set tool approval mode |
 | `/tools off\|manual\|auto\|list` | Configure tools or list them |
 | `/compact` | Manually summarize and restart the context window |

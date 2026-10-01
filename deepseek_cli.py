@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fnmatch
+import html
 import inspect
 import io
 import json
@@ -27,6 +28,7 @@ import urllib.request
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
+from html.parser import HTMLParser
 
 try:
     import readline
@@ -392,6 +394,92 @@ def fetch_url(url: str, max_bytes: int = 8000) -> str:
         return f"error fetching '{url}': {type(e).__name__}: {e}"
 
 
+class _DDGResultParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._in_title = False
+        self._in_snippet = False
+        self._href = ""
+        self._title = ""
+        self._snippet = ""
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        cls = attrs.get("class", "")
+        if tag == "a" and "result__a" in cls:
+            self._in_title = True
+            self._href = attrs.get("href", "")
+            self._title = ""
+        elif "result__snippet" in cls:
+            self._in_snippet = True
+            self._snippet = ""
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._in_title:
+            self._in_title = False
+        if self._in_snippet and tag in {"a", "div", "td"}:
+            self._in_snippet = False
+            if self._href and self._title:
+                self.results.append((self._title.strip(), self._href, self._snippet.strip()))
+
+    def handle_data(self, data):
+        if self._in_title:
+            self._title += data
+        elif self._in_snippet:
+            self._snippet += data
+
+
+@tool(eager=True, read_only=True)
+def web_search(query: str, max_results: int = 5) -> str:
+    """Search the web with DuckDuckGo HTML and return top results.
+
+    Args:
+        query: Search query.
+        max_results: Maximum number of results.
+    """
+    try:
+        from urllib.parse import quote_plus
+        url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read(200000).decode("utf-8", errors="replace")
+        parser = _DDGResultParser()
+        parser.feed(body)
+        results = parser.results[: max(1, int(max_results))]
+        if not results:
+            api_url = (
+                "https://api.duckduckgo.com/?q="
+                + quote_plus(query)
+                + "&format=json&no_html=1&skip_disambig=1"
+            )
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if data.get("AbstractURL"):
+                results.append((
+                    data.get("Heading") or query,
+                    data["AbstractURL"],
+                    data.get("AbstractText") or "",
+                ))
+            for topic in data.get("RelatedTopics") or []:
+                if len(results) >= max(1, int(max_results)):
+                    break
+                if isinstance(topic, dict) and topic.get("FirstURL"):
+                    results.append((
+                        topic.get("Text") or query,
+                        topic["FirstURL"],
+                        topic.get("Text") or "",
+                    ))
+        if not results:
+            return "Error: web_search returned no parseable results."
+        return "\n\n".join(
+            f"{title}\n{url}\n{snippet}" for title, url, snippet in results
+        )
+    except Exception as exc:
+        return f"Error: web_search failed: {type(exc).__name__}: {exc}"
+
+
 def legacy_tools() -> list[Tool]:
     """Return the legacy file-oriented tool tier."""
     tools = [
@@ -424,6 +512,8 @@ def codex_default_tools(plan_enabled: bool = False,
         list_skills,
         use_skill,
         read_skill_file,
+        fetch_url,
+        web_search,
     ]
 
 
@@ -478,7 +568,7 @@ BUILTIN_SLASH_COMMANDS = {
     "/clear": "clear the terminal display",
     "/model": "show or set model: chat | expert",
     "/thinking": "toggle DeepThink reasoning",
-    "/search": "toggle web search",
+    "/search": "toggle model web search (not an agent tool)",
     "/mode": "set approval mode: manual | auto",
     "/tools": "set tools: off | manual | auto | list",
     "/compact": "summarize and restart the context window",
@@ -617,6 +707,7 @@ class DeepSeekCLI:
             plan_store=self.plan_store,
         )
         self.extension_commands: dict[str, Callable] = {}
+        self._extensions_reported = False
         self.repl_session = None
         self.approved_tools: set[str] = set()
         self._pending_tool_names: deque[str] = deque()
@@ -789,7 +880,7 @@ class DeepSeekCLI:
     def toolbar_text(self):
         return (
             f" {self.model}  ·  think {'on' if self.thinking else 'off'}"
-            f"  ·  search {'on' if self.search else 'off'}"
+            f"  ·  model-search {'on' if self.search else 'off'}"
             f"  ·  tools {self.tools_mode}"
             f"  ·  agent {self.mode}"
             f"  ·  {self.short_thread()}  ·  ctx ~{max(0, self.context_chars // 4):,} tok "
@@ -855,8 +946,9 @@ class DeepSeekCLI:
             legacy_enabled=self.legacy_tools_enabled,
             plan_enabled=self.plan_enabled,
             plan_mode=self.plan_mode,
-            verbose=not self.json_mode,
+            verbose=not self.json_mode and not self._extensions_reported,
         )
+        self._extensions_reported = True
         self.tools = self.registry.visible_tools()
         self.runtime.tool_registry = self.registry
         set_agent_runtime(self.runtime)
