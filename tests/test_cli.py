@@ -195,6 +195,16 @@ def test_extension_command_contexts() -> None:
     print("  PASS: B2 extension commands receive emit/app or keep legacy print")
 
 
+def test_panel_dirty_on_state_change() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--tools", "off", "hi"])
+    app = DeepSeekCLI(args, parser, interactive=False, prompt="hi")
+    app._panel_dirty = False
+    app.command_toggle("thinking", "on")
+    assert app._panel_dirty is True
+    print("  PASS: panel dirty flag is set by state changes")
+
+
 def test_broken_pipe_exit_and_json_help() -> None:
     cli = str(ROOT / "deepseek_cli.py")
     r = subprocess.run(
@@ -227,6 +237,7 @@ def main() -> None:
     test_tool_preamble_cached_per_session()
     test_json_tool_result_event_shape()
     test_extension_command_contexts()
+    test_panel_dirty_on_state_change()
     test_broken_pipe_exit_and_json_help()
     print("all CLI regression tests passed")
 
