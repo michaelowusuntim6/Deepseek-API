@@ -198,8 +198,13 @@ python deepseek_cli.py --tools auto "show tests/fixtures/test_image.png"
 
 ### Slash commands
 
-Slash commands are available in the REPL. Tab completion is provided through
-`readline`.
+Slash commands are available in the REPL. Typing `/` opens a prompt_toolkit
+completion menu: a flat list with no box border, descriptions dimmed to the
+right, differential redraw, scrolling, terminal resize support, and Ctrl+R
+history search. Matching uses exact, prefix, then fuzzy order. Arrow keys move
+the highlight, Enter submits, Tab completes the highlighted command, and Esc
+closes the menu while keeping the text. Commands with arguments switch to an
+argument list after the space, for example `/model ` shows `chat` and `expert`.
 
 | Command | Effect |
 | --- | --- |
@@ -422,6 +427,9 @@ A self-imposed sliding-window limiter caps requests per client IP (default `30/m
   that it is not over 500 lines, and that it is in the current directory, a
   parent up to the git/filesystem root, or `.agents/AGENTS.md`. Use
   `--no-agents` only if you want discovery disabled.
+- **The popup stacks:** This was fixed by replacing the hand-rolled renderer
+  with prompt_toolkit. Run `pip install -r requirements.txt` and use the latest
+  commit.
 - **Sign in once, then reuse.** The cached session refreshes automatically; you only re-sign-in if it fully expires.
 - **Be reasonable.** Use it in moderation; don't spam or bulk-automate.
 - **No real token counts.** `usage` in server responses is a rough ~4-chars/token estimate.

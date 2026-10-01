@@ -75,6 +75,7 @@ from deepseek.skills import (
     skills_preamble,
     use_skill,
 )
+from deepseek.repl import create_session
 from deepseek.tool_search import DeferredToolRegistry, search_tools
 from deepseek.extensions import load_context_providers
 
@@ -490,6 +491,15 @@ BUILTIN_SLASH_COMMANDS = {
     "/exit": "quit",
 }
 
+SLASH_COMMAND_ARGUMENTS = {
+    "/model": [("chat", "Fast default"), ("expert", "Stronger, slower")],
+    "/mode": [("manual", "Prompt before tools"), ("auto", "Run tools unattended")],
+    "/tools": [("on", "Enable tools"), ("off", "Disable tools"), ("list", "List tools")],
+    "/plan": [("clear", "Delete plan"), ("resume", "Resume in-progress step")],
+    "/thinking": [("on", "Enable DeepThink"), ("off", "Disable DeepThink")],
+    "/search": [("on", "Enable web search"), ("off", "Disable web search")],
+}
+
 _TIPS = [
     "Use --json for one JSON object per line on stdout.",
     "Use --tools manual to approve every tool call.",
@@ -602,6 +612,7 @@ class DeepSeekCLI:
             plan_store=self.plan_store,
         )
         self.extension_commands: dict[str, Callable] = {}
+        self.repl_session = None
         self.approved_tools: set[str] = set()
         self._pending_tool_names: deque[str] = deque()
         self._answer_parts: list[str] = []
@@ -812,6 +823,7 @@ class DeepSeekCLI:
 
         self.reload_tools()
         self.extension_commands = load_extension_commands()
+        self.refresh_repl_session()
         self._load_context_layers()
         self.runtime.conversation_id = self.conversation_id
         self.runtime.tool_registry = self.registry
@@ -945,6 +957,12 @@ class DeepSeekCLI:
             readline.parse_and_bind("tab: complete")
         except Exception:
             pass
+
+    def refresh_repl_session(self) -> None:
+        commands = dict(BUILTIN_SLASH_COMMANDS)
+        for name in sorted(self.extension_commands):
+            commands.setdefault(name, "extension command")
+        self.repl_session = create_session(sorted(commands.items()), SLASH_COMMAND_ARGUMENTS)
 
     # ----- turn execution --------------------------------------------------
 
@@ -1309,19 +1327,13 @@ class DeepSeekCLI:
     def run_repl(self) -> int:
         self.init_client()
         self.render_startup()
-        if readline is not None:
-            hist = Path.home() / ".deepseek_cli_history"
-            try:
-                if hist.exists():
-                    readline.read_history_file(str(hist))
-                readline.set_history_length(1000)
-            except Exception:
-                pass
         try:
             while True:
                 self.render_status()
                 try:
-                    raw = input("> ")
+                    if self.repl_session is None:
+                        self.refresh_repl_session()
+                    raw = self.repl_session.prompt("> ")
                 except EOFError:
                     self.ui.print()
                     break
@@ -1342,12 +1354,6 @@ class DeepSeekCLI:
                     if code not in (EXIT_OK, EXIT_INTERRUPTED):
                         self.emit_event("error", message=f"turn failed with exit code {code}")
         finally:
-            if readline is not None:
-                hist = Path.home() / ".deepseek_cli_history"
-                try:
-                    readline.write_history_file(str(hist))
-                except Exception:
-                    pass
             if self.client is not None:
                 self.client.close()
         return EXIT_OK
@@ -1419,6 +1425,7 @@ class DeepSeekCLI:
             reload_extensions()
             self.reload_tools()
             self.extension_commands = load_extension_commands()
+            self.refresh_repl_session()
             self.configure_readline()
             self._render_system("[green]Extensions reloaded.[/]")
         elif cmd in self.extension_commands:
