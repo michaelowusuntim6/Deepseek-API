@@ -14,6 +14,8 @@ You sign in once in a browser; the session is captured and refreshed automatical
 
 ## What's new
 
+- DeepSeek model-side web search is now enabled by default; use
+  `--no-search` or `/search` to disable it.
 - Added a Markdown memory extension with BM25 retrieval and capped
   session-start injection.
 - Added AGENTS.md discovery, `/agents`, `/agents-reload`, and `/agents-init`.
@@ -123,7 +125,7 @@ context estimate, followed by a dim status footer before each prompt.
 | `--model` | `chat`, `expert` | Select DeepSeek Instant or Expert |
 | `--thinking` | flag | Enable DeepThink reasoning |
 | `--show-thinking` | flag | Display the reasoning trace during streaming |
-| `--search` | flag | Enable DeepSeek web search |
+| `--no-search` | flag | Disable DeepSeek model-side web search (enabled by default) |
 | `--tools` | `off`, `manual`, `auto` | Strip tools, approve each call, or run unattended |
 | `--json` | flag | Emit one JSON object per line on stdout |
 | `--resume` | conversation id | Continue an existing thread |
@@ -214,7 +216,7 @@ argument list after the space, for example `/model ` shows `chat` and `expert`.
 | `/clear` | Clear the terminal display |
 | `/model [chat\|expert]` | Show or set the model |
 | `/thinking [on\|off]` | Toggle DeepThink |
-| `/search [on\|off]` | Toggle DeepSeek model-side web search (not an agent tool) |
+| `/search [on\|off]` | Toggle DeepSeek model-side web search (enabled by default) |
 | `/mode manual\|auto` | Set tool approval mode |
 | `/tools off\|manual\|auto\|list` | Configure tools or list them |
 | `/compact` | Manually summarize and restart the context window |

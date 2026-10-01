@@ -568,7 +568,7 @@ BUILTIN_SLASH_COMMANDS = {
     "/clear": "clear the terminal display",
     "/model": "show or set model: chat | expert",
     "/thinking": "toggle DeepThink reasoning",
-    "/search": "toggle model web search (not an agent tool)",
+    "/search": "toggle DeepSeek web search (enabled by default)",
     "/mode": "set approval mode: manual | auto",
     "/tools": "set tools: off | manual | auto | list",
     "/compact": "summarize and restart the context window",
@@ -621,7 +621,8 @@ def build_parser() -> UsageErrorParser:
     p.add_argument("prompt", nargs="?", help="prompt for one-shot mode; omit for the REPL")
     p.add_argument("--model", choices=sorted(MODEL_CHOICES), help="model alias: chat or expert")
     p.add_argument("--thinking", action="store_true", help="enable DeepThink reasoning")
-    p.add_argument("--search", action="store_true", help="enable DeepSeek web search")
+    p.add_argument("--no-search", action="store_true",
+                   help="disable DeepSeek model-side web search (enabled by default)")
     p.add_argument(
         "--tools",
         choices=("off", "manual", "auto"),
@@ -680,7 +681,7 @@ class DeepSeekCLI:
         self.model = MODEL_CHOICES[self.model_alias][0]
         self.wire_model_first = MODEL_CHOICES[self.model_alias][1]
         self.thinking = bool(args.thinking)
-        self.search = bool(args.search)
+        self.search = not bool(getattr(args, "no_search", False))
         self.tools_mode = args.tools
         self.mode = args.mode
         self.legacy_tools_enabled = bool(args.legacy_tools)
@@ -1559,7 +1560,7 @@ class DeepSeekCLI:
             table.add_row(cmd, "extension command")
         self.ui.print(table)
         self.ui.print(
-            "[dim]Flags are available on startup: --model, --thinking, --search, "
+            "[dim]Flags are available on startup: --model, --thinking, --no-search, "
             "--tools, --show-thinking, --json, --resume, --no-stream, "
             "--legacy-tools, --compact-at, --plan-mode, --mode.[/]"
         )

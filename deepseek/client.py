@@ -62,7 +62,7 @@ Available tools:
 {tools_schema}
 
 ## Model capabilities vs. agent tools
-The user may enable DeepSeek's server-side web search with /search. That is a model capability and does not appear as a tool. If you need to fetch a URL or search the web as a tool, use exec_command with curl, wget, or git as appropriate.
+DeepSeek web search is enabled by default. It is a model-side capability: the server decides per prompt whether to search. To disable it, run /search or pass --no-search at startup. It does not appear as a tool. If you need to fetch a URL or search the web as a tool, use exec_command with curl, wget, or git as appropriate.
 
 When a task needs a capability that is not in the tool list, before saying the capability is unavailable:
 1. Call search_tools once with a clear query.
