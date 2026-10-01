@@ -555,7 +555,7 @@ class _Stream:
             for kind, text in _parse_sse(resp.iter_lines(), meta):
                 if kind == "tool_call":
                     try:
-                        data = json.loads(text)
+                        data = _extract_tool_call_json(text)
                         name = data.get("name", "")
                         arguments = data.get("arguments", {})
                         if isinstance(arguments, str):
@@ -574,9 +574,10 @@ class _Stream:
                             ToolCall(
                                 name=name,
                                 arguments=arguments,
-                                raw=text,
+                                raw=json.dumps(data, ensure_ascii=False),
                             )
                         )
+                        text = json.dumps(data, ensure_ascii=False)
                     except Exception as e:
                         _dlog(f"Failed to parse tool_call JSON: {e}")
                 yield (kind, text)
@@ -645,6 +646,18 @@ def _dsml_calls_to_json(text: str) -> Iterator[str]:
                     value = raw_value
             arguments[param_name] = value
         yield json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False)
+
+
+def _extract_tool_call_json(text: str) -> dict:
+    """Extract the first complete JSON object from a possibly DSML-suffixed string."""
+    start = text.find("{")
+    if start < 0:
+        raise json.JSONDecodeError("no JSON object found", text, 0)
+    decoder = json.JSONDecoder()
+    obj, _ = decoder.raw_decode(text[start:])
+    if not isinstance(obj, dict):
+        raise json.JSONDecodeError("tool call JSON is not an object", text, start)
+    return obj
 
 
 def _fragment_kind(frag: dict) -> Optional[PartKind]:

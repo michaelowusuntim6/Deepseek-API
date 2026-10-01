@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from deepseek.auth import Session
-from deepseek.client import DeepSeekClient, Reply, _parse_sse
+from deepseek.client import DeepSeekClient, Reply, _extract_tool_call_json, _parse_sse
 from deepseek.tools import Tool, ToolCall, execute_tool
 from deepseek_cli import DeepSeekCLI, build_parser, read_file
 
@@ -229,6 +229,14 @@ def test_streaming_code_fence_is_consumed() -> None:
     print("  PASS: streaming code fences are consumed")
 
 
+def test_dsml_suffixed_json_tool_call() -> None:
+    raw = '{"name":"exec_command","arguments":{"cmd":"ls -la"}}</' + "｜｜DSML｜｜ parameter>"
+    data = _extract_tool_call_json(raw)
+    assert data["name"] == "exec_command"
+    assert data["arguments"]["cmd"] == "ls -la"
+    print("  PASS: DSML-suffixed JSON tool call is recovered")
+
+
 def test_broken_pipe_exit_and_json_help() -> None:
     cli = str(ROOT / "deepseek_cli.py")
     r = subprocess.run(
@@ -263,6 +271,7 @@ def main() -> None:
     test_extension_command_contexts()
     test_toolbar_reads_live_state()
     test_streaming_code_fence_is_consumed()
+    test_dsml_suffixed_json_tool_call()
     test_broken_pipe_exit_and_json_help()
     print("all CLI regression tests passed")
 
