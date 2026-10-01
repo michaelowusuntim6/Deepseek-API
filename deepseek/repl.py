@@ -7,6 +7,7 @@ from typing import Iterable
 
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.document import Document
 from prompt_toolkit.styles import Style
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import ThreadedCompleter
@@ -57,11 +58,13 @@ class SlashCommandCompleter(Completer):
         if " " not in text:
             query = text[1:]
             items = self.commands
-            insert_slash = False
+            start_position = -(len(query) + 1)
+            command_mode = True
         else:
             cmd, _, query = text.partition(" ")
             items = self.arguments.get(cmd, [])
-            insert_slash = True
+            start_position = -len(query)
+            command_mode = False
             if not items:
                 return
         ranked = []
@@ -71,9 +74,15 @@ class SlashCommandCompleter(Completer):
                 continue
             ranked.append((tier, len(name), name, desc))
         for _, _, name, desc in sorted(ranked):
+            if command_mode:
+                insert = name
+                if name in {"/thinking", "/search"}:
+                    insert += " "
+            else:
+                insert = name
             yield Completion(
-                name if insert_slash else name.lstrip("/"),
-                start_position=-len(query),
+                insert,
+                start_position=start_position,
                 display=name,
                 display_meta=desc,
             )
@@ -110,7 +119,20 @@ def create_session(commands: list[tuple[str, str]],
 
     @kb.add("enter")
     def _(event):
-        event.current_buffer.validate_and_handle()
+        buf = event.current_buffer
+        text = buf.text
+        if text.startswith("/"):
+            completions = list(completer.get_completions(Document(text, len(text)), None))
+            if completions:
+                index = 0
+                if buf.complete_state and buf.complete_state.complete_index is not None:
+                    index = min(buf.complete_state.complete_index, len(completions) - 1)
+                completion = completions[index]
+                replace_at = len(text) + completion.start_position
+                new_text = text[:replace_at] + completion.text
+                buf.text = new_text
+                buf.cursor_position = len(new_text)
+        buf.validate_and_handle()
 
     hist_path = Path.home() / ".deepseek-cli" / "repl_history"
     hist_path.parent.mkdir(parents=True, exist_ok=True)

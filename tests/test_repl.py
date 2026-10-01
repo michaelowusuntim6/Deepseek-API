@@ -23,11 +23,18 @@ def test_repl_completions() -> None:
         [("/model", "Model"), ("/mode", "Mode"), ("/new", "New")],
         {"/model": [("chat", "Fast"), ("expert", "Strong")]},
     )
-    assert [c.text for c in complete(completer, "/")] == ["new", "mode", "model"]
-    assert [c.text for c in complete(completer, "/mo")] == ["mode", "model"]
-    assert [c.text for c in complete(completer, "/model")][0] == "model"
+    assert [c.text for c in complete(completer, "/")] == ["/new", "/mode", "/model"]
+    assert [c.text for c in complete(completer, "/mo")] == ["/mode", "/model"]
+    assert [c.text for c in complete(completer, "/model")][0] == "/model"
     assert [c.text for c in complete(completer, "/model ")] == ["chat", "expert"]
     assert [c.text for c in complete(completer, "/model ch")] == ["chat"]
+    tools = SlashCommandCompleter(
+        [("/tools", "Tools"), ("/thinking", "Thinking"), ("/help", "Help")],
+        {"/tools": [("list", "List")]},
+    )
+    assert complete(tools, "/tools")[0].text == "/tools"
+    assert complete(tools, "/thinking")[0].text == "/thinking "
+    assert complete(tools, "/help")[0].text == "/help"
     assert complete(completer, "plain text") == []
     print("all repl tests passed")
 
