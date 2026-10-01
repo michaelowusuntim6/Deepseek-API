@@ -534,7 +534,7 @@ def build_parser() -> UsageErrorParser:
     p.add_argument("--legacy-tools", action="store_true",
                    help="also expose the legacy file-oriented tool tier")
     p.add_argument("--compact-at", type=int,
-                   help="compact when estimated context tokens exceed this value")
+                   help="compact when estimated context tokens exceed this value (default: 500000)")
     p.add_argument("--plan-mode", action="store_true",
                    help="enable request_user_input for structured plan questions")
     p.add_argument("--mode", choices=("normal", "agent"), default="normal",
@@ -1644,6 +1644,7 @@ def main(argv: list[str] | None = None) -> int:
         sections = app._context_sections()
         if sections:
             text += "\n\n" + "\n\n".join(sections)
+        sys.stderr.write(f"Compact at: {app.compaction.threshold:,} tokens\n")
         sys.stderr.write(text + "\n")
         return EXIT_OK
     if args.generate_agents:

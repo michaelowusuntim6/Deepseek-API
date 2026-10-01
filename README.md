@@ -129,7 +129,7 @@ context estimate, followed by a dim status footer before each prompt.
 | `--resume` | conversation id | Continue an existing thread |
 | `--no-stream` | flag | Buffer the answer instead of streaming tokens |
 | `--legacy-tools` | flag | Re-enable the legacy file-oriented tool tier |
-| `--compact-at` | tokens | Compact context above this estimated token threshold |
+| `--compact-at` | tokens | Compact above this estimated token threshold (default: `500000`) |
 | `--plan-mode` | flag | Enable structured `request_user_input` questions |
 | `--mode` | `normal`, `agent` | Agent mode enables persistent plan tracking |
 | `--no-markdown` | flag | Disable Markdown rendering during streaming |
@@ -166,6 +166,9 @@ Auto-compaction runs before a new user turn when accumulated estimated context
 exceeds `--compact-at` or `DEEPSEEK_COMPACT_AT`. It summarizes the thread,
 stores the summary under `~/.deepseek-cli/summaries/`, and restarts with a new
 DeepSeek session. Active plans are carried across compaction.
+
+The default is 500,000 tokens for DeepSeek's 1M-token context window; 500K is a
+conservative threshold that leaves retrieval-quality headroom.
 
 ### Diff rendering
 
