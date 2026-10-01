@@ -1350,6 +1350,8 @@ class DeepSeekCLI:
         nudge_count = 0
         had_tool_call = False
         tool_count = 0
+        plan_enforced = False
+        parse_fail_count = 0
         self._indicator = WorkingIndicator()
         self._indicator.start()
 
@@ -1388,7 +1390,24 @@ class DeepSeekCLI:
                 self.client._remember_tool_prompt(schema, current_cid)
 
             if not stream.tool_calls:
-                self._audit_unparsed_tool_call()
+                parse_candidate = self._audit_unparsed_tool_call()
+                if parse_candidate:
+                    parse_fail_count += 1
+                    nudge_count = min(MAX_NUDGES_PER_TURN, nudge_count + 1)
+                    if parse_fail_count <= MAX_NUDGES_PER_TURN:
+                        current_prompt = (
+                            "Your previous response contained a tool call that could not be "
+                            "parsed. Re-emit ONLY the tool call, using exactly this format "
+                            "and nothing else:\n\n"
+                            '<tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>\n\n'
+                            "Do not include any DSML, XML, closing tags, or prose."
+                        )
+                        continue
+                    stamp = int(time.time())
+                    path = Path(f"/tmp/parse_fail_{stamp}.txt")
+                    path.write_text("".join(self._answer_parts), encoding="utf-8")
+                    sys.stderr.write(f"[parser] parse retries exhausted; saved raw response to {path}\n")
+                    break
                 answer_text = "".join(self._raw_answer_parts).lower()
                 complete = "task complete" in answer_text or any(sig in answer_text for sig in (
                     "task complete", "task is complete", "finished", "done.",
@@ -1411,8 +1430,21 @@ class DeepSeekCLI:
                 self._indicator.stop()
                 break
 
+            first_tool_this_turn = not had_tool_call
             had_tool_call = True
             tool_count += len(stream.tool_calls)
+
+            if (
+                first_tool_this_turn
+                and not plan_enforced
+                and len(prompt.split()) > 20
+                and self.tools_mode == "auto"
+                and stream.tool_calls[0].name != "update_plan"
+            ):
+                plan_enforced = True
+                self._indicator.show_nudge(min(nudge_count + 1, MAX_NUDGES_PER_TURN))
+                current_prompt = "You skipped the plan. Call update_plan first, then proceed."
+                continue
 
             if self.tools_mode == "manual":
                 decisions = self._approve_tool_batch(stream.tool_calls)
@@ -1477,7 +1509,7 @@ class DeepSeekCLI:
     def _emit_tool_result(self, call: ToolCall, result: str) -> None:
         self.emit_event("tool_result", self._short_result(result, limit=500), name=call.name)
 
-    def _audit_unparsed_tool_call(self) -> None:
+    def _audit_unparsed_tool_call(self) -> bool:
         raw = "".join(self._answer_parts)
         lowered = raw.lower()
         candidate = (
@@ -1487,17 +1519,11 @@ class DeepSeekCLI:
             or ('"name":' in raw and '"arguments":' in raw)
         )
         if not candidate:
-            return
-        timestamp = int(time.time())
-        path = Path(f"/tmp/parser_fail_{timestamp}.txt")
-        path.write_text(raw, encoding="utf-8")
+            return False
         sys.stderr.write(
             "[parser] unparsed tool-call candidate: " + raw[:500].replace("\n", "\\n") + "\n"
         )
-        sys.stderr.write(
-            "[parser] a tool call was emitted but could not be parsed; turn ended "
-            f"without execution. Raw stream saved to {path}\n"
-        )
+        return True
 
     def _maybe_compact_before_turn(self) -> None:
         if not self.conversation_id:
