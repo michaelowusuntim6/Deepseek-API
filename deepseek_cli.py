@@ -843,6 +843,8 @@ class DeepSeekCLI:
         if not self._fence_lines:
             self._in_code_fence = False
             return
+        while self._fence_lines and not self._fence_lines[-1].strip():
+            self._fence_lines.pop()
         code = "\n".join(self._fence_lines)
         self.out.print(Padding(
             Syntax(
