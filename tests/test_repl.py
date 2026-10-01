@@ -23,9 +23,9 @@ def test_repl_completions() -> None:
         [("/model", "Model"), ("/mode", "Mode"), ("/new", "New")],
         {"/model": [("chat", "Fast"), ("expert", "Strong")]},
     )
-    assert [c.text for c in complete(completer, "/")] == ["/new", "/mode", "/model"]
-    assert [c.text for c in complete(completer, "/mo")] == ["/mode", "/model"]
-    assert [c.text for c in complete(completer, "/model")][0] == "/model"
+    assert [c.text for c in complete(completer, "/")] == ["new", "mode", "model"]
+    assert [c.text for c in complete(completer, "/mo")] == ["mode", "model"]
+    assert [c.text for c in complete(completer, "/model")][0] == "model"
     assert [c.text for c in complete(completer, "/model ")] == ["chat", "expert"]
     assert [c.text for c in complete(completer, "/model ch")] == ["chat"]
     assert complete(completer, "plain text") == []

@@ -10,6 +10,8 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import ThreadedCompleter
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.shortcuts import CompleteStyle
 
 
 def claude_style() -> Style:
@@ -55,11 +57,11 @@ class SlashCommandCompleter(Completer):
         if " " not in text:
             query = text[1:]
             items = self.commands
-            prefix = "/"
+            insert_slash = False
         else:
             cmd, _, query = text.partition(" ")
             items = self.arguments.get(cmd, [])
-            prefix = ""
+            insert_slash = True
             if not items:
                 return
         ranked = []
@@ -70,7 +72,7 @@ class SlashCommandCompleter(Completer):
             ranked.append((tier, len(name), name, desc))
         for _, _, name, desc in sorted(ranked):
             yield Completion(
-                prefix + name if not name.startswith("/") else name,
+                name if insert_slash else name.lstrip("/"),
                 start_position=-len(query),
                 display=name,
                 display_meta=desc,
@@ -80,11 +82,43 @@ class SlashCommandCompleter(Completer):
 def create_session(commands: list[tuple[str, str]],
                    arguments: dict[str, list[tuple[str, str]]]) -> PromptSession:
     completer = SlashCommandCompleter(commands, arguments)
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        buf = event.current_buffer
+        state = buf.complete_state
+        if state and state.completions:
+            index = state.complete_index if state.complete_index is not None else 0
+            state.complete_index = (index - 1) % len(state.completions)
+            event.app.invalidate()
+
+    @kb.add("down")
+    def _(event):
+        buf = event.current_buffer
+        state = buf.complete_state
+        if state and state.completions:
+            index = state.complete_index if state.complete_index is not None else -1
+            state.complete_index = (index + 1) % len(state.completions)
+            event.app.invalidate()
+
+    @kb.add("escape")
+    def _(event):
+        buf = event.current_buffer
+        if buf.complete_state:
+            buf.cancel_completion()
+
+    @kb.add("enter")
+    def _(event):
+        event.current_buffer.validate_and_handle()
+
     hist_path = Path.home() / ".deepseek-cli" / "repl_history"
     hist_path.parent.mkdir(parents=True, exist_ok=True)
     session = PromptSession(
         completer=ThreadedCompleter(completer),
+        key_bindings=kb,
         complete_while_typing=True,
+        complete_style=CompleteStyle.COLUMN,
         history=FileHistory(str(hist_path)),
         style=claude_style(),
         reserve_space_for_menu=8,
