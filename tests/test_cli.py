@@ -222,9 +222,9 @@ def test_streaming_code_fence_is_consumed() -> None:
     app.out = Capture()  # type: ignore[assignment]
     app._emit_markdown_line("```python")
     app._emit_markdown_line("x = 1")
-    assert app.out.items == []
+    assert len(app.out.items) == 1
     app._emit_markdown_line("```")
-    assert len(app.out.items) == 2
+    assert len(app.out.items) == 3
     assert app._in_code_fence is False
     print("  PASS: streaming code fences are consumed")
 

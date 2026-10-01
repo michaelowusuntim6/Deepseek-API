@@ -723,6 +723,7 @@ class DeepSeekCLI:
         self._fence_language = "text"
         self._just_closed_code_fence = False
         self._code_gap_emitted = False
+        self._last_output_blank = False
         self._pending_compaction_prefix: str | None = None
         self._summary_prefix_for_next_request: str | None = None
         self._plan_injected_cid: str | None = None
@@ -859,10 +860,13 @@ class DeepSeekCLI:
         self._in_code_fence = False
         self._just_closed_code_fence = True
         self._code_gap_emitted = True
+        self._last_output_blank = True
 
     def _emit_markdown_line(self, line: str) -> None:
         stripped = line.strip()
         if not self._in_code_fence and stripped.startswith("```"):
+            if not self._last_output_blank:
+                self.out.print()
             self._in_code_fence = True
             self._fence_language = stripped[3:].strip() or "text"
             return
@@ -875,11 +879,17 @@ class DeepSeekCLI:
         if self._just_closed_code_fence:
             if not line.strip():
                 if not self._code_gap_emitted:
-                    self.out.print(Markdown(""))
+                    self.out.print()
                     self._code_gap_emitted = True
+                    self._last_output_blank = True
                 return
             self._just_closed_code_fence = False
+        if not line.strip():
+            self.out.print()
+            self._last_output_blank = True
+            return
         self.out.print(Markdown(line))
+        self._last_output_blank = not line.strip()
 
     def _close_thinking_line(self) -> None:
         if self._thinking_line_open:
