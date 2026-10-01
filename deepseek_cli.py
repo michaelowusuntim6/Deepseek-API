@@ -39,6 +39,7 @@ from rich import box
 from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.padding import Padding
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -720,6 +721,8 @@ class DeepSeekCLI:
         self._in_code_fence = False
         self._fence_lines: list[str] = []
         self._fence_language = "text"
+        self._just_closed_code_fence = False
+        self._code_gap_emitted = False
         self._pending_compaction_prefix: str | None = None
         self._summary_prefix_for_next_request: str | None = None
         self._plan_injected_cid: str | None = None
@@ -840,14 +843,22 @@ class DeepSeekCLI:
             self._in_code_fence = False
             return
         code = "\n".join(self._fence_lines)
-        self.out.print(Panel(
-            Syntax(code, self._fence_language or "text", theme="monokai"),
-            border_style="cyan",
-            expand=False,
+        self.out.print(Padding(
+            Syntax(
+                code,
+                self._fence_language or "text",
+                theme="monokai",
+                background_color="default",
+                line_numbers=False,
+            ),
+            (0, 0, 0, 2),
         ))
+        self.out.print()
         self._fence_lines = []
         self._fence_language = "text"
         self._in_code_fence = False
+        self._just_closed_code_fence = True
+        self._code_gap_emitted = True
 
     def _emit_markdown_line(self, line: str) -> None:
         stripped = line.strip()
@@ -861,6 +872,13 @@ class DeepSeekCLI:
         if self._in_code_fence:
             self._fence_lines.append(line)
             return
+        if self._just_closed_code_fence:
+            if not line.strip():
+                if not self._code_gap_emitted:
+                    self.out.print(Markdown(""))
+                    self._code_gap_emitted = True
+                return
+            self._just_closed_code_fence = False
         self.out.print(Markdown(line))
 
     def _close_thinking_line(self) -> None:

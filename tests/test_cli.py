@@ -224,7 +224,7 @@ def test_streaming_code_fence_is_consumed() -> None:
     app._emit_markdown_line("x = 1")
     assert app.out.items == []
     app._emit_markdown_line("```")
-    assert len(app.out.items) == 1
+    assert len(app.out.items) == 2
     assert app._in_code_fence is False
     print("  PASS: streaming code fences are consumed")
 
