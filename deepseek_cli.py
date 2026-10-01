@@ -1350,7 +1350,6 @@ class DeepSeekCLI:
         nudge_count = 0
         had_tool_call = False
         tool_count = 0
-        plan_enforced = False
         parse_fail_count = 0
         self._indicator = WorkingIndicator()
         self._indicator.start()
@@ -1433,18 +1432,6 @@ class DeepSeekCLI:
             first_tool_this_turn = not had_tool_call
             had_tool_call = True
             tool_count += len(stream.tool_calls)
-
-            if (
-                first_tool_this_turn
-                and not plan_enforced
-                and len(prompt.split()) > 20
-                and self.tools_mode == "auto"
-                and stream.tool_calls[0].name != "update_plan"
-            ):
-                plan_enforced = True
-                self._indicator.show_nudge(min(nudge_count + 1, MAX_NUDGES_PER_TURN))
-                current_prompt = "You skipped the plan. Call update_plan first, then proceed."
-                continue
 
             if self.tools_mode == "manual":
                 decisions = self._approve_tool_batch(stream.tool_calls)
