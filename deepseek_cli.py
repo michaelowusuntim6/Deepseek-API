@@ -12,6 +12,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import fnmatch
 import html
@@ -167,17 +168,23 @@ class WorkingIndicator:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._started = False
+        self._stopped = False
 
     def start(self):
         if not self._started:
             self._started = True
+            self._stopped = False
+            _ACTIVE_INDICATORS.add(self)
             self._thread.start()
 
     def stop(self):
-        if not self._started:
+        if getattr(self, "_stopped", False):
             return
+        self._stopped = True
         self._stop.set()
-        self._thread.join(timeout=2)
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        _ACTIVE_INDICATORS.discard(self)
         sys.stderr.write("\r\033[2K")
         sys.stderr.flush()
         self._started = False
@@ -193,6 +200,17 @@ class WorkingIndicator:
     def show_nudge(self, attempt: int) -> None:
         sys.stderr.write(f"\r\033[2K[nudge {attempt}/{MAX_NUDGES_PER_TURN}] continuing turn…")
         sys.stderr.flush()
+
+
+_ACTIVE_INDICATORS: set[WorkingIndicator] = set()
+
+
+def _stop_active_indicators() -> None:
+    for indicator in list(_ACTIVE_INDICATORS):
+        indicator.stop()
+
+
+atexit.register(_stop_active_indicators)
 
 
 # ----- Built-in tools --------------------------------------------------------
@@ -751,7 +769,12 @@ class DeepSeekCLI:
         self.generate_agents = bool(args.generate_agents)
         self.show_preamble = bool(args.show_preamble)
         self.show_thinking = bool(args.show_thinking)
-        self.model_alias = args.model or "chat"
+        if args.model:
+            self.model_alias = args.model
+        elif args.tools == "auto" or args.mode == "agent":
+            self.model_alias = "expert"
+        else:
+            self.model_alias = "chat"
         self.model = MODEL_CHOICES[self.model_alias][0]
         self.wire_model_first = MODEL_CHOICES[self.model_alias][1]
         self.thinking = not bool(getattr(args, "no_thinking", False))
@@ -1327,6 +1350,8 @@ class DeepSeekCLI:
         nudge_count = 0
         had_tool_call = False
         tool_count = 0
+        self._indicator = WorkingIndicator()
+        self._indicator.start()
 
         for iteration in range(8):
             visible = self.registry.visible_tools()
@@ -1353,10 +1378,7 @@ class DeepSeekCLI:
                 thinking=self.thinking,
                 search=self.search,
             )
-            indicator = WorkingIndicator()
-            indicator.start()
             for kind, text in stream.iter_parts():
-                indicator.stop()
                 self._handle_part(kind, text)
 
             current_cid = stream.conversation_id
@@ -1374,8 +1396,7 @@ class DeepSeekCLI:
                 ))
                 if nudge_count < MAX_NUDGES_PER_TURN and not complete and self.tools_mode == "auto":
                     nudge_count += 1
-                    indicator = WorkingIndicator()
-                    indicator.show_nudge(nudge_count)
+                    self._indicator.show_nudge(nudge_count)
                     current_prompt = NUDGE_MESSAGES[nudge_count - 1]
                     continue
                 if not had_tool_call and not complete:
@@ -1387,6 +1408,7 @@ class DeepSeekCLI:
                         f"saved={path}\n"
                     )
                 self.registry.finish_iteration()
+                self._indicator.stop()
                 break
 
             had_tool_call = True
@@ -1410,6 +1432,7 @@ class DeepSeekCLI:
             wire_model = None
 
         self._finish_turn(prompt, current_cid, prefix_chars=turn_prompt_chars)
+        self._indicator.stop()
         return EXIT_OK
 
     def _finish_turn(self, prompt: str, new_cid: str | None,
@@ -1688,6 +1711,7 @@ class DeepSeekCLI:
                     if code not in (EXIT_OK, EXIT_INTERRUPTED):
                         self.emit_event("error", message=f"turn failed with exit code {code}")
         finally:
+            _stop_active_indicators()
             if self.client is not None:
                 self.client.close()
         return EXIT_OK
@@ -1698,6 +1722,7 @@ class DeepSeekCLI:
         arg = arg.strip()
 
         if cmd in ("/exit", "/quit"):
+            _stop_active_indicators()
             return EXIT_OK
         if cmd in ("/help", "/?"):
             self.show_help()

@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 from deepseek.auth import Session
 from deepseek.client import DeepSeekClient, Reply, _extract_tool_call_json, _parse_sse
 from deepseek.tools import Tool, ToolCall, execute_tool
-from deepseek_cli import DeepSeekCLI, build_parser, read_file
+from deepseek_cli import DeepSeekCLI, WorkingIndicator, build_parser, read_file
 
 
 def test_unknown_tool_returns_error() -> None:
@@ -237,6 +237,19 @@ def test_dsml_suffixed_json_tool_call() -> None:
     print("  PASS: DSML-suffixed JSON tool call is recovered")
 
 
+def test_indicator_double_stop_and_agent_default() -> None:
+    indicator = WorkingIndicator()
+    indicator.start()
+    indicator.stop()
+    indicator.stop()
+    assert indicator._stopped is True
+    parser = build_parser()
+    args = parser.parse_args(["--tools", "auto", "hi"])
+    app = DeepSeekCLI(args, parser, interactive=False, prompt="hi")
+    assert app.model == "deepseek-expert"
+    print("  PASS: indicator stop is idempotent and auto mode defaults to expert")
+
+
 def test_broken_pipe_exit_and_json_help() -> None:
     cli = str(ROOT / "deepseek_cli.py")
     r = subprocess.run(
@@ -272,6 +285,7 @@ def main() -> None:
     test_toolbar_reads_live_state()
     test_streaming_code_fence_is_consumed()
     test_dsml_suffixed_json_tool_call()
+    test_indicator_double_stop_and_agent_default()
     test_broken_pipe_exit_and_json_help()
     print("all CLI regression tests passed")
 
