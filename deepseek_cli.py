@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections import deque
@@ -92,6 +93,40 @@ EXIT_AUTH = 2
 EXIT_USAGE = 3
 EXIT_INTERRUPTED = 130
 EXIT_SIGPIPE = 141
+MAX_NUDGES_PER_TURN = 3
+NUDGE_MESSAGES = [
+    "Continue. Call the next tool now. Do not write prose.",
+    (
+        "You stopped without a tool call. The task requires exec_command. "
+        "Emit ONLY this and nothing else, on one line:\n\n"
+        '<tool_call>{"name":"exec_command","arguments":{"cmd":"ls ~/Downloads/Hugginface/hf_results/"}}</tool_call>\n\n'
+        "Do not write any prose before or after."
+    ),
+    (
+        "FINAL ATTEMPT. You must call a tool to make progress. Reply with "
+        "exactly one <tool_call>...</tool_call> block and nothing else. "
+        "No prose. No explanation. Just the tool call."
+    ),
+]
+
+
+def build_tool_result_message(tool_name: str, output: str,
+                              original_prompt: str, tool_count: int) -> str:
+    return (
+        f"TOOL RESULT for {tool_name}:\n{output}\n\n"
+        "---\n"
+        "[TASK STATUS]\n"
+        "Original user request (verbatim, truncated to 300 chars):\n"
+        f"{(original_prompt or '')[:300]}\n\n"
+        f"Tool calls completed so far: {tool_count}\n\n"
+        "Do NOT write a summary of the tool output. Do NOT write a final "
+        "answer unless the task is complete. If the task requires more tool "
+        "calls, emit the next <tool_call> block now. If and only if the "
+        "entire task is done, write the final answer and end with the "
+        "literal token TASK COMPLETE on its own line.\n\n"
+        "If you write prose without a tool call and without TASK COMPLETE, "
+        "the harness will nudge you. Do not waste nudges."
+    )
 
 MODEL_CHOICES = {
     "chat": ("deepseek-chat", "default"),
@@ -154,6 +189,10 @@ class WorkingIndicator:
             sys.stderr.flush()
             idx += 1
             self._stop.wait(1.5)
+
+    def show_nudge(self, attempt: int) -> None:
+        sys.stderr.write(f"\r\033[2K[nudge {attempt}/{MAX_NUDGES_PER_TURN}] continuing turn…")
+        sys.stderr.flush()
 
 
 # ----- Built-in tools --------------------------------------------------------
@@ -748,6 +787,8 @@ class DeepSeekCLI:
         self.approved_tools: set[str] = set()
         self._pending_tool_names: deque[str] = deque()
         self._answer_parts: list[str] = []
+        self._raw_answer_parts: list[str] = []
+        self._original_prompt: str | None = None
         self._thinking_parts: list[str] = []
         self._answer_line_open = False
         self._thinking_line_open = False
@@ -1202,6 +1243,9 @@ class DeepSeekCLI:
 
         self._pending_tool_names.clear()
         self._answer_parts = []
+        self._raw_answer_parts = []
+        if self._original_prompt is None:
+            self._original_prompt = prompt
         self._thinking_parts = []
         self._answer_line_open = False
         self._thinking_line_open = False
@@ -1280,6 +1324,9 @@ class DeepSeekCLI:
         turn_prompt_chars = 0
         summary_prefix = self._summary_prefix_for_next_request
         self._summary_prefix_for_next_request = None
+        nudge_count = 0
+        had_tool_call = False
+        tool_count = 0
 
         for iteration in range(8):
             visible = self.registry.visible_tools()
@@ -1320,8 +1367,30 @@ class DeepSeekCLI:
 
             if not stream.tool_calls:
                 self._audit_unparsed_tool_call()
+                answer_text = "".join(self._raw_answer_parts).lower()
+                complete = "task complete" in answer_text or any(sig in answer_text for sig in (
+                    "task complete", "task is complete", "finished", "done.",
+                    "no further action", "all steps complete",
+                ))
+                if nudge_count < MAX_NUDGES_PER_TURN and not complete and self.tools_mode == "auto":
+                    nudge_count += 1
+                    indicator = WorkingIndicator()
+                    indicator.show_nudge(nudge_count)
+                    current_prompt = NUDGE_MESSAGES[nudge_count - 1]
+                    continue
+                if not had_tool_call and not complete:
+                    stamp = int(time.time())
+                    path = Path(f"/tmp/prose_stop_{stamp}.txt")
+                    path.write_text("".join(self._answer_parts), encoding="utf-8")
+                    sys.stderr.write(
+                        f"[agent] prose-only stop. session={self.conversation_id} "
+                        f"saved={path}\n"
+                    )
                 self.registry.finish_iteration()
                 break
+
+            had_tool_call = True
+            tool_count += len(stream.tool_calls)
 
             if self.tools_mode == "manual":
                 decisions = self._approve_tool_batch(stream.tool_calls)
@@ -1332,7 +1401,12 @@ class DeepSeekCLI:
                 self._turn_tool_result_chars += len(result)
                 self._emit_tool_result(call, result)
             self.registry.finish_iteration()
-            current_prompt = self.client._tool_result_prompt(results)
+            current_prompt = "\n\n".join(
+                build_tool_result_message(
+                    call.name, result, self._original_prompt or prompt, tool_count
+                )
+                for call, result in results
+            )
             wire_model = None
 
         self._finish_turn(prompt, current_cid, prefix_chars=turn_prompt_chars)
@@ -1463,7 +1537,9 @@ class DeepSeekCLI:
 
     def _handle_part(self, kind: str, text: str) -> None:
         if kind == "answer":
+            self._raw_answer_parts.append(text)
             text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
+            text = re.sub(r"(?m)^TASK COMPLETE\s*$", "", text)
             if not text:
                 return
             self._answer_parts.append(text)
