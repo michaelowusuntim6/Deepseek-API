@@ -168,7 +168,7 @@ class WorkingIndicator:
 
     def __init__(self):
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread: threading.Thread | None = None
         self._started = False
         self._stopped = False
 
@@ -176,6 +176,8 @@ class WorkingIndicator:
         if not self._started:
             self._started = True
             self._stopped = False
+            self._stop = threading.Event()
+            self._thread = threading.Thread(target=self._run, daemon=True)
             _ACTIVE_INDICATORS.add(self)
             self._thread.start()
 
@@ -184,8 +186,9 @@ class WorkingIndicator:
             return
         self._stopped = True
         self._stop.set()
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=2.0)
         _ACTIVE_INDICATORS.discard(self)
         sys.stderr.write("\r\033[2K")
         sys.stderr.flush()
@@ -877,7 +880,7 @@ class DeepSeekCLI:
         if kind == "answer":
             if not self._answer_line_open:
                 self._close_thinking_line()
-                self.out.print("\n[bold green]Assistant[/]")
+                self.out.print()
                 self._answer_line_open = True
             self._emit_answer_text(text)
         elif kind == "thinking":
@@ -1358,7 +1361,6 @@ class DeepSeekCLI:
         tool_count = 0
         parse_fail_count = 0
         self._indicator = WorkingIndicator()
-        self._indicator.start()
 
         for iteration in range(8):
             visible = self.registry.visible_tools()
@@ -1380,6 +1382,7 @@ class DeepSeekCLI:
 
             self._response_processor = ResponseProcessor()
             self._answer_tail = ""
+            self._indicator.start()
             stream = self.client.stream(
                 request_prompt,
                 conversation_id=current_cid,
@@ -1388,6 +1391,9 @@ class DeepSeekCLI:
                 search=self.search,
             )
             for kind, text in stream.iter_parts():
+                # Stop (and join) the spinner before the first rendered chunk so
+                # it can never write over the response line.
+                self._indicator.stop()
                 self._handle_part(kind, text)
 
             current_cid = stream.conversation_id
@@ -1437,6 +1443,7 @@ class DeepSeekCLI:
                     self.registry.finish_iteration()
                     self._indicator.stop()
                     break
+                self._indicator.stop()
                 self._indicator.show_nudge(nudger.total_nudges)
                 current_prompt = NUDGE_MESSAGE
                 continue
