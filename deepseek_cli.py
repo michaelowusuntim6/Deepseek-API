@@ -72,9 +72,11 @@ from deepseek.compaction import CompactionManager
 from deepseek.client import TOOL_SYSTEM_PREAMBLE
 from deepseek.net import (
     ContinuationConfig,
+    ThinkingConfig,
     WatchConfig,
     load_continuation_config,
     load_network_retry_config,
+    load_thinking_config,
     load_watch_config,
 )
 from deepseek.response import (
@@ -626,8 +628,10 @@ def build_parser() -> UsageErrorParser:
     )
     p.add_argument("prompt", nargs="?", help="prompt for one-shot mode; omit for the REPL")
     p.add_argument("--model", choices=sorted(MODEL_CHOICES), help="model alias: chat or expert")
+    p.add_argument("--thinking", action="store_true",
+                   help="force DeepThink reasoning on (overrides config.json)")
     p.add_argument("--no-thinking", action="store_true",
-                   help="disable DeepThink reasoning (enabled by default)")
+                   help="force DeepThink reasoning off (default: config.json)")
     p.add_argument("--no-search", action="store_true",
                    help="disable DeepSeek model-side web search (enabled by default)")
     p.add_argument(
@@ -692,7 +696,7 @@ class DeepSeekCLI:
             self.model_alias = "chat"
         self.model = MODEL_CHOICES[self.model_alias][0]
         self.wire_model_first = MODEL_CHOICES[self.model_alias][1]
-        self.thinking = not bool(getattr(args, "no_thinking", False))
+        self.thinking = self._resolve_thinking()
         self.search = not bool(getattr(args, "no_search", False))
         self.tools_mode = args.tools
         self.mode = args.mode
@@ -1215,6 +1219,9 @@ class DeepSeekCLI:
         self._response_processor = ResponseProcessor()
         self._original_prompt = prompt
         self._last_tool_result_running = False
+        # Re-read config.json each turn: thinking.enabled is the default, and
+        # --thinking / --no-thinking override it.
+        self.thinking = self._resolve_thinking()
         self._thinking_parts = []
         self._answer_line_open = False
         self._thinking_line_open = False
@@ -1299,6 +1306,7 @@ class DeepSeekCLI:
         had_tool_call = False
         tool_count = 0
         last_response_text = ""
+        network_retries = 0
         parse_fail_count = 0
         self._indicator = WorkingIndicator()
 
@@ -1339,6 +1347,8 @@ class DeepSeekCLI:
                 self._handle_part(kind, text)
 
             stream_finished = bool(getattr(stream, "finished", False))
+            stream_bytes = bool(getattr(stream, "received_bytes", False))
+            stream_incomplete = bool(getattr(stream, "incomplete", False))
             self._log_stream_state(stream_finished)
             current_cid = stream.conversation_id
             self.conversation_id = current_cid
@@ -1347,10 +1357,36 @@ class DeepSeekCLI:
                 self.client._remember_tool_prompt(schema, current_cid)
 
             if not stream_finished:
-                # The SSE stream ended without the FINISHED marker: a partial
-                # response, not a completed turn. Never run the completion
-                # check here, and never re-issue a continuation - retry the
-                # real request (user prompt or last tool result) instead.
+                if stream_bytes or stream_incomplete:
+                    # The server delivered bytes and closed the stream: this is
+                    # a completed request with a failure status, not a network
+                    # failure. Do not retry it and do not continue.
+                    path = self._save_incomplete_stream(stream)
+                    last_line = (
+                        self._response_processor.raw_answer
+                        or "".join(self._answer_parts)
+                    ).strip().splitlines()
+                    line = (
+                        "[turn] server returned INCOMPLETE. No retry. "
+                        f"Last fragment: {last_line[-1] if last_line else '(none)'}"
+                    )
+                    sys.stderr.write("\n" + line + "\n" + f"Raw stream saved to {path}\n\n")
+                    sys.stderr.flush()
+                    _append_debug_log(os.getenv("DEEPSEEK_SSE_DEBUG", ""), line)
+                    self._ensure_fresh_line()
+                    break
+                # Nothing arrived at all: a real network failure. Retry, and
+                # count it against the network retry limit.
+                network_retries += 1
+                if network_retries >= load_network_retry_config().max_consecutive_retries:
+                    sys.stderr.write(
+                        "\n"
+                        f"The model did not respond after {network_retries} "
+                        "consecutive attempts.\n"
+                        "The operation has been stopped.\n\n"
+                    )
+                    sys.stderr.flush()
+                    break
                 current_prompt = base_prompt
                 self._ensure_fresh_line()
                 continue
@@ -1514,6 +1550,14 @@ class DeepSeekCLI:
         self.emit_event("tool_result", self._display_result(result), name=call.name)
 
     @staticmethod
+    def _save_incomplete_stream(stream, directory: Path | str = "/tmp") -> Path:
+        """Persist the raw SSE frames of an INCOMPLETE response."""
+        path = Path(directory) / f"incomplete_stream_{int(time.time())}.txt"
+        lines = list(getattr(stream, "raw_lines", []) or [])
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        return path
+
+    @staticmethod
     def _display_result(result: str, limit_lines: int = 20,
                         limit_chars: int = 2000) -> str:
         """Bound a tool result for display without hiding later statements.
@@ -1534,6 +1578,17 @@ class DeepSeekCLI:
 
     def _watch_settings(self) -> WatchConfig:
         return load_watch_config()
+
+    def _thinking_config(self) -> ThinkingConfig:
+        return load_thinking_config()
+
+    def _resolve_thinking(self) -> bool:
+        """CLI flags win; otherwise config.json's thinking.enabled (fresh)."""
+        if bool(getattr(self.args, "thinking", False)):
+            return True
+        if bool(getattr(self.args, "no_thinking", False)):
+            return False
+        return self._thinking_config().enabled
 
     def _continuation_config(self) -> ContinuationConfig:
         return load_continuation_config()

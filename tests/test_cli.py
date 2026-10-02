@@ -576,10 +576,16 @@ def test_stall_max_retries_stops() -> None:
 class _ScriptedClient:
     """Minimal stand-in for DeepSeekClient that replays scripted responses."""
 
-    def __init__(self, responses: list[list[tuple[str, str]]], finished=True):
+    def __init__(self, responses: list[list[tuple[str, str]]], finished=True,
+                 received_bytes=None, incomplete=False):
         self._responses = list(responses)
         self._finished_seq = list(finished) if isinstance(finished, list) else None
         self._finished_default = True if isinstance(finished, list) else finished
+        self._received_seq = (list(received_bytes)
+                              if isinstance(received_bytes, list) else None)
+        self._received_default = (None if isinstance(received_bytes, list)
+                                  else received_bytes)
+        self._incomplete = incomplete
         self.prompts: list[str] = []
 
     def _tool_prompt(self, prompt, schema, conversation_id, extra_sections=None):
@@ -605,6 +611,19 @@ class _ScriptedClient:
                 yield from parts
 
         _Stream.finished = finished
+        if self._received_seq is not None:
+            received = self._received_seq[index] if index < len(self._received_seq) else True
+        elif self._received_default is not None:
+            received = self._received_default
+        else:
+            received = finished
+        _Stream.received_bytes = received
+        if isinstance(self._incomplete, list):
+            _Stream.incomplete = (self._incomplete[index]
+                                  if index < len(self._incomplete) else False)
+        else:
+            _Stream.incomplete = self._incomplete
+        _Stream.raw_lines = [f'data: {{"probe":"response {index + 1}"}}']
         return _Stream()
 
 
@@ -949,6 +968,68 @@ def test_five_consecutive_continuations_give_up(tmp_path, monkeypatch) -> None:
 # ----- the definitive end-of-response marker (see Part 1 stream probes) -----
 
 
+def test_incomplete_does_not_retry(tmp_path, monkeypatch) -> None:
+    saved = tmp_path / "incomplete_stream.txt"
+    monkeypatch.setattr(
+        DeepSeekCLI, "_save_incomplete_stream",
+        staticmethod(lambda stream, directory="/tmp": saved),
+    )
+    monkeypatch.setenv("DEEPSEEK_SSE_DEBUG", str(tmp_path / "dbg.log"))
+    app, client = _scripted_app(
+        [[("answer", "Partial bytes arrived.")]],
+        finished=False, received_bytes=True, incomplete=True,
+    )
+    app._grace_sleep = lambda seconds: None
+    _run_app(app)
+    assert len(client.prompts) == 1                  # the request was not retried
+    assert FIRST_CONTINUE_PROMPT not in client.prompts
+    assert CONTINUE_PROMPT not in client.prompts
+    assert (tmp_path / "dbg.log").read_text().count(
+        "server returned INCOMPLETE. No retry"
+    ) == 1
+    print("  PASS: an INCOMPLETE stream with bytes is not retried")
+
+
+def test_no_bytes_retries() -> None:
+    app, client = _scripted_app([[]], finished=False, received_bytes=False)
+    app._grace_sleep = lambda seconds: None
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        app._run_agent_turn("hi")
+    assert len(client.prompts) >= 2                  # the request was retried
+    assert "did not respond after" in err.getvalue()
+    print("  PASS: a stream that delivered no bytes is retried")
+
+
+def test_thinking_disabled_by_default() -> None:
+    real = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    assert real["thinking"]["enabled"] is False
+
+    from deepseek.net import load_thinking_config
+    assert load_thinking_config().enabled is False
+
+    parser = build_parser()
+    args = parser.parse_args(["--tools", "auto", "hi"])
+    app = DeepSeekCLI(args, parser, interactive=False, prompt="hi")
+    assert app.thinking is False                     # config default
+
+    forced_on = DeepSeekCLI(
+        parser.parse_args(["--thinking", "--tools", "auto", "hi"]),
+        parser, interactive=False, prompt="hi",
+    )
+    assert forced_on.thinking is True
+
+    forced_off = DeepSeekCLI(
+        parser.parse_args(["--no-thinking", "--tools", "auto", "hi"]),
+        parser, interactive=False, prompt="hi",
+    )
+    assert forced_off.thinking is False
+
+    body = _Stream(object(), "hi", "sid", None, "default", False, False)._request_body()
+    assert body["thinking_enabled"] is False
+    print("  PASS: thinking defaults off from config and the payload says so")
+
+
 def test_completion_waits_for_final_marker(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("DEEPSEEK_SSE_DEBUG", str(tmp_path / "dbg.log"))
     app, client = _scripted_app([
@@ -1204,12 +1285,13 @@ def test_grace_period_applied(tmp_path, monkeypatch) -> None:
     print("  PASS: the continuation waits for the configured grace period")
 
 
-def _scripted_app(responses, finished=True):
+def _scripted_app(responses, finished=True, received_bytes=None, incomplete=False):
     parser = build_parser()
     args = parser.parse_args(["--tools", "auto", "hi"])
     app = DeepSeekCLI(args, parser, interactive=False, prompt="hi")
     app.reload_tools()
-    client = _ScriptedClient(responses, finished=finished)
+    client = _ScriptedClient(responses, finished=finished,
+                             received_bytes=received_bytes, incomplete=incomplete)
     app.client = client
     return app, client
 

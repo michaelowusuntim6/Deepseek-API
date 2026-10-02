@@ -580,6 +580,9 @@ class _Stream:
         self._message_id: Optional[int] = None
         self._attempts = 0
         self.finished = False
+        self.received_bytes = False
+        self.incomplete = False
+        self.raw_lines: list[str] = []
         self.delete_message_hook: Optional[Callable[[str, Optional[int]], None]] = None
         self.tool_calls: list[ToolCall] = []
 
@@ -641,6 +644,10 @@ class _Stream:
             try:
                 for line in resp.iter_lines():
                     detector.feed()
+                    if line:
+                        self.received_bytes = True
+                        if len(self.raw_lines) < 5000:
+                            self.raw_lines.append(line)
                     yield line
             except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError,
                     httpx.StreamClosed) as exc:
@@ -710,6 +717,7 @@ class _Stream:
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
         self.finished = bool(meta.get("finished"))
+        self.incomplete = bool(meta.get("incomplete"))
 
     def __iter__(self) -> Iterator[str]:
         """Yield ONLY answer text (backwards compatible with plain iteration)."""
@@ -970,6 +978,9 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, s
                         yield from process_answer_chunk(op_v)
                     else:
                         yield (kind, op_v)
+                elif op_p.endswith("quasi_status") and op_v == "INCOMPLETE":
+                    if meta is not None:
+                        meta["incomplete"] = True
             continue
 
         # --- 1. Snapshot with a full response object ---
@@ -1029,6 +1040,10 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, s
         if p == "response/status" and v == "FINISHED":
             if meta is not None:
                 meta["finished"] = True
+            continue
+        if p == "response/status" and v == "INCOMPLETE":
+            if meta is not None:
+                meta["incomplete"] = True
             continue
 
         # --- 4. Content delta ---

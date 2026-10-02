@@ -9,5 +9,8 @@
   },
   "continuation": {
     "grace_ms": 500
+  },
+  "thinking": {
+    "enabled": false
   }
 }

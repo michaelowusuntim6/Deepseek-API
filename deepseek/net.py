@@ -32,6 +32,7 @@ DEFAULT_RESPONSE_TIMEOUT_MINUTES = 3.0
 DEFAULT_MAX_CONSECUTIVE_RETRIES = 5
 DEFAULT_WATCH_INTERVAL_SECONDS = 60.0
 DEFAULT_CONTINUATION_GRACE_MS = 500
+DEFAULT_THINKING_ENABLED = False
 
 NETWORK_ERROR_TEMPLATE = (
     "Network Connection Error\n"
@@ -71,6 +72,13 @@ class ContinuationConfig:
     """Post-FINISHED grace period before the completion check runs."""
 
     grace_ms: int = DEFAULT_CONTINUATION_GRACE_MS
+
+
+@dataclass(frozen=True)
+class ThinkingConfig:
+    """``thinking`` section of config.json (DeepThink on/off)."""
+
+    enabled: bool = DEFAULT_THINKING_ENABLED
 
 
 def _coerce_minutes(value: object) -> float:
@@ -145,6 +153,19 @@ def load_continuation_config(path: Optional[Path | str] = None) -> ContinuationC
     if grace < 0:
         grace = 0
     return ContinuationConfig(grace_ms=grace)
+
+
+def load_thinking_config(path: Optional[Path | str] = None) -> ThinkingConfig:
+    """Read the ``thinking`` section of ``config.json`` fresh."""
+    config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    section = raw.get("thinking") if isinstance(raw, dict) else None
+    section = section if isinstance(section, dict) else {}
+    enabled = section.get("enabled", DEFAULT_THINKING_ENABLED)
+    return ThinkingConfig(enabled=bool(enabled))
 
 
 class StallDetector:
