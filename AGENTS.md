@@ -7,36 +7,34 @@ repository. It is loaded into the preamble on every turn.
 
 Every response is exactly one of:
 
-  1. One sentence of intent, then a single <tool_call> block.
-  2. A final answer followed by the completion marker <<DONE>>.
+  1. One sentence of intent, then one or more tool calls.
+  2. A final answer, optionally followed by <<DONE>> on its own line.
 
-Prose with no tool call and no <<DONE>> is an incomplete turn.
-Do not write it.
+Prose with no tool call and no final answer is an incomplete turn. The
+harness replies with "Continue." and lets you carry on.
 
 ## Tool-call format
 
-Call tools with exactly this format and nothing else:
+Any of these shapes is accepted, and several may appear in one response:
 
-    <tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>
+  * <tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>
+  * a freeform patch block (see "Editing files" below)
+  * a DSML invoke block with named parameters
 
-Do not wrap the call in DSML, XML, <|tool_calls|>, or any other markup.
-Do not include more than one sentence of prose before the <tool_call> block.
+Every call the harness finds is executed, in the order it appears.
 
 ## Completion marker
 
-When a task is complete, write a single line containing exactly:
-
-    <<DONE>>
-
-The line must have a blank line before it and a blank line after
-it. It must be the only content on its line. It is a control
-signal and will not be shown to the user.
+<<DONE>> is optional. When a task is complete you may write a single
+line containing exactly <<DONE>>, with a blank line before it. It is
+a control signal, it is never shown to the user, and stopping with a
+plain final answer is just as good — the harness detects both.
 
 ## Single tool call per response
 
-Emit at most ONE <tool_call> block per response. If you emit
-more, only the first will be executed. Wait for the tool result
-before emitting the next call.
+Prefer one tool call per response: it keeps results easy to read.
+This is a preference, not a rule — if you emit several, all of them
+run, in order.
 
 ## No dangling preambles
 
@@ -53,18 +51,15 @@ over any planning suggestion.
 
 ## Never forget these rules
 
-The completion marker, single tool call, and no-dangling-preamble
-rules are non-negotiable. They govern every response.
+The no-dangling-preamble rule is non-negotiable. Completion and call
+formatting are up to you.
 
 ## Single-task turns
 
-Do one atomic thing per turn. If the task requires more than three
-tool calls, do the first one and stop. The harness will continue on
-the next turn.
-
-Do NOT scaffold multiple files from one prompt. Do NOT write a
-script, run it, and verify it in one turn unless the prompt is short
-and single-purpose. Split the work.
+Prefer an atomic step per turn. When a task needs several tool calls
+they may be emitted together — the harness runs them all in order —
+but keep each step small enough to check. Avoid scaffolding many
+unrelated files from one prompt.
 
 ## Editing files
 
@@ -130,7 +125,7 @@ truncated at 10KB or 256 lines. Use exec_command for all shell work.
 
 ## When to stop
 
-If a task is complete, write the final answer and end with the
-completion marker <<DONE>> on its own line. If a task is not
-complete and you need more turns, emit the next tool call. Do not
-write a summary of what you have done unless the task is done.
+If a task is complete, write the final answer — with <<DONE>> on its
+own line if you like. If a task is not complete, emit the next tool
+call. Do not write a summary of what you have done unless the task
+is done.

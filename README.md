@@ -147,26 +147,25 @@ error, and `141` for a truncated pipe (`SIGPIPE` convention).
 
 ### Response protocol
 
-The CLI drives the model through a strict, machine-checked protocol.
+The CLI accepts whatever the model naturally produces and parses it — it does
+not force a single format.
 
-**Completion marker.** When a task is complete the model writes a single line
-containing exactly `<<DONE>>`. The marker must be the only content on its line,
-it must be preceded by a blank line, and it must be followed by a blank line or
-the end of the response. A response with a malformed marker (inline text,
-missing blank lines, or more than one occurrence) is not treated as complete.
-The marker is a control signal: it is stripped and never shown to the user.
+**Tool calls.** One unified parser extracts every call in a response, in the
+order it appears, whatever its shape: a `<tool_call>{"name": ..., "arguments":
+...}</tool_call>` JSON block, a freeform patch block, or a DSML
+`invoke`/`parameter` block. Mixed responses work too. All extracted calls are
+executed sequentially; a failing call is reported and the rest still run, and
+all results are returned to the model in one message.
 
-**One tool call per response.** The model emits at most one
-`<tool_call>...</tool_call>` block per response and waits for the tool result
-before emitting the next call. If a response contains several calls, the
-harness executes only the first and returns a synthetic error result for each
-of the others telling the model to re-emit them separately.
+**Completion.** A response ends the turn when it carries a valid `<<DONE>>`
+marker, contains a completion phrase such as "TASK COMPLETE", or is a
+substantial final answer (at least 200 characters with no trailing question or
+forward-looking phrase). `<<DONE>>` is never shown to the user.
 
-**No dangling preambles.** Prose such as "I'll run..." without a tool call is an
-incomplete turn. If the model intends to call a tool, the tool call must be in
-the same response. A response with neither a tool call nor a valid `<<DONE>>`
-is nudged; after five consecutive nudges the turn is abandoned and the raw
-response is saved to `/tmp/prose_stop_<ts>.txt`.
+**Soft continuation.** Otherwise the harness sends exactly `Continue.` and
+lets the model pick up where it left off — no correction, no format lecture.
+The counter resets after any successful tool call and the turn stops after
+five continuations, saving the last response to `/tmp/incomplete_<ts>.txt`.
 
 **Network retry.** Retry behaviour is configured in `config.json` at the
 repository root and is re-read at the start of every request:

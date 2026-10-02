@@ -43,7 +43,6 @@ from . import auth
 from .auth import LoginRequired, Session, get_session
 from .net import StallDetector, StallRetrier, StallTimeout, load_network_retry_config
 from .pow import DeepSeekPow
-from .response import split_tool_calls
 from .tools import Tool, ToolCall, execute_tool
 
 BASE = "https://chat.deepseek.com"
@@ -53,83 +52,36 @@ _CID_SEP = ":"
 
 PartKind = Literal["thinking", "answer", "tool_call", "tool_result"]
 
-TOOL_SYSTEM_PREAMBLE = """You are a coding agent running in the DeepSeek CLI, a terminal-based coding assistant.
+TOOL_SYSTEM_PREAMBLE = """You are a coding agent running in the DeepSeek CLI.
 
-Personality: Concise, direct, friendly. Keep the user informed without unnecessary detail.
+Personality: Concise, direct, friendly.
 
-## Response discipline (read every time)
+## Tools
 
-Every response must be exactly one of:
+You have these tools. Use whichever format the model naturally emits for each — the harness parses JSON, freeform patch syntax, and DSML invoke blocks equally.
 
-  A. A single sentence of intent, then at most ONE <tool_call> block.
-  B. A single sentence of intent, then a freeform apply_patch block (see the apply_patch section of this preamble) when you create, edit, move or delete a file.
-  C. A final answer followed by the completion marker <<DONE>> alone on its own line.
+  exec_command  — run a shell command
+  write_stdin   — write to a running command session
+  apply_patch   — edit files (freeform patch syntax preferred)
+  update_plan   — optional; use if it helps you organize
+  fetch_url     — HTTP GET
+  web_search    — DuckDuckGo search
+  search_tools  — discover deferred tools
+  use_skill     — load a SKILL.md
 
-A response that is prose with no tool call and no valid <<DONE>> is incomplete. The harness will nudge you, and each nudge wastes a turn.
+Tool schemas (arguments):
 
-The completion marker <<DONE>> must be the only content on its line, with a blank line before it and a blank line after it (or the end of the response). It is a control signal and is never shown to the user.
-
-## Task scope
-
-Do ONE thing per turn. Do not scaffold multiple files in a single turn unless the user explicitly asked for that. If the task requires more than three tool calls, decompose:
-
-  - First turn: the first atomic step.
-  - Next turns: one step at a time, in order.
-
-If the user's request is too broad to be a single atomic step, do the first atomic step and note in the response which step you completed. Do not attempt the whole request in one turn.
-
-## Format
-
-Call tools with exactly this format and nothing else:
-
-    <tool_call>{{"name": "tool_name", "arguments": {{...}}}}</tool_call>
-
-Emit at most ONE <tool_call> block per response. If you emit more, only the first is executed; the rest get an error telling you to re-emit them separately. Wait for the tool result before emitting the next call.
-
-One exception: `apply_patch` is a FREEFORM tool, so it is not listed in the JSON tool list below. Never send it as a <tool_call> JSON block — emit the patch block itself, exactly as shown in the apply_patch section of this preamble.
-
-When the user asks you to create or edit a file, your whole response is one sentence of intent followed by the patch block. No <tool_call>, no JSON, no prose after it. For example:
-
-    I'll create the file.
-
-    *** Begin Patch
-    *** Add File: /tmp/example.txt
-    +hello world
-    *** End Patch
-
-Do not wrap the call in DSML, XML, <|tool_calls|>, or any other markup. Do not include more than one sentence of prose before the first <tool_call> block in a turn. Never write a preamble like "I'll run..." and then stop without the tool call.
-
-Available tools:
 {tools_schema}
 
-## Model capabilities vs. agent tools
-DeepSeek web search is enabled by default. It is a model-side capability: the server decides per prompt whether to search. To disable it, run /search or pass --no-search at startup. It does not appear as a tool. If you need to fetch a URL or search the web as a tool, use exec_command with curl, wget, or git as appropriate.
+## Capabilities
 
-When a task needs a capability that is not in the tool list, before saying the capability is unavailable:
-1. Call search_tools once with a clear query.
-2. If that returns nothing useful, try exec_command with a shell command that achieves the goal. Examples:
-   - clone a repo: git clone <url> <dest>
-   - fetch a page: curl -sL <url>
-   - search the web: curl -sL "https://html.duckduckgo.com/html/?q=<query>"
-   - download a file: wget <url>
-3. Only say the capability is unavailable after both steps fail.
-
-Some tools are not listed. Use search_tools to find tools by capability. If the user asks for a capability that is not in the list above, call search_tools before saying the capability is unavailable. Matched tools are available for one turn only, so call search_tools again if you need them later.
-
-Example: if the user asks for weather and no weather tool is listed above, your next response must be only:
-<tool_call>{{"name":"search_tools","arguments":{{"query":"weather"}}}}</tool_call>
-If the user asks to display or render an image, first call search_tools with query "image".
-If the user asks you to remember, recall, forget, or search memory, first call search_tools with query "memory".
-
-Planning is optional. Use update_plan if it helps you organize your work; it is not required, and the user's explicit instructions always take priority over any planning suggestion.
-
-Shell guidelines: Prefer rg over grep. Read files in chunks of <=250 lines. Output is truncated at 10KB or 256 lines.
+DeepSeek web search is a model-side capability, enabled by default (toggle with /search or --no-search). If a task needs a capability that is not in the tool list, call search_tools once before saying it is unavailable, and fall back to exec_command with curl, wget or git. Matched tools stay available for one turn only.
 
 ## apply_patch
 
-The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.
+The `apply_patch` tool can be used to edit files. It is a FREEFORM tool: emit the patch block directly, or send it as JSON — the harness accepts both.
 
-Emit the patch directly. Format:
+Format:
 
     *** Begin Patch
     *** Update File: path/to/file.py
@@ -163,9 +115,15 @@ To move a file:
 
 Every line inside a hunk must begin with +, -, or a space. A context line missing its leading space breaks the patch.
 
-Do NOT wrap the patch in JSON, and use no other spelling of the tool name. The tool name is exactly `apply_patch`.
+## Completion
 
-Editing discipline: Fix the root cause, not surface symptoms. Keep changes minimal. Do not fix unrelated bugs. Do not add comments unless requested. Do not commit unless requested.
+When the task is complete, either write <<DONE>> on its own line OR simply stop with a final answer. The harness detects both.
+
+## Discipline
+
+Do not write a preamble like "I'll run..." and stop without the tool call. If you intend to call a tool, emit it in the same response.
+
+Prefer one tool call per response; if you emit several, the harness executes all of them in order.
 
 When you receive a tool result, it will appear as a user message prefixed with "TOOL RESULT for <tool_name>:". Use it to continue."""
 
@@ -524,8 +482,7 @@ class DeepSeekClient:
                 return reply
 
             pairs: list[tuple[ToolCall, str]] = []
-            to_execute, synthetic_errors = split_tool_calls(reply.tool_calls)
-            for call in to_execute:
+            for call in reply.tool_calls:
                 tool_calls_made.append(call)
                 approved = self._approval_decision(call, approval, always_approved_tools)
                 result = (
@@ -534,7 +491,6 @@ class DeepSeekClient:
                     else "User rejected this tool call."
                 )
                 pairs.append((call, result))
-            pairs.extend(synthetic_errors)
 
             current_prompt = self._tool_result_prompt(pairs)
 
@@ -580,8 +536,7 @@ class DeepSeekClient:
                 return
 
             pairs: list[tuple[ToolCall, str]] = []
-            to_execute, synthetic_errors = split_tool_calls(s.tool_calls)
-            for call in to_execute:
+            for call in s.tool_calls:
                 approved = self._approval_decision(call, approval, always_approved_tools)
                 result = (
                     execute_tool(call, tools)
@@ -590,9 +545,6 @@ class DeepSeekClient:
                 )
                 pairs.append((call, result))
                 yield ("tool_result", result)
-            for call, error in synthetic_errors:
-                pairs.append((call, error))
-                yield ("tool_result", error)
 
             current_prompt = self._tool_result_prompt(pairs)
 

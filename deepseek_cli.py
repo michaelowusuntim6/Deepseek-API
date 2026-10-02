@@ -74,12 +74,12 @@ from deepseek.compaction import CompactionManager
 from deepseek.client import TOOL_SYSTEM_PREAMBLE
 from deepseek.response import (
     DONE_TOKEN,
-    MAX_NUDGES_PER_TURN,
-    NUDGE_MESSAGE,
+    CONTINUE_PROMPT,
+    MAX_CONTINUATIONS_PER_TURN,
     PatchStreamFilter,
     ResponseProcessor,
     TurnNudger,
-    split_tool_calls,
+    execute_tool_calls,
     strip_done,
 )
 from deepseek.agents_md import discover_agents, generate_draft
@@ -104,15 +104,6 @@ EXIT_AUTH = 2
 EXIT_USAGE = 3
 EXIT_INTERRUPTED = 130
 EXIT_SIGPIPE = 141
-PARSE_RETRY_MESSAGE = (
-    "Your previous response contained a tool call that could not be "
-    "parsed. Re-emit ONLY the tool call, using exactly this format "
-    "and nothing else:\n\n"
-    '<tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>\n\n'
-    "Do not include any DSML, XML, closing tags, or prose."
-)
-
-
 def build_tool_result_message(tool_name: str, output: str,
                               original_prompt: str, tool_count: int) -> str:
     return (
@@ -122,14 +113,8 @@ def build_tool_result_message(tool_name: str, output: str,
         "Original user request (verbatim, truncated to 300 chars):\n"
         f"{(original_prompt or '')[:300]}\n\n"
         f"Tool calls completed so far: {tool_count}\n\n"
-        "Do NOT write a summary of the tool output. Do NOT write a final "
-        "answer unless the task is complete. If the task requires more tool "
-        "calls, emit exactly ONE <tool_call> block now and wait for its "
-        "result. If and only if the entire task is done, write the final "
-        "answer and end with <<DONE>> alone on its own line, preceded and "
-        "followed by a blank line.\n\n"
-        "If you write prose without a tool call and without <<DONE>>, the "
-        "harness will nudge you. Do not waste nudges."
+        "Continue the task: call another tool if you need one, otherwise give "
+        "your final answer."
     )
 
 MODEL_CHOICES = {
@@ -143,20 +128,6 @@ _BUILTIN_TOOL_NAMES = frozenset({
     "read_file", "list_dir", "write_file", "run_shell",
     "edit_file", "grep", "find_files", "fetch_url",
 })
-
-# Freeform tools are described in the preamble and are deliberately NOT listed
-# in the JSON tool schema, so the model emits raw patch text instead of a
-# <tool_call> JSON block. The harness still accepts (and executes) the legacy
-# JSON form if a model sends one.
-FREEFORM_TOOL_NAMES = frozenset({"apply_patch"})
-
-
-def tool_schema_json(tools: list[Tool]) -> str:
-    """Serialise the JSON tool list, leaving freeform tools to the preamble."""
-    return json.dumps(
-        [t.schema() for t in tools if t.name not in FREEFORM_TOOL_NAMES],
-        indent=2,
-    )
 
 _SKIP_DIRS = {
     "__pycache__", ".git", "venv", "node_modules", ".venv",
@@ -218,7 +189,9 @@ class WorkingIndicator:
             self._stop.wait(1.5)
 
     def show_nudge(self, attempt: int) -> None:
-        sys.stderr.write(f"\r\033[2K[nudge {attempt}/{MAX_NUDGES_PER_TURN}] continuing turn…")
+        sys.stderr.write(
+            f"\r\033[2K[continue {attempt}/{MAX_CONTINUATIONS_PER_TURN}] continuing turn…"
+        )
         sys.stderr.flush()
 
 
@@ -1373,15 +1346,16 @@ class DeepSeekCLI:
         turn_prompt_chars = 0
         summary_prefix = self._summary_prefix_for_next_request
         self._summary_prefix_for_next_request = None
-        nudger = TurnNudger(MAX_NUDGES_PER_TURN)
+        nudger = TurnNudger(MAX_CONTINUATIONS_PER_TURN)
         had_tool_call = False
         tool_count = 0
+        last_response_text = ""
         parse_fail_count = 0
         self._indicator = WorkingIndicator()
 
         for iteration in range(8):
             visible = self.registry.visible_tools()
-            schema = tool_schema_json(visible)
+            schema = json.dumps([tool_obj.schema() for tool_obj in visible], indent=2)
             tool_prompt = (
                 self.client._tool_prompt(
                     current_prompt, schema, current_cid,
@@ -1420,77 +1394,54 @@ class DeepSeekCLI:
             if visible:
                 self.client._remember_tool_prompt(schema, current_cid)
 
-            # Freeform patch blocks are detected after the stream ends; they
-            # become apply_patch calls alongside any parsed <tool_call> blocks.
-            parsed_calls = list(stream.tool_calls) + self._response_processor.freeform_patch_calls
-            signal = self._response_processor.signal
-            if signal == "tool_call" and not parsed_calls:
-                # A <tool_call> block was seen in a RESPONSE fragment but its
-                # JSON could not be parsed: treat it as a parser failure.
-                signal = None
+            last_response_text = (
+                self._response_processor.raw_answer or "".join(self._answer_parts)
+            )
+            # One unified parse of the whole response: JSON, freeform patches
+            # and DSML all land here, in the order the model emitted them.
+            calls = self._response_processor.parsed_tool_calls
 
-            if signal is None:
-                parse_candidate = self._audit_unparsed_tool_call(
-                    self._response_processor.raw_answer
+            if calls:
+                had_tool_call = True
+                tool_count += len(calls)
+                nudger.reset()
+                decisions = (
+                    self._approve_tool_batch(calls)
+                    if self.tools_mode == "manual"
+                    else None
                 )
-                if parse_candidate:
-                    parse_fail_count += 1
-                    nudger.consecutive_failures += 1
-                    nudger.total_nudges += 1
-                    if parse_fail_count <= MAX_NUDGES_PER_TURN:
-                        current_prompt = PARSE_RETRY_MESSAGE
-                        continue
-                    stamp = int(time.time())
-                    path = Path(f"/tmp/parse_fail_{stamp}.txt")
-                    path.write_text("".join(self._answer_parts), encoding="utf-8")
-                    sys.stderr.write(f"[parser] parse retries exhausted; saved raw response to {path}\n")
-                    break
+                results = execute_tool_calls(executor, calls, visible, decisions=decisions)
+                for call, result in results:
+                    self._turn_tool_result_chars += len(result)
+                    self._emit_tool_result(call, result)
+                self.registry.finish_iteration()
+                current_prompt = "\n\n".join(
+                    build_tool_result_message(
+                        call.name, result, self._original_prompt or prompt, tool_count
+                    )
+                    for call, result in results
+                )
+                wire_model = None
+                continue
 
-            decision = nudger.note(signal)
-            if decision == "complete":
+            if self._response_processor.complete:
                 self.registry.finish_iteration()
                 self._indicator.stop()
                 break
 
-            if decision in ("nudge", "give_up"):
-                if self.tools_mode != "auto":
-                    decision = "give_up"
-                if decision == "give_up":
-                    path = nudger.write_stop_file("".join(self._answer_parts))
-                    sys.stderr.write(
-                        f"[agent] prose-only stop. session={self.conversation_id} "
-                        f"saved={path}\n"
-                    )
-                    self.registry.finish_iteration()
-                    self._indicator.stop()
-                    break
-                self._indicator.stop()
-                self._indicator.show_nudge(nudger.total_nudges)
-                current_prompt = NUDGE_MESSAGE
-                continue
-
-            had_tool_call = True
-            to_execute, synthetic_errors = split_tool_calls(parsed_calls)
-            tool_count += len(to_execute)
-
-            if self.tools_mode == "manual":
-                decisions = self._approve_tool_batch(to_execute)
-                results = executor.execute(
-                    to_execute, visible, decisions=decisions
-                ) + synthetic_errors
-            else:
-                results = executor.execute(to_execute, visible) + synthetic_errors
-            for call, result in results:
-                self._turn_tool_result_chars += len(result)
-                self._emit_tool_result(call, result)
+            # Incomplete: a soft ping, never a correction.
+            decision = nudger.note(None)
             self.registry.finish_iteration()
-            current_prompt = "\n\n".join(
-                build_tool_result_message(
-                    call.name, result, self._original_prompt or prompt, tool_count
+            self._indicator.stop()
+            if decision == "give_up":
+                path = nudger.write_stop_file(last_response_text)
+                sys.stderr.write(
+                    f"[agent] no progress after {nudger.total_nudges} continuations. "
+                    f"session={self.conversation_id} saved={path}\n"
                 )
-                for call, result in results
-            )
-            wire_model = None
+                break
+            self._indicator.show_nudge(nudger.total_nudges)
+            current_prompt = CONTINUE_PROMPT
 
         self._finish_turn(prompt, current_cid, prefix_chars=turn_prompt_chars)
         self._indicator.stop()
@@ -2095,7 +2046,7 @@ def main(argv: list[str] | None = None) -> int:
         app = DeepSeekCLI(args, parser, interactive=False, prompt=None)
         app.reload_tools()
         app._load_context_layers()
-        schema = tool_schema_json(app.registry.visible_tools())
+        schema = json.dumps([t.schema() for t in app.registry.visible_tools()], indent=2)
         text = TOOL_SYSTEM_PREAMBLE.format(tools_schema=schema)
         sections = app._context_sections()
         if sections:
