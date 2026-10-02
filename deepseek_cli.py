@@ -184,13 +184,6 @@ class WorkingIndicator:
             idx += 1
             self._stop.wait(1.5)
 
-    def show_nudge(self, attempt: int) -> None:
-        sys.stderr.write(
-            f"\r\033[2K[continue {attempt}/{MAX_CONTINUATIONS_PER_TURN}] continuing turn…"
-        )
-        sys.stderr.flush()
-
-
 _ACTIVE_INDICATORS: set[WorkingIndicator] = set()
 
 
@@ -1461,12 +1454,16 @@ class DeepSeekCLI:
             self._indicator.stop()
             if decision == "give_up":
                 path = nudger.write_stop_file(last_response_text)
+                sent = max(1, nudger.total_nudges - 1)
                 sys.stderr.write(
-                    f"[agent] no progress after {nudger.total_nudges} continuations. "
-                    f"session={self.conversation_id} saved={path}\n"
+                    "\n"
+                    f"The model made no progress after {sent} "
+                    "continuations, so the turn was stopped.\n"
+                    f"The last response was saved to {path}\n"
+                    "\n"
                 )
+                sys.stderr.flush()
                 break
-            self._indicator.show_nudge(nudger.total_nudges)
             self._ensure_fresh_line()
             current_prompt = CONTINUE_PROMPT
 
