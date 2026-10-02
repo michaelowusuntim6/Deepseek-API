@@ -25,7 +25,6 @@ from deepseek.client import (
     _parse_sse,
 )
 from deepseek.response import (
-    CONTINUE_PROMPT,
     DONE_TOKEN,
     MAX_CONTINUATIONS_PER_TURN,
     PatchStreamFilter,
@@ -42,6 +41,7 @@ from deepseek.response import (
 from deepseek.agent_tools import ToolExecutor, _parse_patch, apply_patch
 from deepseek.tools import Tool, ToolCall, execute_tool
 from deepseek_cli import (
+    CONTINUE_PROMPT,
     DeepSeekCLI,
     WorkingIndicator,
     build_tool_registry,
@@ -373,7 +373,6 @@ def test_done_malformed_not_complete() -> None:
         f"Here is the report. {DONE_TOKEN}\n",
         f"{DONE_TOKEN}\n\n{DONE_TOKEN}\n",
         f"Report.\n{DONE_TOKEN}\n",
-        f"{DONE_TOKEN}\n",
     ]
     for raw in cases:
         assert not has_valid_done(raw), raw
@@ -425,13 +424,18 @@ def test_multiple_tool_calls_ordering_and_failure_continues() -> None:
     print("  PASS: every call runs, in order, and a failure does not stop the rest")
 
 
-def test_continue_prompt_is_a_soft_ping() -> None:
-    assert CONTINUE_PROMPT == "Continue."
+def test_continue_prompt_text() -> None:
+    assert CONTINUE_PROMPT == (
+        "Are you done? If so, write <<DONE>> on its own line "
+        "(with a blank line before it). If not, emit a tool call to "
+        "continue the task. Do not write prose without one of these."
+    )
+    assert "<<DONE>>" in CONTINUE_PROMPT
+    assert "emit a tool call" in CONTINUE_PROMPT
     for banned in ("~/", "Downloads", "hf_results", "ls ", "/home/", "Hugginface"):
         assert banned not in CONTINUE_PROMPT, banned
     assert "You stopped" not in CONTINUE_PROMPT
-    assert "<tool_call>" not in CONTINUE_PROMPT
-    print("  PASS: continuation is the bare word Continue.")
+    print("  PASS: continuation offers <<DONE>> or a tool call, no correction")
 
 
 def test_nudge_counter_resets_on_tool_success() -> None:
@@ -790,13 +794,13 @@ def test_mixed_formats_in_one_response() -> None:
 
 
 def test_soft_continue_message() -> None:
-    assert CONTINUE_PROMPT == "Continue."
+    assert "<<DONE>>" in CONTINUE_PROMPT and "emit a tool call" in CONTINUE_PROMPT
     assert "You stopped" not in CONTINUE_PROMPT
     app, client = _run_scripted([
         [("answer", "Let me think about that.")],
         [("answer", "All done. " + "x" * 220)],
     ])
-    assert client.prompts[1] == "Continue."
+    assert client.prompts[1] == CONTINUE_PROMPT
     assert "The task requires exec_command" not in client.prompts[1]
     print("  PASS: an incomplete response is answered with exactly 'Continue.'")
 
@@ -818,10 +822,31 @@ def test_continuation_counter_resets_on_tool_call() -> None:
         [("answer", "Let me look again.")],
         [("answer", "Done. " + "y" * 220)],
     ])
-    assert client.prompts[1] == "Continue."
+    assert client.prompts[1] == CONTINUE_PROMPT
     assert "TOOL RESULT for exec_command" in client.prompts[2]
-    assert client.prompts[3] == "Continue."
+    assert client.prompts[3] == CONTINUE_PROMPT
     print("  PASS: continuation counter is 1, 0, 1 across a tool call")
+
+
+def test_continuation_renders_on_new_line() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--tools", "auto", "hi"])
+    app = DeepSeekCLI(args, parser, interactive=False, prompt="hi")
+    app.reload_tools()
+    app.client = _ScriptedClient([
+        [("answer", "Hi! What can I help you with today?")],
+        [("answer", "No task yet - just say what you'd like me to do.")],
+        [("answer", "Ready whenever you are.\n\n<<DONE>>\n")],
+    ])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        app._run_agent_turn("hi")
+    rendered = out.getvalue()
+    assert "today?No task" not in rendered
+    assert "do.Ready" not in rendered
+    assert "\n\nNo task yet" in rendered
+    assert "\n\nReady whenever you are." in rendered
+    print("  PASS: each continued response starts on its own line")
 
 
 def test_completion_heuristic_substantial_answer() -> None:
@@ -858,6 +883,27 @@ def test_done_marker_still_stripped() -> None:
     assert client.prompts == ["hi"]
     assert DONE_TOKEN not in "".join(app._answer_parts)
     print("  PASS: <<DONE>> still ends the turn and never reaches the output")
+
+
+def test_done_marker_alone_is_valid() -> None:
+    processor = ResponseProcessor().feed_all([("answer", f"{DONE_TOKEN}\n")])
+    assert processor.done is True
+    assert processor.complete is True
+    print("  PASS: a response that is only <<DONE>> counts as complete")
+
+
+def test_done_marker_no_preceding_blank_line_still_invalid() -> None:
+    processor = ResponseProcessor().feed_all([("answer", f"Some text\n{DONE_TOKEN}\n")])
+    assert processor.done is False
+    assert processor.complete is False
+    print("  PASS: a marker glued under text is still not complete")
+
+
+def test_done_marker_with_preceding_blank_line_valid() -> None:
+    processor = ResponseProcessor().feed_all([("answer", f"Some text\n\n{DONE_TOKEN}\n")])
+    assert processor.done is True
+    assert processor.complete is True
+    print("  PASS: a marker after a blank line is complete")
 
 
 def test_five_consecutive_continuations_give_up(tmp_path, monkeypatch) -> None:

@@ -74,7 +74,6 @@ from deepseek.compaction import CompactionManager
 from deepseek.client import TOOL_SYSTEM_PREAMBLE
 from deepseek.response import (
     DONE_TOKEN,
-    CONTINUE_PROMPT,
     MAX_CONTINUATIONS_PER_TURN,
     PatchStreamFilter,
     ResponseProcessor,
@@ -104,6 +103,14 @@ EXIT_AUTH = 2
 EXIT_USAGE = 3
 EXIT_INTERRUPTED = 130
 EXIT_SIGPIPE = 141
+
+# Sent when a response is incomplete: it asks for a decision instead of the
+# bare "Continue." that used to leave the model guessing.
+CONTINUE_PROMPT = (
+    "Are you done? If so, write <<DONE>> on its own line "
+    "(with a blank line before it). If not, emit a tool call to "
+    "continue the task. Do not write prose without one of these."
+)
 
 
 MODEL_CHOICES = {
@@ -801,6 +808,7 @@ class DeepSeekCLI:
         self._answer_line_open = False
         self._thinking_line_open = False
         self._answer_line_buffer = ""
+        self._last_render_ended_with_newline = True
         self._in_code_fence = False
         self._fence_lines: list[str] = []
         self._fence_language = "text"
@@ -861,12 +869,14 @@ class DeepSeekCLI:
                 self.out.print()
                 self._answer_line_open = True
             self._emit_answer_text(text)
+            self._last_render_ended_with_newline = text.endswith("\n")
         elif kind == "thinking":
             if self.show_thinking:
                 if not self._thinking_line_open:
                     self.ui.print("\n[dim]Thinking[/]")
                     self._thinking_line_open = True
                 self.ui.print(text, end="", markup=False, highlight=False)
+                self._last_render_ended_with_newline = text.endswith("\n")
         elif kind == "tool_call":
             self._close_answer_line()
             args = json.dumps(fields.get("arguments", {}), ensure_ascii=False)
@@ -874,12 +884,14 @@ class DeepSeekCLI:
                 f"\n[bold yellow]tool[/] [cyan]{fields.get('name', 'unknown')}[/] "
                 f"[dim]{args}[/]"
             )
+            self._last_render_ended_with_newline = True
         elif kind == "tool_result":
             result = self._short_result(text)
             self.ui.print(
                 f"[dim]  result[/] [cyan]{fields.get('name', 'unknown')}[/] "
                 f"[dim]{result}[/]"
             )
+            self._last_render_ended_with_newline = True
         elif kind == "system":
             self._render_system(text)
         elif kind == "error":
@@ -905,6 +917,24 @@ class DeepSeekCLI:
         if self._answer_line_open:
             self.out.print()
             self._answer_line_open = False
+
+    def _ensure_fresh_line(self) -> None:
+        """Make the next rendered output start on its own line.
+
+        Continuations and tool results reuse the same output stream as the
+        previous response; without this, a response that did not end in a
+        newline glues onto the one before it.
+        """
+        if self.json_mode or self._last_render_ended_with_newline:
+            return
+        if self._answer_line_buffer or self._answer_line_open:
+            # Flushes the pending answer line (and closes the block) so the
+            # next text starts fresh instead of continuing that line.
+            self._close_answer_line()
+        else:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        self._last_render_ended_with_newline = True
 
     def _markdown_streaming_enabled(self) -> bool:
         return (
@@ -1260,6 +1290,7 @@ class DeepSeekCLI:
         self._thinking_parts = []
         self._answer_line_open = False
         self._thinking_line_open = False
+        self._last_render_ended_with_newline = True
         self._json_tool_event_seen = False
         self._json_answer_buffer = ""
         self._turn_tool_result_chars = 0
@@ -1436,6 +1467,7 @@ class DeepSeekCLI:
                 )
                 break
             self._indicator.show_nudge(nudger.total_nudges)
+            self._ensure_fresh_line()
             current_prompt = CONTINUE_PROMPT
 
         self._finish_turn(prompt, current_cid, prefix_chars=turn_prompt_chars)
@@ -1487,6 +1519,7 @@ class DeepSeekCLI:
             raise
 
     def _emit_tool_result(self, call: ToolCall, result: str) -> None:
+        self._ensure_fresh_line()
         self.emit_event("tool_result", self._short_result(result, limit=500), name=call.name)
 
     def _audit_unparsed_tool_call(self, raw: str | None = None) -> bool:

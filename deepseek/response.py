@@ -24,9 +24,6 @@ from .tools import ToolCall
 
 DONE_TOKEN = "<<DONE>>"
 
-# Soft continuation: one word, no correction, no instructions.
-CONTINUE_PROMPT = "Continue."
-
 MAX_CONTINUATIONS_PER_TURN = 5
 # Backwards-compatible alias for callers written against the old name.
 MAX_NUDGES_PER_TURN = MAX_CONTINUATIONS_PER_TURN
@@ -69,7 +66,7 @@ def has_valid_done(text: str) -> bool:
     if len(indexes) != 1:
         return False
     i = indexes[0]
-    if i == 0 or lines[i - 1].strip() != "":
+    if i > 0 and lines[i - 1].strip() != "":
         return False
     if i != len(lines) - 1 and lines[i + 1].strip() != "":
         return False
