@@ -25,3 +25,6 @@ test_sdk.py
 
 # Generated image fixtures
 tests/fixtures/*.png
+
+# Working checklists — keep them in docs/checklists/, not root
+/*_TODO.md
