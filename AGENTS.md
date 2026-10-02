@@ -5,6 +5,10 @@ repository. It is loaded into the preamble on every turn.
 
 ## Response format
 
+Before your first tool call in a turn, do not narrate. Emit the
+tool call directly. One short sentence of intent is the maximum;
+zero is preferred.
+
 Every response is exactly one of:
 
   1. One sentence of intent, then one or more tool calls.

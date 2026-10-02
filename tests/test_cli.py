@@ -38,12 +38,13 @@ from deepseek.response import (
     strip_done,
     strip_freeform_patches,
 )
-from deepseek.agent_tools import ToolExecutor, _parse_patch, apply_patch
+from deepseek.agent_tools import ToolExecutor, _parse_patch, apply_patch, exec_command
 from deepseek.net import WatchConfig
 from deepseek.tools import Tool, ToolCall, execute_tool
 from deepseek_cli import (
     CONTINUE_PROMPT,
     DeepSeekCLI,
+    FIRST_CONTINUE_PROMPT,
     WATCH_NO_SESSION_ERROR,
     WorkingIndicator,
     build_tool_registry,
@@ -810,7 +811,7 @@ def test_soft_continue_message() -> None:
         [("answer", "Let me think about that.")],
         [("answer", "All done. " + "x" * 220)],
     ])
-    assert client.prompts[1] == CONTINUE_PROMPT
+    assert client.prompts[1] == FIRST_CONTINUE_PROMPT
     assert "The task requires exec_command" not in client.prompts[1]
     print("  PASS: an incomplete response is answered with exactly 'Continue.'")
 
@@ -832,7 +833,7 @@ def test_continuation_counter_resets_on_tool_call() -> None:
         [("answer", "Let me look again.")],
         [("answer", "Done. " + "y" * 220)],
     ])
-    assert client.prompts[1] == CONTINUE_PROMPT
+    assert client.prompts[1] == FIRST_CONTINUE_PROMPT
     assert "TOOL RESULT for exec_command" in client.prompts[2]
     assert client.prompts[3] == CONTINUE_PROMPT
     print("  PASS: continuation counter is 1, 0, 1 across a tool call")
@@ -878,7 +879,7 @@ def test_completion_heuristic_dangling_preamble() -> None:
         [("answer", "Let me inspect the file.")],
         [("answer", "All steps complete.")],
     ])
-    assert client.prompts[1] == CONTINUE_PROMPT
+    assert client.prompts[1] == FIRST_CONTINUE_PROMPT
     print("  PASS: a dangling preamble does not end the turn; Continue. fires")
 
 
@@ -929,7 +930,8 @@ def test_five_consecutive_continuations_give_up(tmp_path, monkeypatch) -> None:
     prose = [[("answer", f"Still thinking {i}.")] for i in range(5)]
     app, client = _run_scripted(prose)
     assert client.prompts[0] == "hi"
-    assert client.prompts.count(CONTINUE_PROMPT) == 5
+    assert client.prompts.count(FIRST_CONTINUE_PROMPT) == 1
+    assert client.prompts.count(CONTINUE_PROMPT) == 4
     assert len(written) == 1 and written[0].name.startswith("incomplete_")
     assert "Still thinking 4." in written[0].read_text()
     print("  PASS: five continuations exhaust the turn and write a diagnostic file")
@@ -939,6 +941,91 @@ def test_five_consecutive_continuations_give_up(tmp_path, monkeypatch) -> None:
 
 
 # ----- FINISHED gating and the continuation grace period --------------------
+
+
+# ----- multi-statement commands, continuation limit, directive first ping ---
+
+
+def test_multi_statement_command_runs_to_completion() -> None:
+    result = exec_command.fn(cmd="echo one; sleep 0.2; echo two; sleep 0.2; echo three")
+    assert "one" in result and "two" in result and "three" in result, result
+
+    result2 = exec_command.fn(
+        cmd='ls venv/bin/python 2>&1; echo \'---\'; '
+            'venv/bin/python -c "print(\'hello from python\')"'
+    )
+    assert "venv/bin/python" in result2, result2
+    assert "---" in result2, result2
+    assert "hello from python" in result2, result2
+
+    parser = build_parser()
+    args = parser.parse_args(["--tools", "off", "hi"])
+    app = DeepSeekCLI(args, parser, interactive=False, prompt="hi")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        app._emit_tool_result(ToolCall("exec_command", {}, "{}"), result2)
+    shown = buf.getvalue()
+    assert "venv/bin/python" in shown and "---" in shown and "hello from python" in shown
+    print("  PASS: multi-statement commands run fully and all lines are rendered")
+
+
+def test_continuation_limit_is_five(tmp_path, monkeypatch) -> None:
+    written: list = []
+    original = TurnNudger.write_stop_file
+
+    def spy(self, text, directory="/tmp"):
+        path = original(self, text, directory=tmp_path)
+        written.append(path)
+        return path
+
+    monkeypatch.setattr(TurnNudger, "write_stop_file", spy)
+    app, client = _scripted_app([[("answer", f"prose {i}.")] for i in range(5)])
+    app._grace_sleep = lambda seconds: None
+    _run_app(app)
+    continuations = (client.prompts.count(FIRST_CONTINUE_PROMPT)
+                     + client.prompts.count(CONTINUE_PROMPT))
+    assert continuations == 5, client.prompts
+    assert client.prompts.count(FIRST_CONTINUE_PROMPT) == 1
+    assert len(written) == 1                  # then the turn ends
+    print("  PASS: exactly five continuations, then the turn ends")
+
+
+def test_empty_response_does_not_reset_counter() -> None:
+    app, client = _scripted_app([
+        [("answer", "prose A.")],
+        [],                                   # empty response
+        [("answer", "prose B.")],
+        [("answer", "Done.\n\n<<DONE>>\n")],
+    ])
+    app._grace_sleep = lambda seconds: None
+    _run_app(app)
+    # If the empty response had reset the counter, the next ping would have
+    # been the directive first-continuation message again.
+    assert client.prompts.count(FIRST_CONTINUE_PROMPT) == 1
+    assert client.prompts.count(CONTINUE_PROMPT) == 2
+    assert len(client.prompts) == 4
+    print("  PASS: an empty response does not reset the continuation counter")
+
+
+def test_first_continuation_message_is_directive() -> None:
+    assert FIRST_CONTINUE_PROMPT == (
+        "You wrote intent but emitted no tool call. Emit the tool call "
+        "now, or write <<DONE>> if the task is finished. Do not write "
+        "prose."
+    )
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "Before your first tool call in a turn, do not narrate." in agents
+
+    app, client = _scripted_app([
+        [("answer", "Let me inspect the file.")],
+        [("answer", "Second prose.")],
+        [("answer", "Done.\n\n<<DONE>>\n")],
+    ])
+    app._grace_sleep = lambda seconds: None
+    _run_app(app)
+    assert client.prompts[1] == FIRST_CONTINUE_PROMPT
+    assert client.prompts[2] == CONTINUE_PROMPT
+    print("  PASS: the first continuation is directive, later ones are questions")
 
 
 def test_continuation_not_fired_on_partial_stream() -> None:
@@ -984,7 +1071,8 @@ def test_continuation_fired_only_after_finished() -> None:
     ])
     app._grace_sleep = lambda seconds: None
     _run_app(app)
-    assert client.prompts.count(CONTINUE_PROMPT) == 1
+    assert client.prompts.count(FIRST_CONTINUE_PROMPT) == 1
+    assert client.prompts.count(CONTINUE_PROMPT) == 0
     assert len(client.prompts) == 2          # the <<DONE>> response ended the turn
     print("  PASS: exactly one continuation, only after FINISHED")
 
@@ -996,7 +1084,7 @@ def test_think_fragment_does_not_trigger_check() -> None:
     ])
     app._grace_sleep = lambda seconds: None
     _run_app(app)
-    assert client.prompts.count(CONTINUE_PROMPT) == 1   # once for the whole stream
+    assert client.prompts.count(FIRST_CONTINUE_PROMPT) == 1   # once for the whole stream
     assert len(client.prompts) == 2
     print("  PASS: THINK fragments do not trigger a completion check")
 
@@ -1092,7 +1180,7 @@ def test_watch_does_not_fire_continuation() -> None:
     print("  PASS: <<WATCH>> never triggers a continuation")
 
 
-def test_watch_resets_failure_counter(tmp_path, monkeypatch) -> None:
+def test_watch_does_not_reset_failure_counter(tmp_path, monkeypatch) -> None:
     written: list = []
     original = TurnNudger.write_stop_file
 
@@ -1102,19 +1190,21 @@ def test_watch_resets_failure_counter(tmp_path, monkeypatch) -> None:
         return path
 
     monkeypatch.setattr(TurnNudger, "write_stop_file", spy)
-    # two stalls, a watch, then four more: without the reset the counter would
-    # pass the limit (2 + 4 > 5) and the turn would give up early.
-    prose = [[("answer", f"Still thinking {i}.")] for i in range(6)]
+    # Two stalls, a watch, then three more: only a successful tool call resets
+    # the counter, so the sixth consecutive failure ends the turn.
+    prose = [[("answer", f"Still thinking {i}.")] for i in range(5)]
     app, client = _scripted_app(
-        prose[:2] + [[("answer", WATCH_REPLY)]] + prose[2:] + [[("answer", "Done.\n\n<<DONE>>\n")]]
+        prose[:2] + [[("answer", WATCH_REPLY)]] + prose[2:]
     )
     app._running_session_id = lambda: "sess_test"
     app._watch_settings = lambda: WatchConfig(0.0, "")
     app._watch_poll = lambda session_id, chars="": WATCH_RUNNING_POLL
     _run_app(app)
-    assert written == []                       # the watch reset the stall counter
-    assert len(client.prompts) == 8            # the loop kept going past the stalls
-    print("  PASS: <<WATCH>> resets the consecutive-failure counter")
+    assert len(written) == 1                   # the watch did not reset the counter
+    # Five prose responses plus the empty one after them = six consecutive
+    # failures, so the turn gives up on the seventh request.
+    assert len(client.prompts) == 7
+    print("  PASS: <<WATCH>> does not reset the consecutive-failure counter")
 
 
 def test_watch_with_no_session_returns_error() -> None:
@@ -1185,7 +1275,7 @@ def test_session_still_running_blocks_completion(monkeypatch) -> None:
         [("answer", "All done.\n\n<<DONE>>\n")],
     ])
     _run_app(app)
-    assert client.prompts[2] == CONTINUE_PROMPT      # prose did not finish the turn
+    assert client.prompts[2] == FIRST_CONTINUE_PROMPT  # prose did not finish the turn
     assert len(client.prompts) == 3                  # the <<DONE>> response ended it
     print("  PASS: a running session blocks a prose-only completion")
 

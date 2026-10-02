@@ -121,6 +121,14 @@ CONTINUE_PROMPT = (
     "continue the task. Do not write prose without one of these."
 )
 
+# The first continuation has to fight the model's narrate-before-acting
+# habit, so it names the missing action instead of asking a question.
+FIRST_CONTINUE_PROMPT = (
+    "You wrote intent but emitted no tool call. Emit the tool call "
+    "now, or write <<DONE>> if the task is finished. Do not write "
+    "prose."
+)
+
 # Sent when the model asks to watch but nothing is running.
 WATCH_NO_SESSION_ERROR = (
     "ERROR: no running tool session to watch. Call a tool or write <<DONE>>."
@@ -929,11 +937,12 @@ class DeepSeekCLI:
             )
             self._last_render_ended_with_newline = True
         elif kind == "tool_result":
-            result = self._short_result(text)
-            self.ui.print(
-                f"[dim]  result[/] [cyan]{fields.get('name', 'unknown')}[/] "
-                f"[dim]{result}[/]"
-            )
+            name = fields.get("name", "unknown")
+            body = text.rstrip() or "(no output)"
+            self._ensure_fresh_line()
+            self.ui.print(f"[dim]  result[/] [cyan]{name}[/]")
+            for line in body.splitlines():
+                self.out.print("    " + line, markup=False, highlight=False)
             self._last_render_ended_with_newline = True
         elif kind == "system":
             self._render_system(text)
@@ -1521,7 +1530,6 @@ class DeepSeekCLI:
 
             if self._response_processor.watch:
                 # The model asked us to wait for a background session.
-                nudger.reset()
                 settings = self._watch_settings()
                 session_id = self._running_session_id()
                 self._indicator.start()
@@ -1567,7 +1575,11 @@ class DeepSeekCLI:
                 sys.stderr.flush()
                 break
             self._ensure_fresh_line()
-            current_prompt = CONTINUE_PROMPT
+            current_prompt = (
+                FIRST_CONTINUE_PROMPT
+                if nudger.total_nudges == 1
+                else CONTINUE_PROMPT
+            )
 
         self._finish_turn(prompt, current_cid, prefix_chars=turn_prompt_chars)
         self._indicator.stop()
@@ -1619,7 +1631,26 @@ class DeepSeekCLI:
 
     def _emit_tool_result(self, call: ToolCall, result: str) -> None:
         self._ensure_fresh_line()
-        self.emit_event("tool_result", self._short_result(result, limit=500), name=call.name)
+        self.emit_event("tool_result", self._display_result(result), name=call.name)
+
+    @staticmethod
+    def _display_result(result: str, limit_lines: int = 20,
+                        limit_chars: int = 2000) -> str:
+        """Bound a tool result for display without hiding later statements.
+
+        Only the first line used to be rendered, which made a multi-statement
+        command look as if it had stopped after statement one.
+        """
+        lines = (result or "").splitlines() or [""]
+        shown = lines[:limit_lines]
+        text = "\n".join(shown)
+        truncated = len(lines) > len(shown)
+        if len(text) > limit_chars:
+            text = text[:limit_chars].rstrip()
+            truncated = True
+        if truncated:
+            text += f"\n… (output truncated; {len(lines)} lines total)"
+        return text
 
     def _watch_settings(self) -> WatchConfig:
         return load_watch_config()
