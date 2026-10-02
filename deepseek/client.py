@@ -117,7 +117,7 @@ Every line inside a hunk must begin with +, -, or a space. A context line missin
 
 ## Completion
 
-When the task is complete, either write <<DONE>> on its own line OR simply stop with a final answer. The harness detects both.
+When the task is complete, write <<DONE>> on its own line, preceded by a blank line, to finish the turn. It is required at the end of every complete turn.
 
 ## Discipline
 

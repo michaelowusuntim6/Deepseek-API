@@ -8,7 +8,7 @@ repository. It is loaded into the preamble on every turn.
 Every response is exactly one of:
 
   1. One sentence of intent, then one or more tool calls.
-  2. A final answer, optionally followed by <<DONE>> on its own line.
+  2. A final answer, followed by <<DONE>> on its own line.
 
 Prose with no tool call and no final answer is an incomplete turn. The
 harness replies with "Continue." and lets you carry on.
@@ -25,10 +25,14 @@ Every call the harness finds is executed, in the order it appears.
 
 ## Completion marker
 
-<<DONE>> is optional. When a task is complete you may write a single
-line containing exactly <<DONE>>, with a blank line before it. It is
-a control signal, it is never shown to the user, and stopping with a
-plain final answer is just as good — the harness detects both.
+When a task is finished you must end your turn by writing a single
+line containing exactly:
+
+    <<DONE>>
+
+It must have a blank line before it, and it is the only content on its
+line. It is a control signal, it is never shown to the user, and the
+turn is not complete without it.
 
 ## Single tool call per response
 
@@ -125,7 +129,7 @@ truncated at 10KB or 256 lines. Use exec_command for all shell work.
 
 ## When to stop
 
-If a task is complete, write the final answer — with <<DONE>> on its
-own line if you like. If a task is not complete, emit the next tool
-call. Do not write a summary of what you have done unless the task
-is done.
+If a task is complete, write the final answer and finish with <<DONE>>
+on its own line, preceded by a blank line. If a task is not complete,
+emit the next tool call. Do not write a summary of what you have done
+unless the task is done.
