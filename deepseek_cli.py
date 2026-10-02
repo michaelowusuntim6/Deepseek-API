@@ -104,18 +104,7 @@ EXIT_AUTH = 2
 EXIT_USAGE = 3
 EXIT_INTERRUPTED = 130
 EXIT_SIGPIPE = 141
-def build_tool_result_message(tool_name: str, output: str,
-                              original_prompt: str, tool_count: int) -> str:
-    return (
-        f"TOOL RESULT for {tool_name}:\n{output}\n\n"
-        "---\n"
-        "[TASK STATUS]\n"
-        "Original user request (verbatim, truncated to 300 chars):\n"
-        f"{(original_prompt or '')[:300]}\n\n"
-        f"Tool calls completed so far: {tool_count}\n\n"
-        "Continue the task: call another tool if you need one, otherwise give "
-        "your final answer."
-    )
+
 
 MODEL_CHOICES = {
     "chat": ("deepseek-chat", "default"),
@@ -1415,11 +1404,17 @@ class DeepSeekCLI:
                     self._turn_tool_result_chars += len(result)
                     self._emit_tool_result(call, result)
                 self.registry.finish_iteration()
-                current_prompt = "\n\n".join(
-                    build_tool_result_message(
-                        call.name, result, self._original_prompt or prompt, tool_count
-                    )
+                body = "\n\n".join(
+                    f"TOOL RESULT for {call.name}:\n{result}"
                     for call, result in results
+                )
+                current_prompt = (
+                    body + "\n\n---\n[TASK STATUS]\n"
+                    "Original user request (verbatim, truncated to 300 chars):\n"
+                    f"{(self._original_prompt or prompt)[:300]}\n\n"
+                    f"Tool calls completed so far: {tool_count}\n\n"
+                    "Continue the task: call another tool if you need one, otherwise "
+                    "give your final answer."
                 )
                 wire_model = None
                 continue
