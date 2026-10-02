@@ -311,6 +311,16 @@ def _get_session(session_id: str) -> ExecSession | None:
         return _SESSIONS.get(session_id)
 
 
+def latest_running_session_id() -> str | None:
+    """Most recently created session whose process is still running."""
+    with _SESSIONS_LOCK:
+        sessions = sorted(_SESSIONS.values(), key=lambda s: s.created_at, reverse=True)
+    for session in sessions:
+        if session.proc.poll() is None:
+            return session.session_id
+    return None
+
+
 @tool(deferred=False, read_only=False)
 def write_stdin(session_id: str, chars: str = "",
                 yield_time_ms: int = 250, max_output_tokens: int = 12000) -> str:

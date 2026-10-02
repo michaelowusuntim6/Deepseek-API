@@ -2,5 +2,12 @@
   "network_retry": {
     "response_timeout_minutes": 3,
     "max_consecutive_retries": 5
+  },
+  "watch": {
+    "interval_seconds": 60,
+    "poll_chars": ""
+  },
+  "continuation": {
+    "grace_ms": 500
   }
 }

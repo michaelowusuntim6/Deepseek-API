@@ -117,7 +117,14 @@ Every line inside a hunk must begin with +, -, or a space. A context line missin
 
 ## Completion
 
-When the task is complete, write <<DONE>> on its own line, preceded by a blank line, to finish the turn. It is required at the end of every complete turn.
+There are two control tokens:
+
+    <<DONE>>   — the task is complete
+    <<WATCH>>  — a background session is running; wait and fetch new output
+
+Both are on their own line with a blank line before them. Both are stripped from the visible output. Every complete turn ends with <<DONE>>. Every wait for background state uses <<WATCH>>.
+
+When exec_command reports a session id and the process is still running, emit <<WATCH>> instead of saying you will wait; the harness waits, polls the session, and sends the new output back as a TOOL RESULT. Stopping with prose while a session runs is an incomplete turn.
 
 ## Discipline
 
@@ -570,6 +577,7 @@ class _Stream:
         self._search = search
         self._message_id: Optional[int] = None
         self._attempts = 0
+        self.finished = False
         self.delete_message_hook: Optional[Callable[[str, Optional[int]], None]] = None
         self.tool_calls: list[ToolCall] = []
 
@@ -699,6 +707,7 @@ class _Stream:
 
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
+        self.finished = bool(meta.get("finished"))
 
     def __iter__(self) -> Iterator[str]:
         """Yield ONLY answer text (backwards compatible with plain iteration)."""
@@ -959,6 +968,9 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, s
                         yield from process_answer_chunk(op_v)
                     else:
                         yield (kind, op_v)
+                elif op_p.endswith("quasi_status") and op_v == "FINISHED":
+                    if meta is not None:
+                        meta["finished"] = True
             continue
 
         # --- 1. Snapshot with a full response object ---
@@ -1007,6 +1019,12 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, s
         if p.endswith("message_id") and isinstance(v, int):
             if meta is not None:
                 meta["message_id"] = v
+            continue
+
+        # --- 3b. end-of-stream marker ---
+        if p.endswith("status") and v == "FINISHED":
+            if meta is not None:
+                meta["finished"] = True
             continue
 
         # --- 4. Content delta ---

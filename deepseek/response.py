@@ -23,6 +23,7 @@ from typing import Iterable, Optional, Protocol
 from .tools import ToolCall
 
 DONE_TOKEN = "<<DONE>>"
+WATCH_TOKEN = "<<WATCH>>"
 
 MAX_CONTINUATIONS_PER_TURN = 5
 # Backwards-compatible alias for callers written against the old name.
@@ -52,6 +53,23 @@ def done_line_indexes(text: str) -> list[int]:
     return [i for i, line in enumerate(text.split("\n")) if line.strip() == DONE_TOKEN]
 
 
+def watch_line_indexes(text: str) -> list[int]:
+    """Indexes of lines that consist of the watch marker alone."""
+    return [i for i, line in enumerate(text.split("\n")) if line.strip() == WATCH_TOKEN]
+
+
+def _has_valid_token(text: str, token: str, indexes: list[int]) -> bool:
+    if text.count(token) != 1 or len(indexes) != 1:
+        return False
+    lines = text.split("\n")
+    i = indexes[0]
+    if i > 0 and lines[i - 1].strip() != "":
+        return False
+    if i != len(lines) - 1 and lines[i + 1].strip() != "":
+        return False
+    return True
+
+
 def has_valid_done(text: str) -> bool:
     """Strict ``<<DONE>>`` validation (clarification 1).
 
@@ -59,18 +77,12 @@ def has_valid_done(text: str) -> bool:
     preceded by a blank line, and followed by a blank line or the end of
     the response.
     """
-    if text.count(DONE_TOKEN) != 1:
-        return False
-    lines = text.split("\n")
-    indexes = done_line_indexes(text)
-    if len(indexes) != 1:
-        return False
-    i = indexes[0]
-    if i > 0 and lines[i - 1].strip() != "":
-        return False
-    if i != len(lines) - 1 and lines[i + 1].strip() != "":
-        return False
-    return True
+    return _has_valid_token(text, DONE_TOKEN, done_line_indexes(text))
+
+
+def has_valid_watch(text: str) -> bool:
+    """Strict ``<<WATCH>>`` validation, the same shape as ``<<DONE>>``."""
+    return _has_valid_token(text, WATCH_TOKEN, watch_line_indexes(text))
 
 
 def strip_done(text: str) -> str:
@@ -93,6 +105,29 @@ def strip_done(text: str) -> str:
     while kept and kept[-1].strip() == "":
         kept.pop()
     return "\n".join(kept)
+
+
+def strip_watch(text: str) -> str:
+    """Remove every ``<<WATCH>>`` from user-visible output (like ``<<DONE>>``)."""
+    kept: list[str] = []
+    for line in text.split("\n"):
+        if WATCH_TOKEN not in line:
+            kept.append(line)
+            continue
+        remainder = line.replace(WATCH_TOKEN, "").strip()
+        if remainder:
+            kept.append(line.replace(WATCH_TOKEN, "").rstrip())
+            continue
+        while kept and kept[-1].strip() == "":
+            kept.pop()
+    while kept and kept[-1].strip() == "":
+        kept.pop()
+    return "\n".join(kept)
+
+
+def strip_control_tokens(text: str) -> str:
+    """Strip both control tokens from visible output."""
+    return strip_watch(strip_done(text))
 
 
 def strip_tool_call_blocks(text: str) -> str:
@@ -451,9 +486,16 @@ class ResponseProcessor:
         return has_valid_done(strip_tool_call_blocks(self.raw_answer))
 
     @property
+    def watch(self) -> bool:
+        """True when the response asks the harness to watch a running session."""
+        return has_valid_watch(strip_tool_calls(self.full_text))
+
+    @property
     def complete(self) -> bool:
         """Heuristic completion (marker, completion phrase, substantial answer)."""
         calls = self.parsed_tool_calls
+        if self.watch:
+            return False
         return is_complete_response(strip_tool_calls(self.full_text), bool(calls))
 
     @property
@@ -467,7 +509,7 @@ class ResponseProcessor:
 
     def visible_answer(self) -> str:
         """Answer text with tool calls and the completion marker stripped."""
-        return strip_done(strip_tool_calls(self.full_text))
+        return strip_control_tokens(strip_tool_calls(self.full_text))
 
 
 def execute_tool_calls(

@@ -64,6 +64,7 @@ from deepseek.agent_tools import (
     ToolExecutor,
     apply_patch,
     exec_command,
+    latest_running_session_id,
     request_user_input,
     set_agent_runtime,
     update_plan,
@@ -72,14 +73,22 @@ from deepseek.agent_tools import (
 from deepseek.auth import LoginRequired
 from deepseek.compaction import CompactionManager
 from deepseek.client import TOOL_SYSTEM_PREAMBLE
+from deepseek.net import (
+    ContinuationConfig,
+    WatchConfig,
+    load_continuation_config,
+    load_network_retry_config,
+    load_watch_config,
+)
 from deepseek.response import (
     DONE_TOKEN,
     MAX_CONTINUATIONS_PER_TURN,
     PatchStreamFilter,
     ResponseProcessor,
     TurnNudger,
+    WATCH_TOKEN,
     execute_tool_calls,
-    strip_done,
+    strip_control_tokens,
 )
 from deepseek.agents_md import discover_agents, generate_draft
 from deepseek.plan_store import PlanStore, render_checklist
@@ -111,6 +120,46 @@ CONTINUE_PROMPT = (
     "(with a blank line before it). If not, emit a tool call to "
     "continue the task. Do not write prose without one of these."
 )
+
+# Sent when the model asks to watch but nothing is running.
+WATCH_NO_SESSION_ERROR = (
+    "ERROR: no running tool session to watch. Call a tool or write <<DONE>>."
+)
+
+# Model round-trips allowed in one agent turn (tool calls, watches, continues).
+# Generous because watches and multi-step tasks each cost iterations.
+MAX_TURN_ITERATIONS = 20
+
+_WATCH_EXITED_RE = re.compile(r"\[process exited with code (-?\d+)\]\s*$")
+_WATCH_RUNNING_RE = re.compile(r"\[process still running; session_id=([^\]]+)\]\s*$")
+
+
+def split_watch_status(text: str) -> tuple[str, Optional[int]]:
+    """Split a write_stdin status string into (output, exit_code)."""
+    exit_code: Optional[int] = None
+    match = _WATCH_EXITED_RE.search(text)
+    if match is not None:
+        exit_code = int(match.group(1))
+        text = text[: match.start()]
+    else:
+        match = _WATCH_RUNNING_RE.search(text)
+        if match is not None:
+            text = text[: match.start()]
+    return text.rstrip("\n"), exit_code
+
+
+def running_session_in(result: str) -> bool:
+    """True when a tool result reports a live background session."""
+    return "session_id=" in result or "still running" in result
+
+
+def _append_debug_log(path: str, line: str) -> None:
+    """Mirror a diagnostic line into the DEEPSEEK_SSE_DEBUG log file."""
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
 
 
 MODEL_CHOICES = {
@@ -802,6 +851,7 @@ class DeepSeekCLI:
         self._thinking_line_open = False
         self._answer_line_buffer = ""
         self._last_render_ended_with_newline = True
+        self._last_tool_result_running = False
         self._in_code_fence = False
         self._fence_lines: list[str] = []
         self._fence_language = "text"
@@ -1278,8 +1328,8 @@ class DeepSeekCLI:
         self._answer_tail = ""
         self._patch_filter = PatchStreamFilter()
         self._response_processor = ResponseProcessor()
-        if self._original_prompt is None:
-            self._original_prompt = prompt
+        self._original_prompt = prompt
+        self._last_tool_result_running = False
         self._thinking_parts = []
         self._answer_line_open = False
         self._thinking_line_open = False
@@ -1354,6 +1404,7 @@ class DeepSeekCLI:
         approval = "auto" if self.tools_mode == "auto" else self._approval_callback
         executor = ToolExecutor(approval=approval)
         current_prompt = prompt
+        base_prompt = prompt
         current_cid = self.conversation_id
         wire_model = self.wire_model_first if current_cid is None else None
         turn_prompt_chars = 0
@@ -1366,7 +1417,7 @@ class DeepSeekCLI:
         parse_fail_count = 0
         self._indicator = WorkingIndicator()
 
-        for iteration in range(8):
+        for iteration in range(MAX_TURN_ITERATIONS):
             visible = self.registry.visible_tools()
             schema = json.dumps([tool_obj.schema() for tool_obj in visible], indent=2)
             tool_prompt = (
@@ -1401,11 +1452,22 @@ class DeepSeekCLI:
                 self._indicator.stop()
                 self._handle_part(kind, text)
 
+            stream_finished = bool(getattr(stream, "finished", False))
+            self._log_stream_state(stream_finished)
             current_cid = stream.conversation_id
             self.conversation_id = current_cid
             self.runtime.conversation_id = current_cid
             if visible:
                 self.client._remember_tool_prompt(schema, current_cid)
+
+            if not stream_finished:
+                # The SSE stream ended without the FINISHED marker: a partial
+                # response, not a completed turn. Never run the completion
+                # check here, and never re-issue a continuation - retry the
+                # real request (user prompt or last tool result) instead.
+                current_prompt = base_prompt
+                self._ensure_fresh_line()
+                continue
 
             last_response_text = (
                 self._response_processor.raw_answer or "".join(self._answer_parts)
@@ -1427,7 +1489,21 @@ class DeepSeekCLI:
                 for call, result in results:
                     self._turn_tool_result_chars += len(result)
                     self._emit_tool_result(call, result)
+                self._last_tool_result_running = any(
+                    running_session_in(result) for _, result in results
+                )
                 self.registry.finish_iteration()
+                if self._last_tool_result_running:
+                    follow_up = (
+                        "A background session is still running. Emit <<WATCH>> on "
+                        "its own line to wait for it, call another tool, or write "
+                        "<<DONE>> if the task is done."
+                    )
+                else:
+                    follow_up = (
+                        "Continue the task: call another tool if you need one, "
+                        "otherwise give your final answer."
+                    )
                 body = "\n\n".join(
                     f"TOOL RESULT for {call.name}:\n{result}"
                     for call, result in results
@@ -1437,13 +1513,39 @@ class DeepSeekCLI:
                     "Original user request (verbatim, truncated to 300 chars):\n"
                     f"{(self._original_prompt or prompt)[:300]}\n\n"
                     f"Tool calls completed so far: {tool_count}\n\n"
-                    "Continue the task: call another tool if you need one, otherwise "
-                    "give your final answer."
+                    + follow_up
                 )
+                base_prompt = current_prompt
                 wire_model = None
                 continue
 
-            if self._response_processor.complete:
+            if self._response_processor.watch:
+                # The model asked us to wait for a background session.
+                nudger.reset()
+                settings = self._watch_settings()
+                session_id = self._running_session_id()
+                self._indicator.start()
+                if session_id is None:
+                    current_prompt = WATCH_NO_SESSION_ERROR
+                else:
+                    time.sleep(settings.interval_seconds)
+                    poll_text = self._watch_poll(session_id, settings.poll_chars)
+                    current_prompt = self._watch_message(session_id, poll_text, tool_count)
+                base_prompt = current_prompt
+                self._indicator.stop()
+                self._ensure_fresh_line()
+                continue
+
+            self._log_config_state()
+            grace = self._continuation_config().grace_ms / 1000.0
+            self._grace_sleep(grace)
+
+            completed = self._response_processor.complete
+            if completed and self._last_tool_result_running and not self._response_processor.done:
+                # A background session is still running: prose is not a finish.
+                completed = False
+
+            if completed:
                 self.registry.finish_iteration()
                 self._indicator.stop()
                 break
@@ -1480,7 +1582,7 @@ class DeepSeekCLI:
                 self.emit_event("answer", tail)
         if not self.stream:
             thinking = "".join(self._thinking_parts)
-            answer = strip_done("".join(self._answer_parts))
+            answer = strip_control_tokens("".join(self._answer_parts))
             if thinking:
                 self.emit_event("thinking", thinking)
             if answer:
@@ -1518,6 +1620,72 @@ class DeepSeekCLI:
     def _emit_tool_result(self, call: ToolCall, result: str) -> None:
         self._ensure_fresh_line()
         self.emit_event("tool_result", self._short_result(result, limit=500), name=call.name)
+
+    def _watch_settings(self) -> WatchConfig:
+        return load_watch_config()
+
+    def _continuation_config(self) -> ContinuationConfig:
+        return load_continuation_config()
+
+    def _grace_sleep(self, seconds: float) -> None:
+        """Short pause after FINISHED so the tail of a response is not raced."""
+        if seconds > 0:
+            time.sleep(seconds)
+
+    def _log_stream_state(self, finished: bool) -> None:
+        debug_path = os.getenv("DEEPSEEK_SSE_DEBUG")
+        if not debug_path:
+            return
+        processor = self._response_processor
+        fragments = (len(processor.thinking_parts) + len(processor.raw_answer_parts)
+                     + len(processor.tool_call_parts))
+        line = (
+            f"[stream] finished={finished} fragments={fragments} "
+            f"think={len(processor.thinking_parts)} "
+            f"response={len(processor.raw_answer_parts)}"
+        )
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+        _append_debug_log(debug_path, line)
+
+    def _log_config_state(self) -> None:
+        debug_path = os.getenv("DEEPSEEK_SSE_DEBUG")
+        if not debug_path:
+            return
+        retry = load_network_retry_config()
+        continuation = self._continuation_config()
+        line = (
+            f"[config] network_retry.timeout={int(retry.stall_timeout_seconds)}s "
+            f"max_retries={retry.max_consecutive_retries} "
+            f"continuation.grace_ms={continuation.grace_ms}"
+        )
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+        _append_debug_log(debug_path, line)
+
+    def _running_session_id(self) -> str | None:
+        return latest_running_session_id()
+
+    def _watch_poll(self, session_id: str, chars: str = "") -> str:
+        """Poll a running session once (empty write, short yield)."""
+        return write_stdin.fn(session_id, chars, 250, 12000)
+
+    def _watch_message(self, session_id: str, poll_text: str, tool_count: int) -> str:
+        output, exit_code = split_watch_status(poll_text)
+        parts = [f"TOOL RESULT for {session_id} (watched):"]
+        if output.strip():
+            parts.append(output)
+        if exit_code is not None:
+            parts.append(f"The watched session has exited with code {exit_code}.")
+        parts.append("")
+        parts.append("[TASK STATUS]")
+        parts.append(f"Original user request: {(self._original_prompt or '')[:300]}")
+        parts.append(f"Tool calls completed so far: {tool_count}")
+        parts.append(
+            "Continue watching, call another tool, or if the task is done "
+            "write <<DONE>>."
+        )
+        return "\n".join(parts)
 
     def _audit_unparsed_tool_call(self, raw: str | None = None) -> bool:
         if raw is None:
@@ -1633,8 +1801,9 @@ class DeepSeekCLI:
         text = self._patch_filter.feed(text)
         combined = self._answer_tail + text
         hold = 0
-        for n in range(min(len(DONE_TOKEN) - 1, len(combined)), 0, -1):
-            if combined.endswith(DONE_TOKEN[:n]):
+        longest = max(len(DONE_TOKEN), len(WATCH_TOKEN))
+        for n in range(min(longest - 1, len(combined)), 0, -1):
+            if combined.endswith(DONE_TOKEN[:n]) or combined.endswith(WATCH_TOKEN[:n]):
                 hold = n
                 break
         if hold:
@@ -1642,12 +1811,12 @@ class DeepSeekCLI:
             combined = combined[:-hold]
         else:
             self._answer_tail = ""
-        return combined.replace(DONE_TOKEN, "")
+        return combined.replace(DONE_TOKEN, "").replace(WATCH_TOKEN, "")
 
     def _flush_answer_tail(self) -> str:
         pending = self._patch_filter.flush()
         self._answer_tail, tail = "", pending + self._answer_tail
-        return strip_done(tail) if tail else ""
+        return strip_control_tokens(tail) if tail else ""
 
     @staticmethod
     def _parse_tool_call(text: str) -> tuple[str, dict]:

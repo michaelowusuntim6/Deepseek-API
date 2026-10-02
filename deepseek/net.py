@@ -30,6 +30,8 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
 DEFAULT_RESPONSE_TIMEOUT_MINUTES = 3.0
 DEFAULT_MAX_CONSECUTIVE_RETRIES = 5
+DEFAULT_WATCH_INTERVAL_SECONDS = 60.0
+DEFAULT_CONTINUATION_GRACE_MS = 500
 
 NETWORK_ERROR_TEMPLATE = (
     "Network Connection Error\n"
@@ -54,6 +56,21 @@ class NetworkRetryConfig:
     @property
     def stall_timeout_seconds(self) -> float:
         return float(self.response_timeout_minutes) * 60.0
+
+
+@dataclass(frozen=True)
+class WatchConfig:
+    """``<<WATCH>>`` polling settings (config.json -> "watch")."""
+
+    interval_seconds: float = DEFAULT_WATCH_INTERVAL_SECONDS
+    poll_chars: str = ""
+
+
+@dataclass(frozen=True)
+class ContinuationConfig:
+    """Post-FINISHED grace period before the completion check runs."""
+
+    grace_ms: int = DEFAULT_CONTINUATION_GRACE_MS
 
 
 def _coerce_minutes(value: object) -> float:
@@ -89,6 +106,45 @@ def load_network_retry_config(path: Optional[Path | str] = None) -> NetworkRetry
             section.get("max_consecutive_retries", DEFAULT_MAX_CONSECUTIVE_RETRIES)
         ),
     )
+
+
+def load_watch_config(path: Optional[Path | str] = None) -> WatchConfig:
+    """Read the ``watch`` section of ``config.json`` fresh, like network_retry."""
+    config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    section = raw.get("watch") if isinstance(raw, dict) else None
+    section = section if isinstance(section, dict) else {}
+    try:
+        interval = float(section.get("interval_seconds", DEFAULT_WATCH_INTERVAL_SECONDS))
+    except (TypeError, ValueError):
+        interval = DEFAULT_WATCH_INTERVAL_SECONDS
+    if interval <= 0:
+        interval = DEFAULT_WATCH_INTERVAL_SECONDS
+    poll_chars = section.get("poll_chars", "")
+    if not isinstance(poll_chars, str):
+        poll_chars = ""
+    return WatchConfig(interval_seconds=interval, poll_chars=poll_chars)
+
+
+def load_continuation_config(path: Optional[Path | str] = None) -> ContinuationConfig:
+    """Read the ``continuation`` section of ``config.json`` fresh."""
+    config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    section = raw.get("continuation") if isinstance(raw, dict) else None
+    section = section if isinstance(section, dict) else {}
+    try:
+        grace = int(section.get("grace_ms", DEFAULT_CONTINUATION_GRACE_MS))
+    except (TypeError, ValueError):
+        grace = DEFAULT_CONTINUATION_GRACE_MS
+    if grace < 0:
+        grace = 0
+    return ContinuationConfig(grace_ms=grace)
 
 
 class StallDetector:

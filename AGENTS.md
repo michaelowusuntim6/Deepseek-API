@@ -8,7 +8,8 @@ repository. It is loaded into the preamble on every turn.
 Every response is exactly one of:
 
   1. One sentence of intent, then one or more tool calls.
-  2. A final answer, followed by <<DONE>> on its own line.
+  2. <<WATCH>> (waiting for background state).
+  3. A final answer, followed by <<DONE>> on its own line.
 
 Prose with no tool call and no final answer is an incomplete turn. The
 harness replies with "Continue." and lets you carry on.
@@ -33,6 +34,45 @@ line containing exactly:
 It must have a blank line before it, and it is the only content on its
 line. It is a control signal, it is never shown to the user, and the
 turn is not complete without it.
+
+## Background sessions — the <<WATCH>> token
+
+When exec_command returns a session id and the process is still
+running, you have three options:
+
+  1. Poll it with write_stdin if you need to send more input.
+  2. Emit <<WATCH>> on its own line (blank line before it) if you
+     just need the harness to wait and fetch new output.
+  3. Emit <<DONE>> if the task is actually finished.
+
+Use <<WATCH>> when you would otherwise have to say "I'll wait" and
+stop. It tells the harness: wait one interval, then send me the
+current output of the running session.
+
+The harness will wait (default 60 seconds), poll the session, and
+send the new output back to you as a TOOL RESULT. You then either
+emit <<WATCH>> again, call another tool, or write <<DONE>>.
+
+Never leave a running session without one of these three actions.
+Stopping with prose while a session is running is an incomplete
+turn — the harness will continue you.
+
+### When to watch
+
+Emit <<WATCH>> when:
+
+  * a long-running install or build is in progress
+  * you just started a background process and want to see its output
+  * you are waiting for external state (a service to come up, a
+    file to appear, a download to finish)
+  * you finished a tool call but need to verify the result before
+    declaring done
+
+Do NOT emit <<WATCH>> when:
+
+  * the task is genuinely finished — use <<DONE>>
+  * you have something else to do — emit a tool call
+  * nothing is running — the harness will return an error
 
 ## Single tool call per response
 
@@ -126,6 +166,14 @@ fix unrelated bugs. Do not add comments unless asked.
 
 Prefer rg over grep. Read files in chunks of <=250 lines. Output is
 truncated at 10KB or 256 lines. Use exec_command for all shell work.
+
+## Environment
+
+This repository's Python dependencies (including transformers) live in
+the project virtualenv. Use `venv/bin/python` and `venv/bin/pip` for
+Python work — e.g. `venv/bin/python script.py`. The system `python3` has
+none of the project dependencies and cannot install them, so do not try
+to `pip install` into it or to build a new virtualenv.
 
 ## When to stop
 

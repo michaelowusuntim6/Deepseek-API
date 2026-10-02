@@ -39,10 +39,12 @@ from deepseek.response import (
     strip_freeform_patches,
 )
 from deepseek.agent_tools import ToolExecutor, _parse_patch, apply_patch
+from deepseek.net import WatchConfig
 from deepseek.tools import Tool, ToolCall, execute_tool
 from deepseek_cli import (
     CONTINUE_PROMPT,
     DeepSeekCLI,
+    WATCH_NO_SESSION_ERROR,
     WorkingIndicator,
     build_tool_registry,
     build_parser,
@@ -573,8 +575,10 @@ def test_stall_max_retries_stops() -> None:
 class _ScriptedClient:
     """Minimal stand-in for DeepSeekClient that replays scripted responses."""
 
-    def __init__(self, responses: list[list[tuple[str, str]]]):
+    def __init__(self, responses: list[list[tuple[str, str]]], finished=True):
         self._responses = list(responses)
+        self._finished_seq = list(finished) if isinstance(finished, list) else None
+        self._finished_default = True if isinstance(finished, list) else finished
         self.prompts: list[str] = []
 
     def _tool_prompt(self, prompt, schema, conversation_id, extra_sections=None):
@@ -586,6 +590,11 @@ class _ScriptedClient:
     def stream(self, prompt, **kwargs):
         self.prompts.append(prompt)
         parts = self._responses.pop(0) if self._responses else []
+        index = len(self.prompts) - 1
+        if self._finished_seq is not None:
+            finished = self._finished_seq[index] if index < len(self._finished_seq) else True
+        else:
+            finished = self._finished_default
 
         class _Stream:
             conversation_id = "sid:1"
@@ -594,6 +603,7 @@ class _ScriptedClient:
             def iter_parts(self):
                 yield from parts
 
+        _Stream.finished = finished
         return _Stream()
 
 
@@ -923,6 +933,284 @@ def test_five_consecutive_continuations_give_up(tmp_path, monkeypatch) -> None:
     assert len(written) == 1 and written[0].name.startswith("incomplete_")
     assert "Still thinking 4." in written[0].read_text()
     print("  PASS: five continuations exhaust the turn and write a diagnostic file")
+
+
+# ----- <<WATCH>> background-session monitoring ------------------------------
+
+
+# ----- FINISHED gating and the continuation grace period --------------------
+
+
+def test_continuation_not_fired_on_partial_stream() -> None:
+    partial = [
+        "data: " + json.dumps({
+            "p": "response/fragments", "o": "APPEND",
+            "v": [{"id": 1, "type": "RESPONSE", "content": "Partial answer."}],
+        })
+    ]
+    meta: dict = {}
+    assert list(_parse_sse(partial, meta)) == [("answer", "Partial answer.")]
+    assert meta.get("finished") is not True
+
+    finished = partial + [
+        "data: " + json.dumps({"p": "response/status", "o": "SET", "v": "FINISHED"})
+    ]
+    meta2: dict = {}
+    list(_parse_sse(finished, meta2))
+    assert meta2.get("finished") is True
+
+    batched = [
+        "data: " + json.dumps({
+            "p": "response", "o": "BATCH",
+            "v": [{"p": "accumulated_token_usage", "v": 10},
+                  {"p": "quasi_status", "v": "FINISHED"}],
+        })
+    ]
+    meta3: dict = {}
+    list(_parse_sse(batched, meta3))
+    assert meta3.get("finished") is True
+
+    app, client = _scripted_app([[("answer", "Partial.")]], finished=False)
+    app._grace_sleep = lambda seconds: None
+    _run_app(app)
+    assert CONTINUE_PROMPT not in client.prompts
+    print("  PASS: a stream without FINISHED never runs the completion check")
+
+
+def test_continuation_fired_only_after_finished() -> None:
+    app, client = _scripted_app([
+        [("answer", "Short prose.")],
+        [("answer", "Done.\n\n<<DONE>>\n")],
+    ])
+    app._grace_sleep = lambda seconds: None
+    _run_app(app)
+    assert client.prompts.count(CONTINUE_PROMPT) == 1
+    assert len(client.prompts) == 2          # the <<DONE>> response ended the turn
+    print("  PASS: exactly one continuation, only after FINISHED")
+
+
+def test_think_fragment_does_not_trigger_check() -> None:
+    app, client = _scripted_app([
+        [("thinking", "thinking hard"), ("answer", "Hi there.")],
+        [("answer", "Done.\n\n<<DONE>>\n")],
+    ])
+    app._grace_sleep = lambda seconds: None
+    _run_app(app)
+    assert client.prompts.count(CONTINUE_PROMPT) == 1   # once for the whole stream
+    assert len(client.prompts) == 2
+    print("  PASS: THINK fragments do not trigger a completion check")
+
+
+def test_config_reloaded_per_turn(tmp_path, monkeypatch) -> None:
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"continuation": {"grace_ms": 111}}))
+    monkeypatch.setattr(net, "DEFAULT_CONFIG_PATH", cfg)
+    app, client = _scripted_app([
+        [("answer", "Short one.")],
+        [("answer", "Done.\n\n<<DONE>>\n")],
+        [("answer", "Short two.")],
+        [("answer", "Done.\n\n<<DONE>>\n")],
+    ])
+    sleeps: list[float] = []
+    app._grace_sleep = sleeps.append
+    _run_app(app)                                    # turn 1
+    cfg.write_text(json.dumps({"continuation": {"grace_ms": 222}}))
+    _run_app(app)                                    # turn 2
+    assert sleeps[0] == 0.111
+    assert sleeps[-1] == 0.222
+    print("  PASS: config.json is re-read for every turn")
+
+
+def test_grace_period_applied(tmp_path, monkeypatch) -> None:
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"continuation": {"grace_ms": 150}}))
+    monkeypatch.setattr(net, "DEFAULT_CONFIG_PATH", cfg)
+    app, client = _scripted_app([
+        [("answer", "Short prose.")],
+        [("answer", "Done.\n\n<<DONE>>\n")],
+    ])
+    recorded: list[float] = []
+    real_sleep = app._grace_sleep
+
+    def spy(seconds: float) -> None:
+        recorded.append(seconds)
+        real_sleep(seconds)
+
+    app._grace_sleep = spy
+    started = time.monotonic()
+    _run_app(app)
+    elapsed = time.monotonic() - started
+    assert recorded and set(recorded) == {0.15}   # once per completion check
+    assert elapsed >= 0.15
+    print("  PASS: the continuation waits for the configured grace period")
+
+
+def _scripted_app(responses, finished=True):
+    parser = build_parser()
+    args = parser.parse_args(["--tools", "auto", "hi"])
+    app = DeepSeekCLI(args, parser, interactive=False, prompt="hi")
+    app.reload_tools()
+    client = _ScriptedClient(responses, finished=finished)
+    app.client = client
+    return app, client
+
+
+def _run_app(app):
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        app._run_agent_turn("hi")
+
+
+WATCH_REPLY = "Waiting for the build to finish.\n\n<<WATCH>>\n"
+WATCH_RUNNING_POLL = "compiling...\n[process still running; session_id=sess_test]"
+WATCH_EXITED_POLL = "build ok\n[process exited with code 0]"
+
+
+def test_watch_token_stripped_from_output() -> None:
+    processor = ResponseProcessor().feed_all([("answer", WATCH_REPLY)])
+    assert processor.watch is True
+    assert "<<WATCH>>" not in processor.visible_answer()
+    assert processor.visible_answer() == "Waiting for the build to finish."
+
+    parser = build_parser()
+    args = parser.parse_args(["--tools", "auto", "hi"])
+    app = DeepSeekCLI(args, parser, interactive=False, prompt="hi")
+    app._handle_part("answer", WATCH_REPLY)
+    assert "<<WATCH>>" not in "".join(app._answer_parts)
+    print("  PASS: <<WATCH>> never reaches the visible output")
+
+
+def test_watch_does_not_fire_continuation() -> None:
+    app, client = _scripted_app([
+        [("answer", WATCH_REPLY)],
+        [("answer", "Finished.\n\n<<DONE>>\n")],
+    ])
+    app._running_session_id = lambda: None
+    app._watch_settings = lambda: WatchConfig(0.0, "")
+    _run_app(app)
+    assert client.prompts[1] == WATCH_NO_SESSION_ERROR
+    assert CONTINUE_PROMPT not in client.prompts
+    print("  PASS: <<WATCH>> never triggers a continuation")
+
+
+def test_watch_resets_failure_counter(tmp_path, monkeypatch) -> None:
+    written: list = []
+    original = TurnNudger.write_stop_file
+
+    def spy(self, text, directory="/tmp"):
+        path = original(self, text, directory=tmp_path)
+        written.append(path)
+        return path
+
+    monkeypatch.setattr(TurnNudger, "write_stop_file", spy)
+    # two stalls, a watch, then four more: without the reset the counter would
+    # pass the limit (2 + 4 > 5) and the turn would give up early.
+    prose = [[("answer", f"Still thinking {i}.")] for i in range(6)]
+    app, client = _scripted_app(
+        prose[:2] + [[("answer", WATCH_REPLY)]] + prose[2:] + [[("answer", "Done.\n\n<<DONE>>\n")]]
+    )
+    app._running_session_id = lambda: "sess_test"
+    app._watch_settings = lambda: WatchConfig(0.0, "")
+    app._watch_poll = lambda session_id, chars="": WATCH_RUNNING_POLL
+    _run_app(app)
+    assert written == []                       # the watch reset the stall counter
+    assert len(client.prompts) == 8            # the loop kept going past the stalls
+    print("  PASS: <<WATCH>> resets the consecutive-failure counter")
+
+
+def test_watch_with_no_session_returns_error() -> None:
+    app, client = _scripted_app([
+        [("answer", WATCH_REPLY)],
+        [("answer", "Finished.\n\n<<DONE>>\n")],
+    ])
+    app._running_session_id = lambda: None
+    app._watch_settings = lambda: WatchConfig(0.0, "")
+    _run_app(app)
+    sent = client.prompts[1]
+    assert sent == "ERROR: no running tool session to watch. Call a tool or write <<DONE>>."
+    assert "TOOL RESULT for" not in sent
+    print("  PASS: watching with no session answers with the error, not a continuation")
+
+
+def test_watch_polls_session() -> None:
+    app, client = _scripted_app([
+        [("answer", WATCH_REPLY)],
+        [("answer", "Finished.\n\n<<DONE>>\n")],
+    ])
+    polls: list[tuple[str, str]] = []
+
+    def fake_poll(session_id: str, chars: str = "") -> str:
+        polls.append((session_id, chars))
+        return WATCH_RUNNING_POLL
+
+    app._running_session_id = lambda: "sess_test"
+    app._watch_settings = lambda: WatchConfig(0.0, "")
+    app._watch_poll = fake_poll
+    _run_app(app)
+    assert polls == [("sess_test", "")]
+    sent = client.prompts[1]
+    assert sent.startswith("TOOL RESULT for sess_test (watched):")
+    assert "compiling..." in sent
+    assert "[process still running" not in sent
+    assert "Continue watching, call another tool" in sent
+    print("  PASS: <<WATCH>> polls the running session and feeds output back")
+
+
+def test_watch_exited_session_reported() -> None:
+    app, client = _scripted_app([
+        [("answer", WATCH_REPLY)],
+        [("answer", "Finished.\n\n<<DONE>>\n")],
+    ])
+    app._running_session_id = lambda: "sess_test"
+    app._watch_settings = lambda: WatchConfig(0.0, "")
+    app._watch_poll = lambda session_id, chars="": WATCH_EXITED_POLL
+    _run_app(app)
+    sent = client.prompts[1]
+    assert "build ok" in sent
+    assert "The watched session has exited with code 0." in sent
+    print("  PASS: an exited watched session reports its exit code")
+
+
+def test_session_still_running_blocks_completion(monkeypatch) -> None:
+    long_prose = "Here is a long summary of the work so far. " + ("detail " * 40)
+    assert len(long_prose) >= 200
+    call = ToolCall("exec_command", {"cmd": "sleep 90 &"}, "{}")
+    running = "started\n[process still running; session_id=sess_x]"
+    monkeypatch.setattr(
+        "deepseek_cli.execute_tool_calls",
+        lambda executor, calls, tools, decisions=None: [(call, running)],
+    )
+    app, client = _scripted_app([
+        [("tool_call", json.dumps({"name": "exec_command", "arguments": {"cmd": "sleep 90 &"}}))],
+        [("answer", long_prose)],
+        [("answer", "All done.\n\n<<DONE>>\n")],
+    ])
+    _run_app(app)
+    assert client.prompts[2] == CONTINUE_PROMPT      # prose did not finish the turn
+    assert len(client.prompts) == 3                  # the <<DONE>> response ended it
+    print("  PASS: a running session blocks a prose-only completion")
+
+
+def test_original_prompt_updates_per_turn(monkeypatch) -> None:
+    call = ToolCall("exec_command", {"cmd": "echo hi"}, "{}")
+    monkeypatch.setattr(
+        "deepseek_cli.execute_tool_calls",
+        lambda executor, calls, tools, decisions=None: [(call, "hi\n[process exited with code 0]")],
+    )
+    app, client = _scripted_app([
+        [("tool_call", json.dumps({"name": "exec_command", "arguments": {"cmd": "echo hi"}}))],
+        [("answer", "First done.\n\n<<DONE>>\n")],
+        [("tool_call", json.dumps({"name": "exec_command", "arguments": {"cmd": "echo hi"}}))],
+        [("answer", "Second done.\n\n<<DONE>>\n")],
+    ])
+    app._running_session_id = lambda: None
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        app.run_prompt("first task")
+        app.run_prompt("second task")
+    footers = [p for p in client.prompts if "TOOL RESULT for" in p]
+    assert len(footers) == 2
+    assert "first task" in footers[0] and "first task" not in footers[1]
+    assert "second task" in footers[1]
+    print("  PASS: the TASK STATUS footer follows the current turn's prompt")
 
 
 def main() -> None:
