@@ -362,8 +362,15 @@ def _parse_patch(patch: str) -> list[dict[str, Any]]:
             i += 1
             hunks: list[dict[str, Any]] = []
             current: dict[str, Any] | None = None
-            while i < len(lines) - 1 and not lines[i].startswith("*** "):
+            move_to: str | None = None
+            while i < len(lines) - 1:
                 item = lines[i]
+                if item.startswith("*** Move to: "):
+                    move_to = item[len("*** Move to: "):].strip()
+                    i += 1
+                    continue
+                if item.startswith("*** "):
+                    break
                 if item.startswith("@@"):
                     if current is not None:
                         hunks.append(current)
@@ -384,9 +391,11 @@ def _parse_patch(patch: str) -> list[dict[str, Any]]:
                 i += 1
             if current is not None:
                 hunks.append(current)
-            if not hunks:
+            if not hunks and move_to is None:
                 raise ValueError(f"no hunks found for {path}")
-            operations.append({"op": "update", "path": path, "hunks": hunks})
+            operations.append(
+                {"op": "update", "path": path, "hunks": hunks, "move_to": move_to}
+            )
             continue
         if line.startswith("*** Add File: "):
             path = line[len("*** Add File: "):].strip()
@@ -490,8 +499,19 @@ def apply_patch(patch: str) -> str:
                 file_lines[match_index:match_index + len(old_lines)] = new_lines
                 hunk_count += 1
             updated = _join_text(file_lines, trailing)
-            pending_writes.append((path, updated))
-            change_records.append((path, original, updated))
+            move_to = operation.get("move_to")
+            if move_to:
+                target = Path(move_to).expanduser()
+                if target.exists():
+                    raise ValueError(f"Move target already exists: {target}")
+                touched.add(target)
+                pending_writes.append((target, updated))
+                pending_deletes.append(path)
+                change_records.append((path, original, ""))
+                change_records.append((target, "", updated))
+            else:
+                pending_writes.append((path, updated))
+                change_records.append((path, original, updated))
 
         for path, content in pending_writes:
             path.parent.mkdir(parents=True, exist_ok=True)

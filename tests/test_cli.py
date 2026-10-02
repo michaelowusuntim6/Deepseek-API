@@ -28,13 +28,16 @@ from deepseek.response import (
     DONE_TOKEN,
     MAX_NUDGES_PER_TURN,
     NUDGE_MESSAGE,
+    PatchStreamFilter,
     ResponseProcessor,
     TurnNudger,
     execute_first_tool_call,
+    find_freeform_patches,
     has_valid_done,
     strip_done,
+    strip_freeform_patches,
 )
-from deepseek.agent_tools import ToolExecutor
+from deepseek.agent_tools import ToolExecutor, _parse_patch, apply_patch
 from deepseek.tools import Tool, ToolCall, execute_tool
 from deepseek_cli import (
     DeepSeekCLI,
@@ -558,6 +561,173 @@ def test_stall_max_retries_stops() -> None:
     assert "did not respond after 5 consecutive attempts" in out
     assert "The operation has been stopped." in out
     print("  PASS: five consecutive stalls stop the operation, no sixth retry")
+
+
+# ----- freeform apply_patch ------------------------------------------------
+
+
+def _patch_block(path: str, old: str, new: str) -> str:
+    return (
+        "*** Begin Patch\n"
+        f"*** Update File: {path}\n"
+        "@@ context\n"
+        f"-{old}\n"
+        f"+{new}\n"
+        "*** End Patch"
+    )
+
+
+def test_freeform_patch_detected() -> None:
+    patch = _patch_block("/tmp/demo.py", "    return 1", "    return 2")
+    processor = ResponseProcessor().feed_all([("answer", patch)])
+    calls = processor.freeform_patch_calls
+    assert processor.signal == "tool_call"
+    assert len(calls) == 1
+    assert calls[0].name == "apply_patch"
+    assert calls[0].arguments == {"patch": patch}
+    assert json.loads(calls[0].raw) == {
+        "name": "apply_patch", "arguments": {"patch": patch}
+    }
+    print("  PASS: freeform patch block is synthesised into an apply_patch call")
+
+
+def test_freeform_patch_stripped_from_output() -> None:
+    patch = _patch_block("/tmp/demo.py", "old", "new")
+    processor = ResponseProcessor().feed_all([("answer", patch)])
+    visible = processor.visible_answer()
+    assert "*** Begin Patch" not in visible
+    assert "*** End Patch" not in visible
+    assert strip_freeform_patches("x " + patch + " y") == "x  y"
+    print("  PASS: freeform patch block never reaches visible output")
+
+
+def test_json_patch_still_works() -> None:
+    patch = _patch_block("/tmp/demo.py", "old", "new")
+    payload = json.dumps({"name": "apply_patch", "arguments": {"patch": patch}})
+    processor = ResponseProcessor().feed_all([("tool_call", payload)])
+    assert processor.signal == "tool_call"
+    assert len(processor.tool_calls) == 1
+    call = json.loads(processor.tool_calls[0])
+    assert call["name"] == "apply_patch" and call["arguments"]["patch"] == patch
+
+    # legacy wrapper arriving inside a RESPONSE fragment is still recovered
+    wrapped = f"<tool_call>{payload}</tool_call>"
+    fallback = ResponseProcessor().feed_all([("answer", wrapped)])
+    assert json.loads(fallback.tool_calls[0])["name"] == "apply_patch"
+    print("  PASS: legacy JSON apply_patch calls are still detected")
+
+
+def test_freeform_with_prose() -> None:
+    patch = _patch_block("/tmp/demo.py", "old", "new")
+    text = "I'll fix this file:\n\n" + patch + "\n\nDone."
+    processor = ResponseProcessor().feed_all([("answer", text)])
+    assert processor.signal == "tool_call"
+    assert len(processor.freeform_patch_calls) == 1
+    visible = processor.visible_answer()
+    assert "*** Begin Patch" not in visible
+    assert "I'll fix this file:" in visible and "Done." in visible
+    print("  PASS: prose around a freeform patch is retained")
+
+
+def test_freeform_split_across_chunks() -> None:
+    patch = _patch_block("/tmp/demo.py", "    return 1", "    return 2")
+    points = [round(len(patch) * i / 5) for i in range(6)]
+    chunks = [patch[points[i]:points[i + 1]] for i in range(5)]
+    assert "".join(chunks) == patch and len(chunks) == 5
+
+    lines = [
+        "data: " + json.dumps({
+            "p": "response/fragments",
+            "o": "APPEND",
+            "v": [{"id": i + 1, "type": "RESPONSE", "content": chunk}],
+        })
+        for i, chunk in enumerate(chunks)
+    ]
+    processor = ResponseProcessor().feed_all(_parse_sse(lines))
+    calls = processor.freeform_patch_calls
+    assert len(calls) == 1
+    assert calls[0].arguments["patch"] == patch
+    assert processor.visible_answer() == ""
+    print("  PASS: patch split across 5 SSE chunks is detected after the stream")
+
+
+def test_freeform_no_end_marker() -> None:
+    text = "*** Begin Patch\n*** Update File: x.py\n"
+    processor = ResponseProcessor().feed_all([("answer", text)])
+    assert processor.freeform_patch_calls == []
+    assert processor.signal is None
+    assert "*** Begin Patch" in processor.visible_answer()
+
+    # the streaming filter releases an unterminated block instead of eating it
+    filt = PatchStreamFilter()
+    streamed = "".join(filt.feed(c) for c in ["x ", "*** Beg", "in Patch\nnope\n"])
+    streamed += filt.flush()
+    assert "*** Begin Patch" in streamed
+    print("  PASS: an unterminated patch block is not detected and does not crash")
+
+
+def test_multiple_patches_first_wins(tmp_path) -> None:
+    first = (
+        "*** Begin Patch\n"
+        f"*** Add File: {tmp_path}/first.txt\n"
+        "+first\n"
+        "*** End Patch"
+    )
+    second = (
+        "*** Begin Patch\n"
+        f"*** Add File: {tmp_path}/second.txt\n"
+        "+second\n"
+        "*** End Patch"
+    )
+    processor = ResponseProcessor().feed_all([("answer", first + "\n\n" + second)])
+    calls = processor.freeform_patch_calls
+    assert len(calls) == 2
+    results = execute_first_tool_call(ToolExecutor(approval="auto"), calls, [apply_patch])
+    assert (tmp_path / "first.txt").read_text() == "first\n"
+    assert not (tmp_path / "second.txt").exists()
+    assert results[0][1].startswith("applied")
+    assert results[1][0] is calls[1]
+    assert results[1][1].startswith(
+        "TOOL RESULT for apply_patch:\nERROR: Multiple tool calls"
+    )
+    print("  PASS: only the first patch executes; the second reports an error")
+
+
+def test_freeform_patch_lark_grammar_fields(tmp_path) -> None:
+    (tmp_path / "src.py").write_text("old\n")
+    (tmp_path / "moved.py").write_text("x\n")
+    (tmp_path / "gone.txt").write_text("bye\n")
+    patch = (
+        "*** Begin Patch\n"
+        f"*** Add File: {tmp_path}/added.txt\n"
+        "+new\n"
+        f"*** Update File: {tmp_path}/src.py\n"
+        "@@\n"
+        "-old\n"
+        "+newer\n"
+        f"*** Delete File: {tmp_path}/gone.txt\n"
+        f"*** Update File: {tmp_path}/moved.py\n"
+        f"*** Move to: {tmp_path}/moved2.py\n"
+        "@@\n"
+        "-x\n"
+        "+y\n"
+        "*** End Patch"
+    )
+    for marker in ("*** Begin Patch", "*** End Patch", "*** Add File: ",
+                   "*** Update File: ", "*** Delete File: ", "*** Move to: "):
+        assert marker in patch
+    assert len(find_freeform_patches(patch)) == 1
+    operations = _parse_patch(patch)
+    assert [op["op"] for op in operations] == ["add", "update", "delete", "update"]
+    assert operations[3]["move_to"] == str(tmp_path / "moved2.py")
+
+    assert apply_patch.fn(patch=patch).startswith("applied")
+    assert (tmp_path / "added.txt").read_text() == "new\n"
+    assert (tmp_path / "src.py").read_text() == "newer\n"
+    assert not (tmp_path / "gone.txt").exists()
+    assert (tmp_path / "moved2.py").read_text() == "y\n"
+    assert not (tmp_path / "moved.py").exists()
+    print("  PASS: all patch grammar markers parse and apply")
 
 
 def main() -> None:

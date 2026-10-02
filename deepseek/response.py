@@ -12,9 +12,12 @@ This module owns the completion protocol:
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Iterable, Optional, Protocol
+
+from .tools import ToolCall
 
 DONE_TOKEN = "<<DONE>>"
 
@@ -34,6 +37,11 @@ MULTI_CALL_ERROR = (
 
 _OPEN_TAG = "<tool_call>"
 _CLOSE_TAG = "</tool_call>"
+
+# Freeform apply_patch delimiters (Codex/OpenAI format, no JSON wrapper).
+PATCH_BEGIN = "*** Begin Patch"
+PATCH_END = "*** End Patch"
+PATCH_TOOL_NAME = "apply_patch"
 
 
 def multi_call_error(name: str) -> str:
@@ -120,6 +128,99 @@ def tool_call_blocks(text: str) -> list[str]:
         pos = end + len(_CLOSE_TAG)
 
 
+def find_freeform_patches(text: str) -> list[tuple[int, int, str]]:
+    """Return ``(start, stop, payload)`` for every complete patch block.
+
+    Only complete blocks (with a matching ``*** End Patch``) are returned;
+    an unterminated ``*** Begin Patch`` is ignored.
+    """
+    spans: list[tuple[int, int, str]] = []
+    cursor = 0
+    while True:
+        start = text.find(PATCH_BEGIN, cursor)
+        if start == -1:
+            return spans
+        end = text.find(PATCH_END, start + len(PATCH_BEGIN))
+        if end == -1:
+            return spans
+        stop = end + len(PATCH_END)
+        spans.append((start, stop, text[start:stop]))
+        cursor = stop
+
+
+def freeform_patch_payloads(text: str) -> list[str]:
+    return [payload for _, _, payload in find_freeform_patches(text)]
+
+
+def strip_freeform_patches(text: str) -> str:
+    """Remove complete freeform patch blocks, leaving surrounding prose."""
+    spans = find_freeform_patches(text)
+    if not spans:
+        return text
+    out: list[str] = []
+    cursor = 0
+    for start, stop, _ in spans:
+        out.append(text[cursor:start])
+        cursor = stop
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+def _partial_marker_hold(text: str, marker: str) -> int:
+    """Length of the longest suffix of *text* that starts *marker*."""
+    for n in range(min(len(marker) - 1, len(text)), 0, -1):
+        if text.endswith(marker[:n]):
+            return n
+    return 0
+
+
+class PatchStreamFilter:
+    """Suppress freeform patch blocks from a *streamed* answer.
+
+    The marker may be split across chunks (``"*** Beg"`` then
+    ``"in Patch\\n"``), so the filter holds back any trailing text that could
+    still turn out to be a marker and drops everything up to the matching
+    ``*** End Patch``. If the stream ends with the block still unterminated,
+    :meth:`flush` releases the held text unchanged so an incomplete block
+    behaves exactly like :func:`strip_freeform_patches` (i.e. stays visible).
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._in_patch = False
+
+    def feed(self, text: str) -> str:
+        self._buffer += text
+        out: list[str] = []
+        while True:
+            if self._in_patch:
+                index = self._buffer.find(PATCH_END)
+                if index == -1:
+                    return "".join(out)
+                self._buffer = self._buffer[index + len(PATCH_END):]
+                self._in_patch = False
+                continue
+            index = self._buffer.find(PATCH_BEGIN)
+            if index != -1:
+                out.append(self._buffer[:index])
+                self._buffer = self._buffer[index:]
+                self._in_patch = True
+                continue
+            hold = _partial_marker_hold(self._buffer, PATCH_BEGIN)
+            if hold:
+                out.append(self._buffer[:-hold])
+                self._buffer = self._buffer[-hold:]
+            else:
+                out.append(self._buffer)
+                self._buffer = ""
+            return "".join(out)
+
+    def flush(self) -> str:
+        text = self._buffer
+        self._buffer, self._in_patch = "", False
+        return text
+
+
 class SupportsExecute(Protocol):
     def execute(self, calls, tools, decisions=None): ...
 
@@ -164,13 +265,37 @@ class ResponseProcessor:
 
     @property
     def tool_calls(self) -> list[str]:
-        """Tool-call payloads found in RESPONSE fragments."""
+        """Tool-call payloads found in RESPONSE fragments.
+
+        Includes freeform patch blocks, which are synthesised into the JSON
+        form so callers that only look at signals see them as tool calls.
+        """
         calls = list(self.tool_call_parts)
         if not calls:
             # Defensive: a RESPONSE fragment may contain an unfenced block if a
             # caller bypasses the SSE parser.
             calls = tool_call_blocks(self.raw_answer)
+        calls.extend(
+            json.dumps({"name": PATCH_TOOL_NAME, "arguments": {"patch": payload}},
+                       ensure_ascii=False)
+            for payload in freeform_patch_payloads(self.raw_answer)
+        )
         return calls
+
+    @property
+    def freeform_patch_calls(self) -> list[ToolCall]:
+        """Complete freeform patch blocks, synthesised as apply_patch calls."""
+        return [
+            ToolCall(
+                name=PATCH_TOOL_NAME,
+                arguments={"patch": payload},
+                raw=json.dumps(
+                    {"name": PATCH_TOOL_NAME, "arguments": {"patch": payload}},
+                    ensure_ascii=False,
+                ),
+            )
+            for payload in freeform_patch_payloads(self.raw_answer)
+        ]
 
     @property
     def done(self) -> bool:
@@ -187,7 +312,8 @@ class ResponseProcessor:
 
     def visible_answer(self) -> str:
         """Answer text with tool calls and the completion marker stripped."""
-        return strip_done(strip_tool_call_blocks(self.raw_answer))
+        text = strip_tool_call_blocks(self.raw_answer)
+        return strip_done(strip_freeform_patches(text))
 
 
 def split_tool_calls(calls: list) -> tuple[list, list[tuple[object, str]]]:

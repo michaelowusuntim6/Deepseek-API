@@ -145,8 +145,6 @@ context estimate, followed by a dim status footer before each prompt.
 Exit codes are `0` success, `1` runtime error, `2` auth required, `3` usage
 error, and `141` for a truncated pipe (`SIGPIPE` convention).
 
-### Agent tool set
-
 ### Response protocol
 
 The CLI drives the model through a strict, machine-checked protocol.
@@ -192,6 +190,31 @@ and any successful response resets it to zero. After
 `max_consecutive_retries` consecutive attempts the CLI prints a
 `Network Connection Error` naming the attempt count, stops the operation, and
 does not retry again.
+
+## apply_patch format
+
+`apply_patch` is a freeform tool. The model emits patch text directly — there is
+no JSON wrapper.
+
+Patch delimiters:
+  `*** Begin Patch ... *** End Patch`
+
+File operations:
+  `*** Add File: <path>`     — create a new file
+  `*** Update File: <path>`  — modify an existing file
+  `*** Delete File: <path>`  — remove a file
+  `*** Move to: <path>`      — rename, inside an Update hunk
+
+Every hunk line must begin with `+`, `-`, or a space.
+
+The harness detects freeform patches in the model's response and converts them
+to tool calls automatically. Both the freeform format and the legacy JSON
+format are accepted, but the FREEFORM format is preferred because it avoids the
+JSON escaping tax on diffs.
+
+This matches the format OpenAI Codex uses. Their official model guide reports a
+35% reduction in apply_patch failure rates with freeform vs JSON function
+calling.
 
 ### Agent tool set
 

@@ -76,6 +76,7 @@ from deepseek.response import (
     DONE_TOKEN,
     MAX_NUDGES_PER_TURN,
     NUDGE_MESSAGE,
+    PatchStreamFilter,
     ResponseProcessor,
     TurnNudger,
     split_tool_calls,
@@ -142,6 +143,20 @@ _BUILTIN_TOOL_NAMES = frozenset({
     "read_file", "list_dir", "write_file", "run_shell",
     "edit_file", "grep", "find_files", "fetch_url",
 })
+
+# Freeform tools are described in the preamble and are deliberately NOT listed
+# in the JSON tool schema, so the model emits raw patch text instead of a
+# <tool_call> JSON block. The harness still accepts (and executes) the legacy
+# JSON form if a model sends one.
+FREEFORM_TOOL_NAMES = frozenset({"apply_patch"})
+
+
+def tool_schema_json(tools: list[Tool]) -> str:
+    """Serialise the JSON tool list, leaving freeform tools to the preamble."""
+    return json.dumps(
+        [t.schema() for t in tools if t.name not in FREEFORM_TOOL_NAMES],
+        indent=2,
+    )
 
 _SKIP_DIRS = {
     "__pycache__", ".git", "venv", "node_modules", ".venv",
@@ -817,6 +832,7 @@ class DeepSeekCLI:
         self._answer_parts: list[str] = []
         self._raw_answer_parts: list[str] = []
         self._answer_tail = ""
+        self._patch_filter = PatchStreamFilter()
         self._response_processor = ResponseProcessor()
         self._original_prompt: str | None = None
         self._thinking_parts: list[str] = []
@@ -1275,6 +1291,7 @@ class DeepSeekCLI:
         self._answer_parts = []
         self._raw_answer_parts = []
         self._answer_tail = ""
+        self._patch_filter = PatchStreamFilter()
         self._response_processor = ResponseProcessor()
         if self._original_prompt is None:
             self._original_prompt = prompt
@@ -1364,7 +1381,7 @@ class DeepSeekCLI:
 
         for iteration in range(8):
             visible = self.registry.visible_tools()
-            schema = json.dumps([tool_obj.schema() for tool_obj in visible], indent=2)
+            schema = tool_schema_json(visible)
             tool_prompt = (
                 self.client._tool_prompt(
                     current_prompt, schema, current_cid,
@@ -1382,6 +1399,7 @@ class DeepSeekCLI:
 
             self._response_processor = ResponseProcessor()
             self._answer_tail = ""
+            self._patch_filter = PatchStreamFilter()
             self._indicator.start()
             stream = self.client.stream(
                 request_prompt,
@@ -1402,8 +1420,11 @@ class DeepSeekCLI:
             if visible:
                 self.client._remember_tool_prompt(schema, current_cid)
 
+            # Freeform patch blocks are detected after the stream ends; they
+            # become apply_patch calls alongside any parsed <tool_call> blocks.
+            parsed_calls = list(stream.tool_calls) + self._response_processor.freeform_patch_calls
             signal = self._response_processor.signal
-            if signal == "tool_call" and not stream.tool_calls:
+            if signal == "tool_call" and not parsed_calls:
                 # A <tool_call> block was seen in a RESPONSE fragment but its
                 # JSON could not be parsed: treat it as a parser failure.
                 signal = None
@@ -1449,7 +1470,7 @@ class DeepSeekCLI:
                 continue
 
             had_tool_call = True
-            to_execute, synthetic_errors = split_tool_calls(stream.tool_calls)
+            to_execute, synthetic_errors = split_tool_calls(parsed_calls)
             tool_count += len(to_execute)
 
             if self.tools_mode == "manual":
@@ -1630,8 +1651,10 @@ class DeepSeekCLI:
 
         A trailing fragment that could be the start of ``<<DONE>>`` is held
         back until more text arrives so a split marker never leaks out.
+        Freeform patch blocks are suppressed the same way.
         """
         text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
+        text = self._patch_filter.feed(text)
         combined = self._answer_tail + text
         hold = 0
         for n in range(min(len(DONE_TOKEN) - 1, len(combined)), 0, -1):
@@ -1646,7 +1669,8 @@ class DeepSeekCLI:
         return combined.replace(DONE_TOKEN, "")
 
     def _flush_answer_tail(self) -> str:
-        tail, self._answer_tail = self._answer_tail, ""
+        pending = self._patch_filter.flush()
+        self._answer_tail, tail = "", pending + self._answer_tail
         return strip_done(tail) if tail else ""
 
     @staticmethod
@@ -2071,7 +2095,7 @@ def main(argv: list[str] | None = None) -> int:
         app = DeepSeekCLI(args, parser, interactive=False, prompt=None)
         app.reload_tools()
         app._load_context_layers()
-        schema = json.dumps([t.schema() for t in app.registry.visible_tools()], indent=2)
+        schema = tool_schema_json(app.registry.visible_tools())
         text = TOOL_SYSTEM_PREAMBLE.format(tools_schema=schema)
         sections = app._context_sections()
         if sections:

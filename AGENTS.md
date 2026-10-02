@@ -66,17 +66,59 @@ Do NOT scaffold multiple files from one prompt. Do NOT write a
 script, run it, and verify it in one turn unless the prompt is short
 and single-purpose. Split the work.
 
-## Editing discipline
+## Editing files
 
-Use apply_patch. Never applypatch or apply-patch. Use the exact
-format:
+Use `apply_patch`. It is a FREEFORM tool — emit the patch directly,
+do NOT wrap it in JSON.
+
+Correct:
 
     *** Begin Patch
-    *** Update File: path/to/file
+    *** Update File: path/to/file.py
     @@ context
     -old
     +new
     *** End Patch
+
+Wrong (do not do this): wrapping the patch in a JSON tool-call object
+(with "name" and "arguments" keys), or using any other editing tool
+such as edit_file or write_file.
+
+The tool name is exactly `apply_patch`.
+
+## Patch operations
+
+Add a file:
+    *** Begin Patch
+    *** Add File: /path/file.txt
+    +content line 1
+    +content line 2
+    *** End Patch
+
+Update a file:
+    *** Begin Patch
+    *** Update File: /path/file.py
+    @@ def function():
+    -    old_line
+    +    new_line
+    *** End Patch
+
+Delete a file:
+    *** Begin Patch
+    *** Delete File: /path/file.py
+    *** End Patch
+
+Move/rename a file:
+    *** Begin Patch
+    *** Update File: /path/old.py
+    *** Move to: /path/new.py
+    @@ context
+    -old
+    +new
+    *** End Patch
+
+Every line inside a hunk must begin with +, -, or a space. A
+context line missing its leading space breaks the patch.
 
 Fix the root cause, not the symptom. Keep changes minimal. Do not
 fix unrelated bugs. Do not add comments unless asked.
