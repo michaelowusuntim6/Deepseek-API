@@ -228,6 +228,9 @@ By default the CLI exposes the Codex-style tools:
 | `update_plan` | Maintain a persistent step-by-step plan |
 | `request_user_input` | Ask structured plan-mode questions |
 
+Web search is provided by DeepSeek's built-in model-side search, enabled by
+default (toggle with `/search`). There is no `web_search` or `fetch_url` tool.
+
 Extension tools are deferred by default. The model must call `search_tools`
 before using them, and matched tools stay available for one turn only.
 Local image viewing is provided by the optional `examples/extensions/image_view.py`

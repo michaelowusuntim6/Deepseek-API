@@ -26,12 +26,9 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
-from html.parser import HTMLParser
 
 try:
     import readline
@@ -179,7 +176,7 @@ _BUILTIN_TOOL_NAMES = frozenset({
     "exec_command", "write_stdin", "apply_patch", "search_tools",
     "update_plan", "request_user_input",
     "read_file", "list_dir", "write_file", "run_shell",
-    "edit_file", "grep", "find_files", "fetch_url",
+    "edit_file", "grep", "find_files",
 })
 
 _SKIP_DIRS = {
@@ -492,124 +489,6 @@ def find_files(pattern: str, path: str = ".", max_results: int = 200) -> str:
         return f"error during find_files: {type(e).__name__}: {e}"
 
 
-@tool
-def fetch_url(url: str, max_bytes: int = 8000) -> str:
-    """Fetch a URL via HTTP/HTTPS and return stripped text content.
-
-    Args:
-        url: The URL to fetch (http:// or https:// only).
-        max_bytes: Maximum response body bytes to return (default 8000).
-    """
-    try:
-        if not (url.startswith("http://") or url.startswith("https://")):
-            return f"error: unsupported scheme in '{url}' — only http:// and https:// are allowed"
-        req = urllib.request.Request(url, headers={"User-Agent": "DeepSeek-CLI/0.3"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read(max_bytes + 1)
-        truncated = len(raw) > max_bytes
-        body = raw[:max_bytes].decode("utf-8", errors="replace")
-        if truncated:
-            body += "… (truncated)"
-        body = re.sub(r"<script[^>]*>.*?</script>", " ", body, flags=re.DOTALL | re.IGNORECASE)
-        body = re.sub(r"<style[^>]*>.*?</style>", " ", body, flags=re.DOTALL | re.IGNORECASE)
-        body = re.sub(r"<[^>]+>", " ", body)
-        return re.sub(r"\s+", " ", body).strip()
-    except urllib.error.HTTPError as e:
-        return f"error: HTTP {e.code} {e.reason} fetching '{url}'"
-    except urllib.error.URLError as e:
-        return f"error: URL error fetching '{url}': {e.reason}"
-    except TimeoutError:
-        return f"error: timed out fetching '{url}'"
-    except Exception as e:
-        return f"error fetching '{url}': {type(e).__name__}: {e}"
-
-
-class _DDGResultParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.results = []
-        self._in_title = False
-        self._in_snippet = False
-        self._href = ""
-        self._title = ""
-        self._snippet = ""
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        cls = attrs.get("class", "")
-        if tag == "a" and "result__a" in cls:
-            self._in_title = True
-            self._href = attrs.get("href", "")
-            self._title = ""
-        elif "result__snippet" in cls:
-            self._in_snippet = True
-            self._snippet = ""
-
-    def handle_endtag(self, tag):
-        if tag == "a" and self._in_title:
-            self._in_title = False
-        if self._in_snippet and tag in {"a", "div", "td"}:
-            self._in_snippet = False
-            if self._href and self._title:
-                self.results.append((self._title.strip(), self._href, self._snippet.strip()))
-
-    def handle_data(self, data):
-        if self._in_title:
-            self._title += data
-        elif self._in_snippet:
-            self._snippet += data
-
-
-@tool(eager=True, read_only=True)
-def web_search(query: str, max_results: int = 5) -> str:
-    """Search the web with DuckDuckGo HTML and return top results.
-
-    Args:
-        query: Search query.
-        max_results: Maximum number of results.
-    """
-    try:
-        from urllib.parse import quote_plus
-        url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read(200000).decode("utf-8", errors="replace")
-        parser = _DDGResultParser()
-        parser.feed(body)
-        results = parser.results[: max(1, int(max_results))]
-        if not results:
-            api_url = (
-                "https://api.duckduckgo.com/?q="
-                + quote_plus(query)
-                + "&format=json&no_html=1&skip_disambig=1"
-            )
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            if data.get("AbstractURL"):
-                results.append((
-                    data.get("Heading") or query,
-                    data["AbstractURL"],
-                    data.get("AbstractText") or "",
-                ))
-            for topic in data.get("RelatedTopics") or []:
-                if len(results) >= max(1, int(max_results)):
-                    break
-                if isinstance(topic, dict) and topic.get("FirstURL"):
-                    results.append((
-                        topic.get("Text") or query,
-                        topic["FirstURL"],
-                        topic.get("Text") or "",
-                    ))
-        if not results:
-            return "Error: web_search returned no parseable results."
-        return "\n\n".join(
-            f"{title}\n{url}\n{snippet}" for title, url, snippet in results
-        )
-    except Exception as exc:
-        return f"Error: web_search failed: {type(exc).__name__}: {exc}"
-
-
 def legacy_tools() -> list[Tool]:
     """Return the legacy file-oriented tool tier."""
     tools = [
@@ -620,7 +499,6 @@ def legacy_tools() -> list[Tool]:
         edit_file,
         grep,
         find_files,
-        fetch_url,
     ]
     for tool_obj in tools:
         tool_obj.eager = True
@@ -642,8 +520,6 @@ def codex_default_tools(plan_enabled: bool = False,
         list_skills,
         use_skill,
         read_skill_file,
-        fetch_url,
-        web_search,
     ]
 
 
@@ -1448,6 +1324,7 @@ class DeepSeekCLI:
             self._answer_tail = ""
             self._patch_filter = PatchStreamFilter()
             self._indicator.start()
+            stream_started = time.monotonic()
             stream = self.client.stream(
                 request_prompt,
                 conversation_id=current_cid,
@@ -1548,6 +1425,9 @@ class DeepSeekCLI:
             grace = self._continuation_config().grace_ms / 1000.0
             self._grace_sleep(grace)
 
+            # Audit trail: this line precedes every completion check, so any
+            # future session shows whether the check ran on a partial stream.
+            self._log_turn_check(stream_finished, stream_started)
             completed = self._response_processor.complete
             if completed and self._last_tool_result_running and not self._response_processor.done:
                 # A background session is still running: prose is not a finish.
@@ -1689,6 +1569,24 @@ class DeepSeekCLI:
             f"[config] network_retry.timeout={int(retry.stall_timeout_seconds)}s "
             f"max_retries={retry.max_consecutive_retries} "
             f"continuation.grace_ms={continuation.grace_ms}"
+        )
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+        _append_debug_log(debug_path, line)
+
+    def _log_turn_check(self, finished: bool, started: float) -> None:
+        """Emit the audit line that must precede every completion check."""
+        debug_path = os.getenv("DEEPSEEK_SSE_DEBUG")
+        if not debug_path:
+            return
+        processor = self._response_processor
+        fragments = (len(processor.thinking_parts) + len(processor.raw_answer_parts)
+                     + len(processor.tool_call_parts))
+        line = (
+            f"[turn] completion check: finished={finished} fragments={fragments} "
+            f"think={len(processor.thinking_parts)} "
+            f"response={len(processor.raw_answer_parts)} "
+            f"duration_ms={int((time.monotonic() - started) * 1000)}"
         )
         sys.stderr.write(line + "\n")
         sys.stderr.flush()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Offline tests for the CLI built-in tools:
-  edit_file, grep, find_files, fetch_url
+  edit_file, grep, find_files
 
 Run:
     PYTHONPATH=. venv/bin/python tests/test_cli_tools.py
@@ -10,7 +10,7 @@ Run:
 import tempfile
 from pathlib import Path
 
-from deepseek_cli import edit_file, fetch_url, find_files, grep
+from deepseek_cli import edit_file, find_files, grep
 
 
 def _call(tool_obj, **kwargs):
@@ -98,19 +98,6 @@ def test_find_files(base: Path) -> None:
     print("  PASS: find_files")
 
 
-def test_fetch_url() -> None:
-    result = _call(fetch_url, url="https://example.com")
-    assert isinstance(result, str) and result
-    assert "<html" not in result.lower()
-    assert _call(fetch_url, url="ftp://example.com/file.txt").startswith("error")
-    assert _call(
-        fetch_url,
-        url="http://this-host-definitely-does-not-exist-xyz-abc-123.invalid/path",
-    ).startswith("error")
-    assert len(_call(fetch_url, url="https://example.com", max_bytes=50)) <= 200
-    print("  PASS: fetch_url")
-
-
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         base = Path(tmpdir)
@@ -118,7 +105,6 @@ def main() -> None:
         test_edit_file(base)
         test_grep(base)
         test_find_files(base)
-    test_fetch_url()
     print("all CLI tool tests passed")
 
 

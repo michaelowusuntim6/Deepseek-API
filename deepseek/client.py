@@ -64,8 +64,6 @@ You have these tools. Use whichever format the model naturally emits for each �
   write_stdin   — write to a running command session
   apply_patch   — edit files (freeform patch syntax preferred)
   update_plan   — optional; use if it helps you organize
-  fetch_url     — HTTP GET
-  web_search    — DuckDuckGo search
   search_tools  — discover deferred tools
   use_skill     — load a SKILL.md
 
@@ -75,7 +73,11 @@ Tool schemas (arguments):
 
 ## Capabilities
 
-DeepSeek web search is a model-side capability, enabled by default (toggle with /search or --no-search). If a task needs a capability that is not in the tool list, call search_tools once before saying it is unavailable, and fall back to exec_command with curl, wget or git. Matched tools stay available for one turn only.
+DeepSeek web search is enabled by default and is a model-side capability. It activates based on the question. You do not need to call a tool to search the web.
+
+You run on the user's own machine: exec_command can read files, run programs and inspect anything on the local filesystem (ls, cat, grep, python, ...). Never tell the user you cannot access local files or run commands — call exec_command instead.
+
+If a task needs some other capability that is not in the tool list, call search_tools once before saying it is unavailable, and fall back to exec_command with curl, wget or git. Matched tools stay available for one turn only.
 
 ## apply_patch
 
@@ -968,9 +970,6 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, s
                         yield from process_answer_chunk(op_v)
                     else:
                         yield (kind, op_v)
-                elif op_p.endswith("quasi_status") and op_v == "FINISHED":
-                    if meta is not None:
-                        meta["finished"] = True
             continue
 
         # --- 1. Snapshot with a full response object ---
@@ -1022,7 +1021,12 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple[PartKind, s
             continue
 
         # --- 3b. end-of-stream marker ---
-        if p.endswith("status") and v == "FINISHED":
+        # Empirically (see docs: the stream probes) the ONLY frame that appears
+        # exactly once at the very end of every response is
+        # {"p":"response/status","o":"SET","v":"FINISHED"}. The same frame
+        # carries "INCOMPLETE" when the generation was cut short, so its value
+        # is what distinguishes a finished response from a truncated one.
+        if p == "response/status" and v == "FINISHED":
             if meta is not None:
                 meta["finished"] = True
             continue

@@ -946,6 +946,75 @@ def test_five_consecutive_continuations_give_up(tmp_path, monkeypatch) -> None:
 # ----- multi-statement commands, continuation limit, directive first ping ---
 
 
+# ----- the definitive end-of-response marker (see Part 1 stream probes) -----
+
+
+def test_completion_waits_for_final_marker(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_SSE_DEBUG", str(tmp_path / "dbg.log"))
+    app, client = _scripted_app([
+        [("thinking", "thinking..."), ("answer", "Partial answer.")],   # unfinished
+        [("answer", "Done.\n\n<<DONE>>\n")],                            # finished
+    ], finished=[False, True])
+    app._grace_sleep = lambda seconds: None
+    _run_app(app)
+
+    turns = [line for line in (tmp_path / "dbg.log").read_text().splitlines()
+             if line.startswith("[turn] completion check")]
+    assert len(turns) == 1, turns
+    assert "finished=True" in turns[0]
+    assert FIRST_CONTINUE_PROMPT not in client.prompts
+    assert CONTINUE_PROMPT not in client.prompts
+    print("  PASS: the completion check waits for the final marker")
+
+
+def test_think_fragment_completion_does_not_run_check(tmp_path, monkeypatch) -> None:
+    think_only = [
+        "data: " + json.dumps({"v": {"response": {"fragments": [
+            {"id": 2, "type": "THINK", "content": "hmm", "elapsed_secs": None},
+        ]}}}),
+        "data: " + json.dumps({
+            "p": "response/fragments/-1/elapsed_secs", "o": "SET", "v": 1.234,
+        }),
+    ]
+    meta: dict = {}
+    list(_parse_sse(think_only, meta))
+    assert meta.get("finished") is not True
+
+    monkeypatch.setenv("DEEPSEEK_SSE_DEBUG", str(tmp_path / "dbg.log"))
+    app, client = _scripted_app([[("thinking", "hmm")]], finished=False)
+    app._grace_sleep = lambda seconds: None
+    _run_app(app)
+    assert "[turn] completion check" not in (tmp_path / "dbg.log").read_text()
+    print("  PASS: a completed THINK fragment never runs the completion check")
+
+
+def test_final_marker_runs_check_once(tmp_path, monkeypatch) -> None:
+    marker = ["data: " + json.dumps({
+        "p": "response/status", "o": "SET", "v": "FINISHED",
+    })]
+    meta: dict = {}
+    list(_parse_sse(marker, meta))
+    assert meta.get("finished") is True
+
+    for unfinished in ("INCOMPLETE",):
+        partial = ["data: " + json.dumps({
+            "p": "response/status", "o": "SET", "v": unfinished,
+        })]
+        partial_meta: dict = {}
+        list(_parse_sse(partial, partial_meta))
+        assert partial_meta.get("finished") is not True
+
+    monkeypatch.setenv("DEEPSEEK_SSE_DEBUG", str(tmp_path / "dbg.log"))
+    app, client = _scripted_app([[("answer", "Done.\n\n<<DONE>>\n")]])
+    app._grace_sleep = lambda seconds: None
+    _run_app(app)
+    turns = [line for line in (tmp_path / "dbg.log").read_text().splitlines()
+             if line.startswith("[turn] completion check")]
+    assert len(turns) == 1, turns
+    assert "finished=True" in turns[0]
+    print("  PASS: the final marker runs exactly one completion check")
+
+
 def test_multi_statement_command_runs_to_completion() -> None:
     result = exec_command.fn(cmd="echo one; sleep 0.2; echo two; sleep 0.2; echo three")
     assert "one" in result and "two" in result and "three" in result, result
@@ -1055,7 +1124,9 @@ def test_continuation_not_fired_on_partial_stream() -> None:
     ]
     meta3: dict = {}
     list(_parse_sse(batched, meta3))
-    assert meta3.get("finished") is True
+    # Only response/status=FINISHED marks the end (Part 1 probes); the
+    # quasi_status BATCH is not the marker.
+    assert meta3.get("finished") is not True
 
     app, client = _scripted_app([[("answer", "Partial.")]], finished=False)
     app._grace_sleep = lambda seconds: None
