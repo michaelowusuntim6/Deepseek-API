@@ -185,3 +185,10 @@ If a task is complete, write the final answer and finish with <<DONE>>
 on its own line, preceded by a blank line. If a task is not complete,
 emit the next tool call. Do not write a summary of what you have done
 unless the task is done.
+
+## Chat format validation
+
+OpenAI chat format allows optional "system" messages before the first
+"user" message. Never assert position 0 is "user". Validate by role
+presence: the list must contain at least one "user" and one
+"assistant" message, and every content string must be non-empty.
