@@ -1,0 +1,294 @@
+# DECISIONS — building `mike.py` on Deepseek-API
+
+Every non-obvious choice made while executing the brief, in the form
+**Decision — Rationale — Alternatives considered**. Also records the test
+summary and the end-to-end transcripts required by the brief.
+
+---
+
+## A. Architecture
+
+### A1. Single file, no sibling imports
+**Decision.** `mike.py` is one file; the agent loop, tool registry, compactor,
+session manager, thinking parser, tool-call parser and server supervisor all live
+inside it. It imports only the stdlib and packages already in the venv
+(`openai`/`httpx`, `rich`, `tiktoken`, `python-dotenv`).
+**Rationale.** The brief requires zero runtime dependency on `~/nanocode` or
+`~/cipher-harness`; verified by renaming both directories and running mike.
+**Alternatives.** A `mike/` package — rejected: the deliverable is explicitly a
+single file.
+
+### A2. Provider: OpenAI-compatible only
+**Decision.** The only client is `DeepSeekLLM`, pointed at
+`http://127.0.0.1:<port>/v1` with `api_key="sk-local"`. The `openai` SDK is used
+when present, with a hand-rolled `httpx` SSE fallback otherwise.
+**Rationale.** The brief forbids OpenRouter/Anthropic paths. The server ignores
+keys, but we still send one for SDK compatibility.
+**Alternatives.** Pure httpx always — rejected: the SDK is already installed and
+handles retries/backoff.
+
+### A3. Keep the full history on disk; compact only the in-context view
+**Decision.** `session.messages` is append-only and holds the complete
+transcript; `MikeAgent.context` is what is sent upstream, and compaction shrinks
+only `context`.
+**Rationale.** The brief requires both *"the summary REPLACES the older turns
+in-context"* and *"the full untruncated history stays on disk"* / *"never lose
+user data"*. Keeping one list that does both is impossible.
+**Alternatives.** Store the pre-compaction history inside the compaction record —
+rejected: bloats the file and duplicates the transcript.
+
+---
+
+## B. Server integration
+
+### B1. Auto-launch is attach-first and idempotent
+**Decision.** TCP-probe the port first; if it answers, reuse it and **never**
+claim ownership. Only spawn `sys.executable app.py` (cwd = repo root) when the
+port is free, capture its combined output into a 200-line ring buffer, and poll
+`/v1/models` for up to 30 s at 250 ms backoff. On failure print the last 50 log
+lines and raise `ServerStartError` (exit 1).
+**Rationale.** Running mike twice must not spawn two servers; and we must not
+kill a server we merely attached to.
+**Alternatives.** Kill-by-port / pidfile — rejected: can kill an unrelated
+process the user started deliberately.
+
+### B2. Tool-calling mode is probed once and cached
+**Decision.** At startup (only if not cached) send a probe asking the model to
+call a dummy `ping` tool; if structured `tool_calls` come back use **native**,
+otherwise **prompted**. Cache the result in `.mike_state.json`.
+**Rationale.** The web-backed bridge drops `tools=` silently, so a one-time probe
+is the only reliable signal; caching avoids paying for it every launch.
+**Alternatives.** Always prompted — rejected as less future-proof. Probe on every
+launch — rejected as slower.
+
+### B3. Support DeepSeek's native DSML syntax *and* the required envelope
+**Decision.** In prompted mode, instruct the model to use the exact
+`<tool_call>{"name": ..., "arguments": {...}}</tool_call>` envelope, **and** also
+parse DeepSeek's native DSML `invoke`/`parameter` blocks that the real model
+actually emits. DSML/`<tool_call>` blocks are hidden from scrollback.
+**Rationale.** Empirically the free web model ignores the requested envelope and
+emits its own DSML syntax; without DSML support no tool ever fires. The brief
+mandates the envelope, so both are supported.
+**Alternatives.** Envelope only — rejected: tools never run in practice.
+DSML only — rejected: violates the brief.
+
+### B4. Server-side single model + alias rewrite shim
+**Decision.** `server/config.py` defines one canonical id
+(`deepseek-v4.1-flash`, display name *DeepSeek V4.1 Flash*) with a
+compatibility alias list. `/v1/models` returns exactly one entry with an
+`aliases: [...]` extension. Any accepted alias is rewritten to the canonical id
+and logged at INFO exactly once per alias per process. Unknown ids still 404.
+**Rationale.** The brief requires one surfaced model plus transparent aliasing
+without log spam.
+**Alternatives.** Return the aliases as separate model entries — rejected: the
+user must see exactly one model. Silent no-404 fallback for unknown ids —
+rejected: hides typos.
+
+### B5. Reasoning is surfaced as `reasoning_content`
+**Decision.** The upstream stream is parsed into typed events by fragment type
+(`THINK*`/`REASON*` → reasoning, everything else → answer) and the bridge emits
+`delta.reasoning_content`, matching DeepSeek's own non-standard field. Reply
+objects gained a `reasoning` attribute.
+**Rationale.** The brief wants thinking on/off to work end-to-end; the original
+`_parse_sse` discarded non-RESPONSE fragments and the answer fragment arrives as
+an appended list, which had to be handled to avoid dropping the answer.
+**Alternatives.** Leave reasoning inlined in `content` — rejected: it pollutes
+answers and can't be toggled.
+
+---
+
+## C. Harness behaviour
+
+### C1. Compaction summary is deterministic (no LLM call)
+**Decision.** `Compactor.build_summary` always emits the seven required sections
+(`Goal`, `Constraints`, `Files Touched`, `Decisions Made`, `Open Todos`,
+`Last User Intent`, `Next Steps`) by extracting them locally; the optional
+summarizer hook is left `None` by default.
+**Rationale.** Guarantees `/compact` and rollover always produce a valid,
+seven-section summary even offline or on a bad day, and keeps the behaviour
+deterministic for tests.
+**Alternatives.** Always call the model to summarise (as `compact.py` did) —
+rejected: slow, costs a request, and can omit sections. A model call is
+available via the `summarizer` hook if wanted.
+
+### C2. Token counter: tiktoken with persisted choice
+**Decision.** Use `tiktoken` (`cl100k_base`) if importable, else `len(text)//4`.
+Persist the chosen estimator name in `.mike_state.json`.
+**Rationale.** Brief requires it and asks the choice be persisted.
+**Alternatives.** Always heuristic — rejected: less accurate where tiktoken is
+available.
+
+### C3. Thresholds
+**Decision.** `MAX_CONTEXT_TOKENS = 500_000` (overridable via `MIKE_MAX_CONTEXT`),
+`COMPACT_THRESHOLD = 0.80` → trigger at `400_000`, `KEEP_RECENT_TURNS = 6`.
+**Rationale.** Exactly what the brief specifies; `/tokens` reports the derived
+400,000 threshold.
+**Alternatives.** None sensible.
+
+### C4. Session files are atomic and human-readable
+**Decision.** Write JSON pretty-printed with sorted keys via a temp file +
+`fsync` + `os.replace`. Sessions live in `sessions/` as
+`YYYYMMDD-HHMMSS__<slug>.json`; rollover creates `<slug>-contN` seeded with a
+single message beginning *"This is a continuation of session <old>. Summary
+follows:"*.
+**Rationale.** "Never lose user data" and "human-readable JSON" requirements; a
+crash mid-write must not corrupt a session.
+**Alternatives.** Plain `json.dump` in place — rejected: a crash can truncate the
+file.
+
+### C5. Safety of the `bash` tool
+**Decision.** Hard-block a small set of catastrophic patterns (`rm -rf /`,
+fork bombs, `mkfs`, …). Destructive-but-normal commands are allowed without an
+interactive prompt.
+**Rationale.** An interactive `input()` prompt inside a tool would steal the
+user's next console line and stall automation; the brief favours robustness.
+**Alternatives.** Port cipher's confirm-on-danger flow — rejected for the reason
+above; it can be re-added behind a flag.
+
+### C6. Crash handling default
+**Decision.** On an unhandled error: save the session, print a rich traceback,
+and offer a self-diagnosis pass (y/n, default **yes** after 5 s when a TTY is
+attached; default yes when non-interactive).
+**Rationale.** Brief specifies y/n with default y after 5 s.
+**Alternatives.** Always auto-diagnose — rejected: could burn rate limit
+unattended.
+
+### C7. Thinking display defaults
+**Decision.** Default mode is `spinner`: reasoning is requested from the model
+and the last 80 characters are shown in a dimmed single-line status area. `/thinking
+on` streams full dim reasoning; `/thinking off` hides it entirely; `/thinking
+last` prints the most recent block once. Reasoning is stored under `reasoning`
+and never sent back as assistant content.
+**Rationale.** Satisfies both "render thinking dimmed by default / don't dump to
+scrollback" and "/thinking off is the hidden mode".
+**Alternatives.** Reasoning off at the API level by default — rejected: there
+would be nothing to show or inspect.
+
+### C8. Repo hygiene
+**Decision.** `sessions/`, `.mike/` and `.mike_state.json` are git-ignored.
+`mike.py` has a shebang and is chmod +x.
+**Rationale.** Session data is user data and must not be committed; the file is
+meant to be run directly.
+**Alternatives.** Commit sessions — rejected.
+
+---
+
+## D. Test summary (Phase 6)
+
+Run inside the project venv, fully hermetic (the OpenAI client is stubbed):
+
+```
+$ venv/bin/python -m pytest tests/test_mike.py
+tests/test_mike.py ...................................                   [100%]
+============================== 35 passed in 1.16s ==============================
+```
+
+Covered: prompted parser (single / multiple / malformed JSON / text around the
+block / JSON-string arguments / DeepSeek DSML), thinking stripper
+(`<think>`, `<reasoning>`, `reasoning_content` on a mock delta, incremental
+stream parser), deterministic token estimator, compactor trigger at 400k and
+non-trigger at 300k (mock counter), seven-section summary, session rollover to
+`-cont1` seeded with the continuation header, pretty/sorted JSON, alias routing
+for every alias, and an end-to-end agent turn with a stubbed LLM that fires a
+tool and feeds the result back.
+
+---
+
+## E. End-to-end manual check (Phase 7)
+
+All runs below used `venv/bin/python mike.py` with the server auto-launched (no
+server was running beforehand). ANSI codes stripped for readability.
+
+### E1. Startup, streamed answer, thinking, file creation, rename
+
+```
+$ python mike.py
+info: single model DeepSeek V4.1 Flash (deepseek-v4.1-flash); 8 legacy aliases route to it; tools: prompted
+mike v1.0.0 - DeepSeek V4.1 Flash (prompted tools, thinking:spinner, ctx 500,000)
+server http://127.0.0.1:8000/v1 | session session | cwd /home/mike/Deepseek-API
+type /help for commands
+
+> What is 6*7? Answer in one short line.
+42
+
+> /thinking last
+╭────────────── last reasoning ──────────────╮
+│ The user asks a simple math question. No   │
+│ tools needed.                              │
+╰────────────────────────────────────────────╯
+
+> Create a file named mike_e2e_check.txt containing exactly the line: hello from mike
+* write_file(/home/mike/Deepseek-API/mike_e2e_check.txt)
+  | wrote 1 line(s) to /home/mike/Deepseek-API/mike_e2e_check.txt
+* read_file(/home/mike/Deepseek-API/mike_e2e_check.txt)
+  |     1       hello from mike
+... verified by read-back.
+
+> /rename hello-world
+renamed -> hello-world
+
+> /quit
+bye.
+```
+
+Confirmed on disk: `mike_e2e_check.txt` contains `hello from mike`. The
+model's native DSML tool-call syntax was hidden from scrollback (only the clean
+tool header/result lines appear).
+
+### E2. Resume, tokens, compaction, rollover
+
+```
+$ python mike.py resume
+                                    Sessions
+ #   name         updated           messages  size   preview
+ 1   hello-world  2026-10-08T00:43… 8         2.8KB  Create a file named mike_e2e_check.t…
+Select a session to resume [1-1, or q]: 1
+server http://127.0.0.1:8000/v1 | session hello-world | cwd /home/mike/Deepseek-API
+
+> /tokens
+estimated 502 tokens / threshold 400,000 (max 500,000) via tiktoken
+
+> /compact
+╭──────── summary ────────╮
+│ ## Goal                 │
+│ What is 6*7? ...        │
+│ ## Constraints          │
+│ ## Files Touched        │
+│ - /home/mike/Deepseek-API/mike_e2e_check.txt
+│ ## Decisions Made       │
+│ ## Open Todos           │
+│ ## Last User Intent     │
+│ Create a file named mike_e2e_check.txt ...
+│ ## Next Steps           │
+╰─────────────────────────╯
+
+> /rollover
+-> rolled over to session hello-world-cont1 (from hello-world)
+
+> /sessions
+ 1   hello-world        8 messages
+ 2   hello-world-cont1  1 message
+```
+
+Confirmed on disk: `20261008-004336__hello-world-cont1.json` exists, its first
+message is `This is a continuation of session hello-world. Summary follows:` +
+the seven-section summary, and the original `hello-world` file still contains the
+full 8-message transcript (compaction did not truncate it).
+
+---
+
+## F. Acceptance checklist
+
+| | Criterion | Result |
+| --- | --- | --- |
+| A | `python mike.py --help` prints usage, exits 0 | ✅ |
+| B | starts the server, connects, one model `DeepSeek V4.1 Flash` | ✅ |
+| C | sibling dirs renamed → mike still works | ✅ (restored) |
+| D | no `openrouter`/`anthropic` in mike.py | ✅ |
+| E | `/tokens` threshold = 400,000 | ✅ |
+| F | `/compact` summary has all seven sections | ✅ |
+| G | `resume` lists sessions (name/timestamp/preview) and restores | ✅ |
+| H | forced rollover → `-cont1` file seeded with the summary header | ✅ |
+| I | `pytest tests/test_mike.py` passes | ✅ 35 passed |
+| J | README.md and DECISIONS.md updated | ✅ |
+| K | all work committed, final message `feat(mike): self-contained free-DeepSeek harness with 500k ctx + resume.` | ✅ |

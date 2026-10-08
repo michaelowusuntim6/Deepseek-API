@@ -1,281 +1,250 @@
-# DeepSeek API: a free LLM API powered by DeepSeek
+# DeepSeek-API — a free LLM API + the `mike` coding harness
 
-**Using your own DeepSeek account.** No API key, no credits, no paid plan: it turns the free chat at [chat.deepseek.com](https://chat.deepseek.com) into an API you can call from code.
+**Using your own DeepSeek account.** No API key, no credits, no paid plan: this
+turns the free chat at [chat.deepseek.com](https://chat.deepseek.com) into an
+OpenAI-compatible API you can call from code — and ships **`mike.py`**, a
+self-contained coding-agent CLI that runs on top of it.
 
-You can use it in two ways:
+Two things live here:
 
-- 🐍 **As a Python library:** just call `client.chat("Hi")`. Supports streaming and multi-turn conversations.
-- 🔌 **As a local OpenAI-compatible API:** runs a server at `http://localhost:8000/v1` that speaks the OpenAI format, so the official `openai` SDK (and any OpenAI-compatible app) works as a drop-in, with `localhost` in place of OpenAI.
+- 🐍 **The library + server** — `deepseek/` (a pure-HTTP client) and `server/`
+  (a FastAPI app at `http://127.0.0.1:8000/v1` that speaks the OpenAI format).
+- 🤖 **`mike.py`** — one file, no sibling dependencies, that auto-launches the
+  server and gives you an interactive coding agent with tools, thinking-block
+  handling, inline compaction and resumable sessions.
 
-You sign in once in a browser with your DeepSeek account; your session is saved and refreshed automatically after that.
-
-> **Unofficial project.** Not affiliated with or endorsed by DeepSeek. It automates the consumer DeepSeek web experience for personal use, so use it responsibly and within DeepSeek's terms.
-
----
-
-## Table of contents
-
-- [Why use this?](#why-use-this)
-- [Requirements](#requirements)
-- [Setup (2 minutes)](#setup-2-minutes)
-- [Usage 1: In Python (no server)](#usage-1-in-python-no-server)
-- [Usage 2: As an OpenAI-compatible server](#usage-2-as-an-openai-compatible-server)
-- [Command line](#command-line)
-- [Human-check & proof-of-work (automatic)](#human-check--proof-of-work-automatic)
-- [Models, DeepThink & web search](#models-deepthink--web-search)
-- [Concurrency](#concurrency)
-- [Rate limiting](#rate-limiting)
-- [Project layout](#project-layout)
-- [Notes & limitations](#notes--limitations)
-- [License](#license)
+> **Unofficial project.** Not affiliated with or endorsed by DeepSeek. It
+> automates the consumer DeepSeek web experience for personal use, so use it
+> responsibly and within DeepSeek's terms.
 
 ---
 
-## Why use this?
+## The single-model story
 
-- **Free:** uses your normal signed-in DeepSeek account, no API billing.
-- **Drop-in OpenAI replacement:** point any OpenAI client at `localhost` and it just works.
-- **Full DeepSeek toolset:** pick the fast or expert model, and toggle DeepThink reasoning and web search per request.
-- **Streaming + conversations:** token-by-token output and multi-turn threads addressed by `conversation_id`.
+DeepSeek's free web chat now exposes **exactly one model**. Everywhere in this
+project it is surfaced as:
+
+| | |
+| --- | --- |
+| **Display name** | `DeepSeek V4.1 Flash` |
+| **Wire id** | `deepseek-v4.1-flash` |
+
+That is the *only* model you will ever see, in `mike.py` or from `/v1/models`.
+For compatibility, these legacy aliases are still accepted and silently routed
+to it (no warning beyond one info line at startup, and a single INFO log line on
+the server per alias per process):
+
+```
+deepseek-chat   deepseek-reasoner   deepseek-v3      deepseek-v4
+deepseek-v4.1-flash   deepseek-flash   deepseek-web   default
+```
+
+Think of **thinking** (DeepThink reasoning) and **web search** as toggles, not
+models — they are requested per call and never encoded in the model name.
 
 ---
 
-## Requirements
-
-- **Python 3.9+**
-- A **DeepSeek account** (the free one you use for [chat.deepseek.com](https://chat.deepseek.com) is fine)
-- Works on Windows, macOS, and Linux
-
----
-
-## Setup (2 minutes)
+## Install
 
 ```bash
-# 1. Clone the project
 git clone https://github.com/sums001/Deepseek-API.git
-cd "Deepseek-API"
-```
+cd Deepseek-API
 
-**2. Create and activate a virtual environment**
-
-On **macOS / Linux**:
-
-```bash
 python3 -m venv venv
-source venv/bin/activate
-```
+source venv/bin/activate            # Windows: venv\Scripts\activate
 
-On **Windows** (PowerShell):
-
-```powershell
-python -m venv venv
-venv\Scripts\Activate.ps1
-```
-
-> On Windows you may need to allow script execution once: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. In `cmd.exe` activate with `venv\Scripts\activate.bat` instead.
-
-**3. Install dependencies and sign in**
-
-```bash
-# Install dependencies
 pip install -r requirements.txt
+playwright install chromium         # one-time: browser for sign-in
 
-# Install the browser Playwright needs (one-time)
-playwright install chromium
-
-# Sign in once: a browser opens, log into your DeepSeek account
-python -m deepseek.auth
+python -m deepseek.auth             # sign in once (opens a browser)
 ```
 
-The login window opens so you can sign in by hand and solve the human-check once. After that your session (bearer token + cookies) is saved under `session/` (git-ignored, never shared) and reused on every run — the cached session is refreshed automatically, so your first request works right away.
-
-> The server can also open this window for you on demand the first time it needs a session, so this step is optional for local single-user use.
+Your session (bearer token + cookies) is saved under `session/` and refreshed
+automatically afterwards. The server can also open the login window on demand
+the first time it needs a session.
 
 ---
 
-## Usage 1: In Python (no server)
-
-The simplest way if your code is already Python.
-
-```python
-from deepseek import DeepSeekClient
-
-client = DeepSeekClient()                # loads your signed-in session
-
-# Get a full reply
-reply = client.chat("Say hello in one short sentence.")
-print(reply.text)
-
-# Continue the SAME conversation — pass the id back
-reply2 = client.chat("And now in French?", conversation_id=reply.conversation_id)
-print(reply2.text)
-
-# Stream the answer as it's typed
-for chunk in client.stream("Tell me a short joke"):
-    print(chunk, end="", flush=True)
-```
-
-`chat()` returns the full text plus a `conversation_id`; pass that id back to keep the thread going, or omit it to start fresh. `stream()` yields the reply piece by piece.
-
-👉 More: [examples/01_direct_chat.py](examples/01_direct_chat.py), [02_direct_conversation.py](examples/02_direct_conversation.py), [03_direct_stream.py](examples/03_direct_stream.py)
-
----
-
-## Usage 2: As an OpenAI-compatible server
-
-Start a local server that speaks the OpenAI API, so existing OpenAI tools and SDKs work unchanged.
+## Run the harness: `mike.py`
 
 ```bash
-python app.py
-# -> DeepSeek OpenAI-compatible API on http://127.0.0.1:8000
+python mike.py            # start (or attach to) the server, then chat
+python mike.py resume     # pick a saved session from a table, then continue
+python mike.py --help     # usage (does not start the server)
 ```
 
-Then point any OpenAI client at it (the API key is required by the SDK but ignored):
+`mike.py` is a single self-contained file. On startup it:
+
+1. probes `127.0.0.1:8000` and reuses a server that is already running
+   (it never starts a second one);
+2. otherwise launches `python app.py` from this directory and polls
+   `/v1/models` until it answers (30s timeout, 250 ms backoff);
+3. registers exit/signal handlers that stop the child **only if mike started it**;
+4. detects whether the backend supports native OpenAI `tools=` (it probes with a
+   dummy `ping` tool) and caches the answer in `.mike_state.json`.
+
+Everything is local: the only network calls are to `127.0.0.1` and, when a tool
+asks for it, to URLs you fetch.
+
+### Slash commands
+
+```
+/help                 show this help
+/quit, /exit          quit (saves the session)
+/clear                clear the screen
+/model [name]         show the model (there is exactly one)
+/thinking on|off|last thinking display: on / off / show last block
+/sessions             list saved sessions
+/resume <n|name>      switch to a saved session
+/rename <name>        rename the current session
+/compact              force compaction now
+/tokens               show the current token estimate + threshold
+/tools                list the available tools
+/rollover             force a session rollover
+```
+
+### Tools
+
+`read_file`, `write_file`, `edit_file`, `list_dir`, `glob`, `grep`, `bash`,
+`python`, `web_fetch`, `todo_write`, `todo_read`.
+
+The server's web backend does not implement OpenAI's `tools=` schema, so mike
+runs in **prompted mode**: it describes the tools in a system prompt and parses
+the model's tool calls out of the reply. It understands both the strict
+`<tool_call>{"name": ..., "arguments": {...}}</tool_call>` envelope *and*
+DeepSeek's native DSML syntax (`invoke`/`parameter` tags), and multiple calls per
+turn. If a backend ever does return native `message.tool_calls`, mike detects it
+at startup and uses that path instead.
+
+### Thinking blocks
+
+DeepSeek streams reasoning (fragment type `THINK`). By default mike shows it in a
+dimmed single-line spinner and never dumps it to scrollback; `/thinking on`
+streams the full reasoning in dim text, `/thinking off` hides it, and
+`/thinking last` prints the most recent full reasoning block once. Reasoning is
+stored in the session under a separate `reasoning` field and is **never** fed
+back to the model as assistant content.
+
+### Sessions
+
+Sessions live in `sessions/` as pretty-printed, sorted-key JSON named
+`YYYYMMDD-HHMMSS__<slug>.json`, where the slug is derived from your first
+message (or set with `/rename`). Each file holds the **full** history, the
+compaction log, and the model name. Compaction shrinks only the *in-context*
+view; the on-disk transcript is never truncated. When a session is still over
+budget after compaction, mike transparently **rolls over** to a new
+`<slug>-contN` session seeded with the summary.
+
+### Changing the context budget
+
+The max context is **500,000 tokens** by default, and auto-compaction triggers at
+**80%** of it (i.e. **400,000 tokens**). Override the max with an environment
+variable — the threshold follows automatically:
+
+```bash
+MIKE_MAX_CONTEXT=200000 python mike.py     # => compacts at 160,000
+```
+
+Token counting uses `tiktoken` when available and falls back to a `len//4`
+heuristic; the choice is persisted in `.mike_state.json`.
+
+---
+
+## The OpenAI-compatible server
+
+Start it directly (mike does this for you):
+
+```bash
+python app.py       # -> http://127.0.0.1:8000
+```
+
+Then point any OpenAI client at it (the key is required by the SDK but ignored):
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="sk-local")
 resp = client.chat.completions.create(
-    model="deepseek-chat",
+    model="deepseek-v4.1-flash",
     messages=[{"role": "user", "content": "Hello!"}],
+    extra_body={"thinking": True, "search": False},   # DeepThink / web search
 )
 print(resp.choices[0].message.content)
-```
-
-Or call it with plain HTTP / `curl`:
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "deepseek-chat", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
 **Endpoints**
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `POST` | `/v1/chat/completions` | Chat (supports `"stream": true`, plus optional `"conversation_id"`, `"thinking"`, `"search"`) |
-| `GET`  | `/v1/models` | Lists the available models |
+| `POST` | `/v1/chat/completions` | Chat. Supports `stream: true`; non-OpenAI extras: `conversation_id`, `thinking`, `search` |
+| `GET`  | `/v1/models` | Advertises the one model, with `aliases: [...]` |
 | `GET`  | `/healthz` | Health check (rate-limit exempt) |
 
-> Change the address with env vars: `HOST=0.0.0.0 PORT=8080 python app.py`, or run `uvicorn server.api:app --host 0.0.0.0 --port 8080`.
+`/v1/models` returns exactly one entry:
 
-👉 More: [examples/04_server_http.py](examples/04_server_http.py), [examples/05_server_stream.py](examples/05_server_stream.py), [examples/06_server_openai_sdk.py](examples/06_server_openai_sdk.py)
-
----
-
-## Command line
-
-```bash
-python -m deepseek.auth          # sign in and save the session
+```json
+{"id": "deepseek-v4.1-flash", "object": "model", "name": "DeepSeek V4.1 Flash",
+ "aliases": ["deepseek-chat", "deepseek-reasoner", "deepseek-v3", "deepseek-v4",
+             "deepseek-flash", "deepseek-web", "default"]}
 ```
 
----
+Requests naming any alias are rewritten to the canonical id and logged once per
+alias per process. Genuinely unknown names still return `404` (no silent
+fallback — there is only one model anyway).
 
-## Human-check & proof-of-work (automatic)
-
-DeepSeek's chat sits behind two gates, both handled for you:
-
-- **AWS WAF human-check:** access needs a signed-in browser session that has
-  cleared the "verify you're human" check. `python -m deepseek.auth` opens a real
-  browser so you can sign in and solve it once; the resulting token + cookies are
-  cached under `session/` and reused on every request.
-- **Proof-of-work:** every completion is gated by a PoW challenge. The bridge
-  solves it by running DeepSeek's own `sha3_wasm_bg.wasm` module — the same one
-  the browser loads — inside a `wasmtime` sandbox, so there's nothing to do on
-  your end.
-
-A cached session is reused for ~6 hours and refreshed headlessly from your saved
-Chrome profile when possible; only a full expiry sends you back to the browser.
+Change the address with env vars: `HOST=0.0.0.0 PORT=8080 python app.py`, or run
+`uvicorn server.api:app --host 0.0.0.0 --port 8080`.
 
 ---
 
-## Models, DeepThink & web search
-
-The `model` name selects **which model** answers. DeepThink and web search are
-**not** models — they're orthogonal toggles you pass per request.
-
-| Model | DeepSeek mode | Notes |
-| --- | --- | --- |
-| `deepseek-chat` | Instant | Fast default model |
-| `deepseek-expert` | Expert | Stronger, slower |
-
-Pass `thinking: true` (DeepThink reasoning) and/or `search: true` (web search) in
-the request body — or via the OpenAI SDK's `extra_body`:
+## Usage as a Python library (no server)
 
 ```python
-resp = client.chat.completions.create(
-    model="deepseek-expert",
-    messages=[{"role": "user", "content": "What changed in the news today?"}],
-    extra_body={"thinking": True, "search": True},
-)
+from deepseek import DeepSeekClient
+
+client = DeepSeekClient()                # loads your signed-in session
+reply = client.chat("Say hello in one short sentence.")
+print(reply.text, "|", reply.reasoning)
+
+reply2 = client.chat("And now in French?", conversation_id=reply.conversation_id)
+print(reply2.text)
+
+for chunk in client.stream("Tell me a short joke"):
+    print(chunk, end="", flush=True)
 ```
 
-`conversation_id`, `thinking`, and `search` are non-OpenAI extras. A thread's
-model is fixed at creation, so `model` can't be combined with `conversation_id`
-on resume. Unknown model names return a `404` (no silent fallback). See
-[server/config.py](server/config.py).
+See [examples/](examples/) for runnable versions.
 
 ---
 
-## Concurrency
+## Concurrency, rate limiting, notes
 
-The server bridges a **single** signed-in DeepSeek account behind one shared
-client. The PoW solver's `wasmtime` store isn't reentrant, so upstream calls are
-**serialized**: parallel HTTP requests queue behind a lock and run one at a time
-(see [server/api.py](server/api.py)). This is intentional — throughput is
-sequential, not parallel. Keep concurrent in-flight requests low, and please
-don't hammer your account.
-
----
-
-## Rate limiting
-
-On top of serialization, the bridge enforces a self-imposed rate limit with a
-dependency-free sliding-window limiter ([server/ratelimit.py](server/ratelimit.py)):
-it caps accepted requests **per client IP** and returns a standard `429` +
-`Retry-After` when you exceed it. `/healthz` is exempt.
-
-| Env var | Default | Meaning |
-| --- | --- | --- |
-| `RATE_LIMIT_PER_MINUTE` | `30` | Requests/minute accepted per client IP |
-
-```bash
-RATE_LIMIT_PER_MINUTE=60 python app.py   # raise it
-```
-
-**On the client side, use exponential backoff.** Transient `429`s clear if you
-retry with growing delays (e.g. 1s, 2s, 4s). The official `openai` SDK does this
-automatically and honours `Retry-After`; with plain HTTP, add a few retries
-yourself.
-
----
+- The server bridges a **single** signed-in account and serializes upstream
+  calls (the PoW solver is not reentrant). Throughput is sequential.
+- A self-imposed sliding-window rate limit applies per client IP
+  (`RATE_LIMIT_PER_MINUTE`, default `30`); `/healthz` is exempt. Use exponential
+  backoff on `429`.
+- No real token counts: `usage` is a rough ~4-chars/token estimate.
+- Most OpenAI params (`temperature`, `top_p`, `max_tokens`) are accepted but
+  ignored; only `model`, `messages`, `stream`, `conversation_id`, `thinking` and
+  `search` do anything.
+- Everything in `session/`, `sessions/` and `.mike_state.json` is local and
+  git-ignored.
 
 ## Project layout
 
 | Path | What it does |
 | --- | --- |
-| [deepseek/](deepseek/) | The core library: `DeepSeekClient`, auth/browser sign-in ([auth.py](deepseek/auth.py)), the HTTP driver ([client.py](deepseek/client.py)), and the PoW solver ([pow.py](deepseek/pow.py)) |
-| [server/](server/) | The FastAPI OpenAI-compatible server |
-| [examples/](examples/) | Runnable examples for every feature ([examples/README.md](examples/README.md)) |
-| [app.py](app.py) | Starts the server |
-
----
-
-## Notes & limitations
-
-- **Sign in once, then reuse.** The cached session refreshes automatically; you only re-sign-in if it fully expires.
-- **Be reasonable.** Please use it in moderation, and don't spam or hammer it with automated bulk requests.
-- **No real token counts.** `usage` in responses is a rough ~4-chars/token estimate.
-- **Most OpenAI params are accepted but ignored** (`temperature`, `top_p`, `max_tokens`); only `model`, `messages`, `stream`, `conversation_id`, `thinking`, and `search` do anything.
-- **Vision is deferred.** It needs image-upload plumbing that isn't built yet.
-- **Your session is private.** Everything in `session/` (cookies + token) stays on your machine and is git-ignored.
+| `mike.py` | The self-contained coding harness (this is the deliverable) |
+| `deepseek/` | Core client: auth, HTTP driver, PoW solver |
+| `server/` | FastAPI OpenAI-compatible server |
+| `tests/test_mike.py` | Hermetic pytest suite for mike |
+| `RECON.md`, `DECISIONS.md` | Reconnaissance notes and design decisions |
+| `app.py` | Starts the server |
 
 ## License
 
-Released under the [MIT License](LICENSE). As this is an unofficial project, you remain responsible for complying with DeepSeek's terms of service.
-
----
-
+MIT. `mike.py` is derived from `nanocode.py` (MIT) and ports tool/compaction
+logic from `cipher-harness` (MIT); those notices are preserved in its header. As
+this is an unofficial project, you remain responsible for complying with
+DeepSeek's terms of service.

@@ -266,7 +266,8 @@ class TokenCounter:
 # <｜end▁of▁thinking｜>), tolerating stray whitespace.
 _TAG_RE = re.compile(
     r"<｜(?:begin|end)▁of▁(?:thinking|reasoning)｜>"
-    r"|<\s*/?\s*(?:think|thinking|reasoning|tool_call)\s*>",
+    r"|<\s*/?\s*(?:think|thinking|reasoning|tool_call)\s*>"
+    r"|<[^<>]*?(?:DSML|dsml)[^<>]*>",
     re.IGNORECASE,
 )
 _REASONING_TAGS = {"think", "thinking", "reasoning"}
@@ -275,6 +276,13 @@ _REASONING_TAGS = {"think", "thinking", "reasoning"}
 def _tag_name(raw_tag: str) -> tuple[str, bool]:
     raw = raw_tag.strip()
     low = raw.lower()
+    # DeepSeek's native DSML tool-call tags. The container tags mention "calls";
+    # the inner invoke/parameter tags do not, so they are no-ops for the parser
+    # (their text is swallowed while the container keeps us in "hidden" mode).
+    if "dsml" in low:
+        if "calls" in low:
+            return "tool_call", raw.startswith("</")
+        return "dsml_inner", raw.startswith("</")
     if "▁of▁" in raw:  # DeepSeek special token, e.g. <｜end▁of▁thinking｜>
         closing = "end▁of▁" in low
         if "thinking" in low:
@@ -399,6 +407,51 @@ class StreamParser:
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
+# DeepSeek's native DSML tool-call syntax:
+#   <|DSML| ... calls> <|DSML| ... invoke name="tool"> ... </|DSML| ... invoke> ...
+# Written as tolerant patterns so the exact full-width markers don't matter.
+_DSML_INVOKE_RE = re.compile(
+    r"<[^<>]*?invoke\s+name=\"([^\"]+)\"[^<>]*>(.*?)</[^<>]*?invoke\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_DSML_PARAM_RE = re.compile(
+    r"<[^<>]*?parameter\s+name=\"([^\"]+)\"([^<>]*)>(.*?)</[^<>]*?parameter\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_DSML_BLOCK_RE = re.compile(
+    r"<[^<>]*?calls[^<>]*>.*?</[^<>]*?calls\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def parse_dsml_calls(text: str) -> list[dict]:
+    """Parse DeepSeek's native DSML invoke/parameter tool-call syntax."""
+    calls: list[dict] = []
+    for m in _DSML_INVOKE_RE.finditer(text or ""):
+        args: dict = {}
+        for pm in _DSML_PARAM_RE.finditer(m.group(2)):
+            args[pm.group(1)] = _dsml_value(pm.group(3), pm.group(2))
+        calls.append({"name": m.group(1), "arguments": args})
+    return calls
+
+
+def _dsml_value(raw: str, attrs: str):
+    if re.search(r'string\s*=\s*"true"', attrs or "", re.IGNORECASE):
+        value = raw
+        if value.startswith("\n"):
+            value = value[1:]
+        return value[:-1] if value.endswith("\n") else value
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def strip_dsml(text: str) -> str:
+    if not text:
+        return text
+    return _DSML_BLOCK_RE.sub("", text)
+
 
 def parse_tool_calls(text: str) -> tuple[list[dict], str]:
     """Parse ``<tool_call>`` envelopes out of an assistant message.
@@ -428,6 +481,10 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
                 calls.append(parsed)
                 clean = clean.replace(raw, "")
                 clean = re.sub(r"```(?:json)?\s*```", "", clean)
+
+    # Native DeepSeek DSML syntax (what the free web model actually emits).
+    calls.extend(parse_dsml_calls(text))
+    clean = strip_dsml(clean)
 
     return calls, clean.strip()
 
@@ -1043,6 +1100,12 @@ def _files_touched(messages: list) -> set:
                 args = {}
             if isinstance(args, dict) and args.get("path"):
                 files.add(str(args["path"]))
+        # Tool results mention paths in prose ("wrote N line(s) to /path",
+        # "edited /path", "File not found: /path"); capture those too.
+        for match in re.finditer(r"(?:to|edited|from|not found:)\s+(\S+)", text):
+            candidate = match.group(1).strip("`'\".,)")
+            if "/" in candidate and not candidate.startswith("http"):
+                files.add(candidate)
     return files
 
 
@@ -1612,6 +1675,8 @@ def build_prompted_tool_prompt(toolbox: Toolbox) -> str:
         "- You may emit several <tool_call> blocks in one turn.",
         "- Arguments must be a JSON object matching the tool's parameters.",
         "- After the tools run you will receive a <tool_result> message; keep going until done.",
+        "- Use ONLY this envelope for tools. Do NOT use any other tool syntax"
+        " (no DSML tags, no bare function names, no fenced code blocks).",
         "",
         "Available tools:",
     ]
@@ -1643,8 +1708,18 @@ class MikeAgent:
         self.thinking_mode = thinking_mode  # spinner | on | off
         self.server = server
         self.cwd = cwd or os.getcwd()
-        self.last_reasoning = ""
+        self.last_reasoning = self._last_reasoning_from_history()
         self._system = BASE_SYSTEM_PROMPT.format(cwd=self.cwd)
+        # `session.messages` is the FULL, append-only history kept on disk.
+        # `self.context` is what we actually send upstream; compaction shrinks
+        # only this, so a crash or a compact never loses the transcript.
+        self.context: list = list(self.session.messages)
+
+    def _last_reasoning_from_history(self) -> str:
+        for msg in reversed(self.session.messages):
+            if msg.get("reasoning"):
+                return msg["reasoning"]
+        return ""
 
     # -- helpers ----------------------------------------------------------
 
@@ -1659,11 +1734,11 @@ class MikeAgent:
         out = [{"role": "system", "content": self._system}]
         if self.tool_mode == "prompted":
             out.append({"role": "system", "content": build_prompted_tool_prompt(self.toolbox)})
-        for msg in self.session.messages:
+        for msg in self.context:
             role = msg.get("role", "user")
             if role == "assistant":
                 entry: dict = {"role": "assistant", "content": msg.get("content") or None}
-                if msg.get("tool_calls"):
+                if msg.get("tool_calls") and self.tool_mode == "native":
                     entry["tool_calls"] = msg["tool_calls"]
                 if not entry["content"] and not entry.get("tool_calls"):
                     continue
@@ -1688,7 +1763,7 @@ class MikeAgent:
         if not self.session.messages:
             self._name_from(user_input)
 
-        self.session.messages.append({"role": "user", "content": user_input})
+        self._append({"role": "user", "content": user_input})
         self._save()
         self._maybe_compact()
 
@@ -1718,30 +1793,36 @@ class MikeAgent:
             if reasoning:
                 assistant_msg["reasoning"] = reasoning
             if calls:
-                if self.tool_mode == "native":
-                    assistant_msg["tool_calls"] = [
-                        {
-                            "id": c["id"],
-                            "type": "function",
-                            "function": {
-                                "name": c["name"],
-                                "arguments": json.dumps(c["arguments"], ensure_ascii=False),
-                            },
-                        }
-                        for c in calls
-                    ]
-                self.session.messages.append(assistant_msg)
+                # Always record the calls in the session (rich history + Files
+                # Touched). They are only *sent* upstream in native mode.
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": c.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {
+                            "name": c["name"],
+                            "arguments": json.dumps(c["arguments"], ensure_ascii=False),
+                        },
+                    }
+                    for c in calls
+                ]
+                self._append(assistant_msg)
                 self._save()
                 self._run_tools(calls)
                 self._save()
                 self._maybe_compact()
                 continue
 
-            self.session.messages.append(assistant_msg)
+            self._append(assistant_msg)
             self._save()
             final_text = clean_text
             break
         return final_text
+
+    def _append(self, message: dict) -> None:
+        """Append to BOTH the full on-disk history and the in-context view."""
+        self.session.messages.append(message)
+        self.context.append(message)
 
     def _name_from(self, first_message: str) -> None:
         """Name/label the session from its first user message (kept on disk)."""
@@ -1842,13 +1923,13 @@ class MikeAgent:
             output = self.toolbox.call(name, args)
             self.console.print(Text(_result_preview(output), style="dim"))
             if self.tool_mode == "native":
-                self.session.messages.append({
+                self._append({
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
                     "content": output,
                 })
             else:
-                self.session.messages.append({
+                self._append({
                     "role": "user",
                     "content": f"<tool_result>\n{output}\n</tool_result>",
                 })
@@ -1856,32 +1937,35 @@ class MikeAgent:
     # -- compaction / rollover -------------------------------------------
 
     def _maybe_compact(self) -> None:
-        if self.compactor.should_compact(self.session.messages):
+        if self.compactor.should_compact(self.context):
             self.compact(force=False)
 
     def compact(self, force: bool = True) -> str:
-        before = self.compactor.estimate(self.session.messages)
+        before = self.compactor.estimate(self.context)
         if not force and before <= self.compactor.trigger_tokens:
             return ""
-        summary = self.compactor.build_summary(self.session.messages)
+        summary = self.compactor.build_summary(self.context)
         self.session.compactions.append({
             "at_tokens": before,
             "summary": summary,
             "new_session": None,
         })
-        self.session.messages = self.compactor.compact(self.session.messages)
+        # Only the in-context view shrinks; session.messages keeps the full
+        # transcript on disk (never lose user data).
+        self.context = self.compactor.compact(self.context)
         self._save()
-        after = self.compactor.estimate(self.session.messages)
+        after = self.compactor.estimate(self.context)
         if after > self.compactor.trigger_tokens:
             self.rollover(summary)
         return summary
 
     def rollover(self, summary: Optional[str] = None) -> Session:
         if summary is None:
-            summary = self.compactor.build_summary(self.session.messages)
+            summary = self.compactor.build_summary(self.context)
         old = self.session
         new = self.store.rollover(old, summary)
         self.session = new
+        self.context = list(new.messages)
         self.console.print(Text(f"-> rolled over to session {new.name}", style="yellow"))
         return new
 
@@ -1992,7 +2076,7 @@ def run_repl(agent: MikeAgent, console) -> None:
                 console.print(f"  {spec.name} [{mode}] - {spec.description}")
             continue
         if user_input == "/tokens":
-            est = agent.compactor.estimate(agent.session.messages)
+            est = agent.compactor.estimate(agent.context)
             console.print(
                 f"estimated {est:,} tokens / threshold {agent.compactor.trigger_tokens:,} "
                 f"(max {agent.compactor.max_context:,}) via {agent.compactor.counter.name}"
@@ -2035,6 +2119,7 @@ def run_repl(agent: MikeAgent, console) -> None:
                 console.print("no such session")
             else:
                 agent.session = chosen
+                agent.context = list(chosen.messages)
                 console.print(f"resumed session {chosen.name} ({len(chosen.messages)} messages)")
             continue
         if user_input.startswith("/rename"):

@@ -80,6 +80,39 @@ def test_parse_arguments_as_json_string():
     assert calls == [{"name": "glob", "arguments": {"pattern": "*.py"}}]
 
 
+BAR = "\uff5c"  # full-width vertical bar used by DeepSeek's DSML tool syntax
+
+
+def _dsml(name, params):
+    """Build a DeepSeek DSML tool-call block (params: list of (name, value))."""
+    p = f"<{BAR}DSML{BAR}{BAR} parameter name=\"%s\" string=\"true\">%s</{BAR}{BAR}DSML{BAR}{BAR} parameter>"
+    body = "\n".join(p % (k, v) for k, v in params)
+    return (f"<{BAR}DSML{BAR}{BAR} calls>\n"
+            f"<{BAR}{BAR}DSML{BAR}{BAR} invoke name=\"{name}\">\n"
+            f"{body}\n"
+            f"</{BAR}{BAR}DSML{BAR}{BAR} invoke>\n"
+            f"</{BAR}{BAR}DSML{BAR}{BAR} calls>")
+
+
+def test_parse_dsml_tool_call():
+    """The free web model emits DeepSeek's native DSML syntax; mike parses it too."""
+    text = _dsml("write_file", [("path", "/tmp/mike_e2e_check.txt"),
+                                ("content", "hello from mike")])
+    calls, clean = mike.parse_tool_calls(text)
+    assert calls == [{"name": "write_file",
+                      "arguments": {"path": "/tmp/mike_e2e_check.txt",
+                                    "content": "hello from mike"}}]
+    assert "DSML" not in clean
+    assert "parameter" not in clean
+
+
+def test_dsml_hidden_from_content():
+    text = _dsml("bash", [("command", "ls")])
+    reasoning, clean = mike.extract_thinking(text)
+    assert clean == ""
+    assert "DSML" not in clean
+
+
 # --------------------------------------------------------------------------- #
 # 2. Thinking-block stripper                                                   #
 # --------------------------------------------------------------------------- #
