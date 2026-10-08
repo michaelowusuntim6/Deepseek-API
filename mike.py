@@ -1461,9 +1461,250 @@ class SessionStore:
             if s.name == key:
                 return s
         for s in sessions:
+            if s.id == key:
+                return s
+        for s in sessions:
             if s.name.startswith(key):
                 return s
+        for s in sessions:
+            if s.id.startswith(key):
+                return s
         return None
+
+
+# --------------------------------------------------------------------------- #
+# 8b. Markdown transcript export                                               #
+# --------------------------------------------------------------------------- #
+
+_TOOL_RESULT_BODY_RE = re.compile(r"\s*<tool_result>\s*(.*?)\s*</tool_result>\s*$", re.DOTALL)
+_CONT_RE = re.compile(r"^(.*)-cont\d+$")
+
+
+def _is_tool_result(text: str) -> bool:
+    return bool(text) and text.lstrip().startswith("<tool_result>")
+
+
+def _tool_result_body(text: str) -> str:
+    m = _TOOL_RESULT_BODY_RE.match(text or "")
+    return m.group(1) if m else (text or "")
+
+
+def _escape_user_text(text: str) -> str:
+    """Preserve user text byte-for-byte; only guard a leading ``---`` line."""
+    if text.startswith("---"):
+        return "\\" + text
+    return text
+
+
+def _truncate(text: str, limit: int = 500) -> str:
+    text = (text or "").replace("\r\n", "\n")
+    return text if len(text) <= limit else text[:limit] + "\u2026"
+
+
+def _rollover_parent(name: str) -> str:
+    m = _CONT_RE.match(name or "")
+    return m.group(1) if m else "\u2014"
+
+
+def _call_args_json(call: dict) -> str:
+    fn = call.get("function") or {}
+    raw = fn.get("arguments")
+    if isinstance(raw, str):
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return raw
+    elif raw is None:
+        obj = {}
+    else:
+        obj = raw
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return str(obj)
+
+
+def _call_name(call: dict) -> str:
+    return (call.get("function") or {}).get("name") or call.get("name") or "?"
+
+
+def render_transcript(session: Session) -> str:
+    """Render a session as a Markdown transcript (see README for the structure)."""
+    header = [
+        f"# Session: {session.name}",
+        "",
+        f"- **id:** {session.id}",
+        f"- **created:** {session.created_at}",
+        f"- **updated:** {session.updated_at}",
+        f"- **model:** {session.model}",
+        f"- **messages:** {len(session.messages)}",
+        f"- **compactions:** {len(session.compactions)}",
+        f"- **rollover-of:** {_rollover_parent(session.name)}",
+    ]
+
+    # Split the transcript into turns at each genuine user message (tool-result
+    # wrappers, which are role:user in prompted mode, do NOT start a turn).
+    turns: list = []
+    current: Optional[list] = None
+    for msg in session.messages:
+        role = msg.get("role")
+        text = _content_text(msg.get("content"))
+        if role == "user" and not _is_tool_result(text):
+            if current is not None:
+                turns.append(current)
+            current = [msg]
+        else:
+            if current is None:
+                current = []
+            current.append(msg)
+    if current:
+        turns.append(current)
+
+    blocks = ["\n".join(header).rstrip("\n")]
+    for number, turn in enumerate(turns, 1):
+        blocks.append(_render_turn(number, turn))
+
+    return "\n\n---\n\n".join(b.strip("\n") for b in blocks) + "\n"
+
+
+def _render_turn(number: int, messages: list) -> str:
+    out: list = []
+
+    def add(line: str = "") -> None:
+        out.append(line)
+
+    first = messages[0]
+    add(f"## Turn {number} \u2014 user")
+    add("")
+    add(_escape_user_text(_content_text(first.get("content"))))
+    add("")
+
+    i = 1
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get("role")
+
+        if role == "assistant":
+            clean = strip_thinking(_content_text(msg.get("content")))
+            reasoning = msg.get("reasoning") or ""
+            calls = msg.get("tool_calls") or []
+
+            # Collect the tool results that immediately follow this message.
+            results: list = []
+            j = i + 1
+            while j < len(messages):
+                nm = messages[j]
+                ntext = _content_text(nm.get("content"))
+                if nm.get("role") == "tool":
+                    results.append(ntext)
+                    j += 1
+                elif nm.get("role") == "user" and _is_tool_result(ntext):
+                    results.append(_tool_result_body(ntext))
+                    j += 1
+                else:
+                    break
+
+            add(f"## Turn {number} \u2014 assistant")
+            add("")
+            if clean:
+                add(clean)
+                add("")
+            if reasoning:
+                add("<details><summary>reasoning</summary>")
+                add("")
+                add(reasoning)
+                add("")
+                add("</details>")
+                add("")
+            if calls:
+                add("**Tool calls:**")
+                add("")
+                for k, call in enumerate(calls):
+                    add(f"- `{_call_name(call)}({_call_args_json(call)})`")
+                    if k < len(results):
+                        add(f"  - result: {_truncate(results[k])}")
+                add("")
+            i = j
+            continue
+
+        if role == "tool":
+            add(f"## Turn {number} \u2014 tool")
+            add("")
+            add(_content_text(msg.get("content")))
+            add("")
+            i += 1
+            continue
+
+        # A stray user message inside a turn that is not a tool result.
+        if role == "user" and not _is_tool_result(_content_text(msg.get("content"))):
+            add(f"## Turn {number} \u2014 user")
+            add("")
+            add(_escape_user_text(_content_text(msg.get("content"))))
+            add("")
+        i += 1
+
+    return "\n".join(out).rstrip("\n")
+
+
+class ExportCancelled(RuntimeError):
+    pass
+
+
+def default_export_name(session: Session) -> str:
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{session.name}__{stamp}.md"
+
+
+def resolve_export_path(path_arg: Optional[str], session: Session, cfg: dict,
+                        cwd: Optional[str] = None) -> Path:
+    """Resolve the destination path for an export (dir vs file semantics)."""
+    if not path_arg:
+        return resolved_export_dir(cfg) / default_export_name(session)
+    p = Path(os.path.expanduser(str(path_arg)))
+    if not p.is_absolute():
+        p = Path(cwd or os.getcwd()) / p
+    if str(path_arg).endswith(("/", os.sep)) or p.is_dir():
+        return p / default_export_name(session)
+    return p
+
+
+def export_session(session: Session, path: Path, force: bool = False,
+                   console=None, interactive: bool = True) -> Path:
+    """Write the session transcript to *path*. Never touches the session file."""
+    console = console or _make_console()
+    path = Path(path)
+    if path.exists() and not force:
+        console.print(f"[yellow]warning: {path} already exists[/yellow]")
+        proceed = False
+        if interactive and sys.stdin.isatty():
+            try:
+                answer = input("Overwrite? [y/N] ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                answer = ""
+            proceed = answer.startswith("y")
+        if not proceed:
+            raise ExportCancelled(f"not overwriting {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    markdown = render_transcript(session)
+    path.write_text(markdown, encoding="utf-8")
+    return path
+
+
+def do_export(session: Session, cfg: dict, path_arg: Optional[str],
+              force: bool, console, interactive: bool = True) -> Optional[Path]:
+    try:
+        path = resolve_export_path(path_arg, session, cfg)
+        written = export_session(session, path, force=force, console=console,
+                                 interactive=interactive)
+    except ExportCancelled as exc:
+        console.print(f"[yellow]export cancelled: {exc}[/yellow]")
+        return None
+    except Exception as exc:
+        console.print(f"[red]export failed: {exc}[/red]")
+        return None
+    size = written.stat().st_size
+    console.print(f"[green]Exported \u2192 {written.resolve()} ({size} bytes)[/green]")
+    return written
 
 
 # --------------------------------------------------------------------------- #
@@ -1858,7 +2099,7 @@ class MikeAgent:
                  compactor: Compactor, toolbox: Toolbox, console,
                  tool_mode: str = "prompted", thinking_mode: str = "spinner",
                  server: Optional[ServerManager] = None,
-                 cwd: Optional[str] = None):
+                 cwd: Optional[str] = None, cfg: Optional[dict] = None):
         self.llm = llm
         self.session = session
         self.store = store
@@ -1869,6 +2110,7 @@ class MikeAgent:
         self.thinking_mode = thinking_mode  # spinner | on | off
         self.server = server
         self.cwd = cwd or os.getcwd()
+        self.cfg = cfg or dict(DEFAULTS)
         self.last_reasoning = self._last_reasoning_from_history()
         self._system = build_system_prompt(
             self.cwd, self.compactor.max_context, self.compactor.trigger_tokens
@@ -2202,17 +2444,19 @@ Commands:
   /clear                clear the screen
   /model [name]         show the model (there is exactly one)
   /thinking on|off|last thinking display: on / off / show last block
-  /sessions             list saved sessions
-  /resume <n|name>      switch to a saved session
-  /rename <name>        rename the current session
-  /compact              force compaction now
+/sessions             list saved sessions
+/resume <n|name>      switch to a saved session
+/rename <name>        rename the current session
+/export [--force] [path]  write this session to a Markdown transcript
+/compact              force compaction now
   /tokens               show the current token estimate + threshold
   /tools                list the available tools
   /rollover             force a session rollover
 """
 
 
-def run_repl(agent: MikeAgent, console) -> None:
+def run_repl(agent: MikeAgent, console, cfg: Optional[dict] = None) -> None:
+    cfg = cfg or getattr(agent, "cfg", None) or dict(DEFAULTS)
     _print_banner(agent, console)
     while True:
         try:
@@ -2301,6 +2545,18 @@ def run_repl(agent: MikeAgent, console) -> None:
                 pass
             agent.session.save()
             console.print(f"renamed -> {new_name}")
+            continue
+        if user_input.startswith("/export"):
+            rest = user_input[len("/export"):].strip()
+            force = False
+            if rest.startswith("--force"):
+                force = True
+                rest = rest[len("--force"):].strip()
+            elif rest.split(" ", 1)[0] == "--force":
+                rest = rest.split(" ", 1)[1].strip() if " " in rest else ""
+            agent._save()
+            do_export(agent.session, cfg, rest or None, force, console,
+                      interactive=True)
             continue
         if user_input == "/compact":
             console.print("compacting...")
@@ -2439,12 +2695,14 @@ def build_argparser() -> argparse.ArgumentParser:
                 "  python mike.py export my-session ./out.md"),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("command", nargs="?", choices=["resume", "config"],
+    parser.add_argument("command", nargs="?", choices=["resume", "config", "export"],
                         help="'resume' opens the session picker; 'config' prints the "
-                             "resolved config")
+                             "resolved config; 'export' writes a session to Markdown")
     parser.add_argument("rest", nargs="*", help="arguments for the 'export' command")
     parser.add_argument("--resume", action="store_true",
                         help="same as the 'resume' command")
+    parser.add_argument("--force", action="store_true",
+                        help="allow /export or the export subcommand to overwrite")
     parser.add_argument("--no-server", action="store_true",
                         help="assume a server is already running; never launch one")
     parser.add_argument("--version", action="version", version=f"mike {__version__}")
@@ -2507,6 +2765,24 @@ def _cli_overrides(args) -> dict:
     return {k: v for k, v in ns.items() if k in DEFAULTS and v is not None}
 
 
+def cmd_export(args, cfg: dict, console) -> int:
+    """Non-interactive ``mike.py export <session-name-or-id> [path]``."""
+    rest = list(getattr(args, "rest", []) or [])
+    if not rest:
+        console.print("usage: mike.py export <session-name-or-id> [path]")
+        return 2
+    name = rest[0]
+    path_arg = rest[1] if len(rest) > 1 else None
+    store = SessionStore(resolved_session_dir(cfg))
+    session = store.find(name)
+    if session is None:
+        console.print(f"[red]no session matching {name!r}[/red]")
+        return 1
+    written = do_export(session, cfg, path_arg, force=args.force,
+                        console=console, interactive=False)
+    return 0 if written else 1
+
+
 def main(argv: Optional[list] = None) -> int:
     parser = build_argparser()
     args = parser.parse_args(argv)
@@ -2519,6 +2795,8 @@ def main(argv: Optional[list] = None) -> int:
     if args.command == "config":
         print_config(cfg, sources, console)
         return 0
+    if args.command == "export":
+        return cmd_export(args, cfg, console)
 
     state = load_state()
     counter = TokenCounter.create()
@@ -2576,11 +2854,11 @@ def main(argv: Optional[list] = None) -> int:
         toolbox=toolbox, console=console, tool_mode=tool_mode,
         thinking_mode=(THINKING_OFF if cfg["thinking_default"] in ("last", THINKING_OFF)
                        else cfg["thinking_default"]),
-        server=server, cwd=os.getcwd(),
+        server=server, cwd=os.getcwd(), cfg=cfg,
     )
 
     try:
-        run_repl(agent, console)
+        run_repl(agent, console, cfg)
     finally:
         agent._save()
         server.stop()

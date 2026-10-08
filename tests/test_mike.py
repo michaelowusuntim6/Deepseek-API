@@ -495,3 +495,69 @@ class TestConfig:
         cfg = {"session_dir": str(tmp_path / "s"), "export_dir": ""}
         assert mike.resolved_session_dir(cfg) == tmp_path / "s"
         assert mike.resolved_export_dir(cfg) == mike.ROOT / "exports"
+
+
+# --------------------------------------------------------------------------- #
+# 9. Markdown export (v0.2)                                                    #
+# --------------------------------------------------------------------------- #
+
+def _fixture_session():
+    return mike.Session({
+        "id": "11111111-1111-1111-1111-111111111111",
+        "name": "demo",
+        "created_at": "2026-10-08T10:00:00",
+        "updated_at": "2026-10-08T10:01:00",
+        "model": "DeepSeek V4.1 Flash",
+        "messages": [
+            {"role": "user", "content": "create a file named a.txt containing hi"},
+            {"role": "assistant", "content": "", "reasoning": "I should use write_file here.",
+             "tool_calls": [{"id": "call_1", "type": "function",
+                             "function": {"name": "write_file",
+                                          "arguments": json.dumps({"path": "a.txt",
+                                                                   "content": "hi"})}}]},
+            {"role": "user",
+             "content": "<tool_result>\nwrote 1 line(s) to /tmp/a.txt\n</tool_result>"},
+            {"role": "assistant", "content": "Done - created a.txt."},
+        ],
+        "compactions": [],
+    })
+
+
+def test_export_matches_golden():
+    golden = (Path(__file__).parent / "golden_export.md").read_text(encoding="utf-8")
+    assert mike.render_transcript(_fixture_session()) == golden
+
+
+def test_export_writes_file_and_ends_with_newline(tmp_path):
+    p = tmp_path / "out.md"
+    written = mike.export_session(_fixture_session(), p, force=True,
+                                  console=mike._PlainConsole())
+    text = written.read_text(encoding="utf-8")
+    assert text == mike.render_transcript(_fixture_session())
+    assert text.endswith("\n")
+
+
+def test_export_dir_semantics(tmp_path):
+    session = _fixture_session()
+    d = tmp_path / "exports"
+    d.mkdir()
+    cfg = {"export_dir": str(d)}
+    p = mike.resolve_export_path(None, session, cfg)
+    assert p.parent == d and p.name.startswith("demo__") and p.name.endswith(".md")
+    assert mike.resolve_export_path(str(d) + "/", session, cfg).parent == d
+    assert mike.resolve_export_path(str(tmp_path / "file.md"), session, cfg).name == "file.md"
+
+
+def test_export_refuses_overwrite_without_force(tmp_path):
+    p = tmp_path / "out.md"
+    p.write_text("existing")
+    with pytest.raises(mike.ExportCancelled):
+        mike.export_session(_fixture_session(), p, interactive=False)
+    assert p.read_text() == "existing"
+
+
+def test_export_escapes_leading_hr(tmp_path):
+    s = _fixture_session()
+    s.messages = [{"role": "user", "content": "---\nnot a rule"}]
+    md = mike.render_transcript(s)
+    assert "\\---\nnot a rule" in md
