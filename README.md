@@ -70,6 +70,8 @@ the first time it needs a session.
 ```bash
 python mike.py            # start (or attach to) the server, then chat
 python mike.py resume     # pick a saved session from a table, then continue
+python mike.py config     # print the resolved config (no server)
+python mike.py export X   # write session X to Markdown (no REPL)
 python mike.py --help     # usage (does not start the server)
 ```
 
@@ -97,11 +99,16 @@ asks for it, to URLs you fetch.
 /sessions             list saved sessions
 /resume <n|name>      switch to a saved session
 /rename <name>        rename the current session
+/export [--force] [path]  write this session to a Markdown transcript
 /compact              force compaction now
 /tokens               show the current token estimate + threshold
 /tools                list the available tools
 /rollover             force a session rollover
 ```
+
+`/export` writes the current session as Markdown (see
+[Export](#export-a-session)). `--force` allows overwriting an existing file;
+without it you get a warning and a `Overwrite? [y/N]` prompt.
 
 ### Tools
 
@@ -110,11 +117,14 @@ asks for it, to URLs you fetch.
 
 The server's web backend does not implement OpenAI's `tools=` schema, so mike
 runs in **prompted mode**: it describes the tools in a system prompt and parses
-the model's tool calls out of the reply. It understands both the strict
-`<tool_call>{"name": ..., "arguments": {...}}</tool_call>` envelope *and*
-DeepSeek's native DSML syntax (`invoke`/`parameter` tags), and multiple calls per
-turn. If a backend ever does return native `message.tool_calls`, mike detects it
-at startup and uses that path instead.
+the model's tool calls out of the reply. If a backend ever does return native
+`message.tool_calls`, mike detects it at startup and uses that path instead.
+
+**Two tool-call syntaxes are supported** (see
+[Tool calls](#tool-calls) below): the strict
+`<tool_call>{"name": ..., "arguments": {...}}</tool_call>` JSON envelope *and*
+DeepSeek's native DSML syntax (`invoke`/`parameter` tags). Both may even appear
+in the same message, and multiple calls per turn are dispatched in order.
 
 ### Thinking blocks
 
@@ -139,16 +149,159 @@ budget after compaction, mike transparently **rolls over** to a new
 
 The max context is **500,000 tokens** by default, and auto-compaction triggers at
 **80%** of it (i.e. **400,000 tokens**). Override the max with an environment
-variable — the threshold follows automatically:
+variable or a config file — the threshold follows automatically:
 
 ```bash
 MIKE_MAX_CONTEXT=200000 python mike.py     # => compacts at 160,000
+python mike.py --max-context 200000        # same, via a flag
 ```
 
 Token counting uses `tiktoken` when available and falls back to a `len//4`
 heuristic; the choice is persisted in `.mike_state.json`.
 
 ---
+
+## Configuration
+
+mike reads layered TOML config. **Later layers win:**
+
+| # | Layer | Shown as source |
+|-|-------|-----------------|
+| 1 | built-in `DEFAULTS` in `mike.py` | `default` |
+| 2 | `~/.config/mike/config.toml` (user-wide) | `user` |
+| 3 | `./mike.toml` (repo-local) | `repo` |
+| 4 | `MIKE_*` environment variables | `env` |
+| 5 | CLI flags | `cli` |
+
+Merging is per-key (`dict.update`), not a deep merge. `mike.toml.example` at the
+repo root mirrors the schema; copy it to `./mike.toml` or
+`~/.config/mike/config.toml`.
+
+**Keys** (all optional):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `max_context` | `500000` | total tokens before compaction is possible |
+| `compact_threshold` | `0.80` | fraction of `max_context` that triggers compaction |
+| `keep_recent_turns` | `6` | turns preserved verbatim across a compaction |
+| `server_host` | `"127.0.0.1"` | server bind host (probe target) |
+| `server_port` | `8000` | server port |
+| `server_cmd` | `""` | command to launch the server (empty ⇒ auto-detect `python app.py`) |
+| `model` | `"DeepSeek V4.1 Flash"` | display name |
+| `model_id` | `"deepseek-v4.1-flash"` | wire id sent to the server |
+| `thinking_default` | `"off"` | `off` \| `on` \| `spinner` \| `last` |
+| `tool_call_mode` | `"auto"` | `auto` \| `native` \| `prompted` |
+| `session_dir` | `""` | empty ⇒ `<repo>/sessions/` |
+| `export_dir` | `""` | empty ⇒ `<repo>/exports/` |
+| `log_level` | `"info"` | `debug` \| `info` \| `warn` \| `error` |
+
+Every key also has an environment variable (`MIKE_MAX_CONTEXT`,
+`MIKE_COMPACT_THRESHOLD`, `MIKE_KEEP_RECENT_TURNS`, `MIKE_SERVER_HOST`,
+`MIKE_SERVER_PORT`, `MIKE_MODEL`, `MIKE_THINKING_DEFAULT`,
+`MIKE_TOOL_CALL_MODE`, `MIKE_SESSION_DIR`, `MIKE_EXPORT_DIR`, `MIKE_LOG_LEVEL`)
+and a CLI flag (`--max-context`, `--compact-threshold`, `--keep-recent-turns`,
+`--host`, `--port`, `--server-cmd`, `--model`, `--thinking`,
+`--tool-call-mode`, `--session-dir`, `--export-dir`, `--log-level`). Flags and
+subcommands compose: `python mike.py --max-context 200000 resume` works.
+`HOST`/`PORT`/`MIKE_PORT` are still honored as fallbacks for the server address.
+
+To see exactly what won, ask mike:
+
+```bash
+python mike.py config
+
+key               value               source
+max_context       250000              env
+compact_threshold 0.8                 default
+…
+```
+
+`config` never starts the server and is safe to run anywhere.
+
+---
+
+## Export a session
+
+`/export [--force] [path]` writes the current session as a single Markdown
+transcript. With no path it goes to
+`<export_dir>/<session-name>__<YYYYMMDD-HHMMSS>.md` (`export_dir` defaults to
+`./exports/`, created on demand). A path ending in `/` or naming an existing
+directory means "use the default filename inside it"; relative paths resolve
+against the current directory.
+
+Any session can be exported non-interactively, without entering the REPL:
+
+```bash
+python mike.py export <session-name-or-id> [path]
+python mike.py --force export my-session ./my-session.md
+```
+
+The transcript has this structure:
+
+```markdown
+# Session: <name>
+
+- **id:** <uuid>
+- **created:** <iso8601>
+- **updated:** <iso8601>
+- **model:** DeepSeek V4.1 Flash
+- **messages:** <n>
+- **compactions:** <n>
+- **rollover-of:** <parent-name or —>
+
+---
+
+## Turn 1 — user
+
+<user text, unmodified>
+
+## Turn 1 — assistant
+
+<assistant visible answer>
+
+<details><summary>reasoning</summary>
+
+<reasoning text, verbatim, if any>
+
+</details>
+
+**Tool calls:**
+
+- `read_file({"path": "..."})`
+  - result: <first 500 chars, … if truncated>
+
+---
+```
+
+Reasoning is wrapped in a collapsible `<details>` block so it stays out of the
+way on GitHub. User text is preserved byte-for-byte (only a leading `---` line is
+escaped). The file ends with a newline.
+
+---
+
+## Tool calls
+
+mike parses **two** tool-call syntaxes, in the same message if needed:
+
+1. the strict JSON envelope:
+
+   ```
+   <tool_call>
+   {"name": "<tool_name>", "arguments": { ... }}
+   </tool_call>
+   ```
+
+2. DeepSeek's native DSML syntax — an `invoke` tag naming the tool, containing
+   `parameter` tags for the arguments.
+
+Covered edge cases: **multiple** calls per message (dispatched in order),
+**self-closing** invokes (`invoke name="list_dir" /` → dispatched with `{}`),
+**attribute-style** arguments on a self-closing invoke
+(`invoke name="read_file" path="x.py" /` → `{"path": "x.py"}`),
+**truncated/unclosed** invokes (the partial call is still dispatched, with a
+`tool_call_truncated` warning logged), and **malformed parameter JSON** (kept as
+a raw string rather than dropping the call). Tool syntax is always hidden from
+your scrollback; only the clean tool header and a short result preview are shown.
 
 ## The OpenAI-compatible server
 

@@ -12,3 +12,6 @@ openai
 rich>=13.7              # terminal rendering: tables, panels, dimmed thinking
 tiktoken>=0.7           # token estimation for context compaction
 pytest>=8.0             # test suite (tests/test_mike.py)
+# NOTE: config parsing uses stdlib `tomllib` (Python 3.11+). On older
+# interpreters mike falls back to `tomli` if it is installed; it is optional and
+# not required here (the project targets the Python 3.14 venv).
