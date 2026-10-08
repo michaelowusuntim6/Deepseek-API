@@ -62,13 +62,17 @@ def _est_tokens(text: str) -> int:
 
 
 def completion_response(model: str, content: str, prompt: str,
-                        conversation_id: str = None) -> dict:
+                        conversation_id: str = None, reasoning: str = None) -> dict:
     """A full (non-streaming) OpenAI chat.completion object.
 
     `conversation_id` is an extra top-level field (outside OpenAI's schema) you
     send back to resume the conversation.
     """
     pt, ct = _est_tokens(prompt), _est_tokens(content)
+    message = {"role": "assistant", "content": content}
+    if reasoning:
+        # Non-standard extension, mirroring DeepSeek's own `reasoning_content`.
+        message["reasoning_content"] = reasoning
     return {
         "id": _id(),
         "object": "chat.completion",
@@ -78,7 +82,7 @@ def completion_response(model: str, content: str, prompt: str,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
+                "message": message,
                 "finish_reason": "stop",
             }
         ],
@@ -90,11 +94,13 @@ def completion_response(model: str, content: str, prompt: str,
     }
 
 
-def stream_chunks(model: str, stream: Iterable[str]) -> Iterable[str]:
+def stream_chunks(model: str, stream, thinking: bool = False) -> Iterable[str]:
     """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
 
     `stream` is the client's stream object; after it's consumed we read its
-    `.conversation_id` and attach it to the final chunk.
+    `.conversation_id` and attach it to the final chunk. When `thinking` is on and
+    the client exposes typed events, reasoning is streamed as a non-standard
+    `delta.reasoning_content` field (the same field DeepSeek's API uses).
     """
     cid, created = _id(), _now()
 
@@ -112,9 +118,24 @@ def stream_chunks(model: str, stream: Iterable[str]) -> Iterable[str]:
 
     # First frame announces the assistant role.
     yield frame({"role": "assistant", "content": ""})
-    for d in stream:
-        if d:
-            yield frame({"content": d})
+    iter_events = getattr(stream, "iter_events", None)
+    if callable(iter_events):
+        for kind, text in iter_events():
+            if not text:
+                continue
+            if kind == "reasoning":
+                if thinking:
+                    yield frame({"reasoning_content": text})
+            else:
+                yield frame({"content": text})
+    else:
+        for d in stream:
+            if d:
+                yield frame({"content": d})
     conversation_id = getattr(stream, "conversation_id", None)
-    yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
+    extra = {"conversation_id": conversation_id}
+    reasoning = getattr(stream, "reasoning", None)
+    if thinking and reasoning:
+        extra["reasoning_content"] = reasoning
+    yield frame({}, finish="stop", extra=extra)
     yield "data: [DONE]\n\n"

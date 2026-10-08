@@ -22,6 +22,7 @@ session (see `deepseek.auth`). For each message it:
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass
 from typing import Iterator, Optional
@@ -65,6 +66,7 @@ class Reply:
 
     text: str
     conversation_id: str
+    reasoning: str = ""
 
     def __str__(self) -> str:  # so print(reply) shows the text
         return self.text
@@ -180,7 +182,7 @@ class DeepSeekClient:
         s = self.stream(prompt, conversation_id=conversation_id,
                         model=model, thinking=thinking, search=search)
         text = "".join(s)
-        return Reply(text=text, conversation_id=s.conversation_id)
+        return Reply(text=text, conversation_id=s.conversation_id, reasoning=s.reasoning)
 
     def close(self) -> None:
         self._http.close()
@@ -201,8 +203,13 @@ class _Stream:
         self._thinking = thinking
         self._search = search
         self._message_id: Optional[int] = None
+        self._reasoning = ""
 
-    def __iter__(self) -> Iterator[str]:
+    def _request_headers(self) -> dict:
+        # PoW challenges are short-lived, so solve right before the request.
+        return {"x-ds-pow-response": self._client._pow_header()}
+
+    def _body(self) -> dict:
         body = {
             "chat_session_id": self._session_id,
             "parent_message_id": self._parent_id,
@@ -216,37 +223,84 @@ class _Stream:
         # Only select a model on a new thread; on resume the thread keeps its own.
         if self._model is not None:
             body["model_type"] = self._model
-        # PoW challenges are short-lived, so solve right before the request.
-        headers = {"x-ds-pow-response": self._client._pow_header()}
+        return body
+
+    def iter_events(self) -> Iterator[tuple]:
+        """Yield ``("response"|"reasoning", text)`` tuples for the whole stream."""
+        headers = self._request_headers()
         meta: dict = {}
         with self._client._http.stream(
-            "POST", COMPLETION_PATH, json=body, headers=headers
+            "POST", COMPLETION_PATH, json=self._body(), headers=headers
         ) as resp:
             resp.raise_for_status()
-            yield from _parse_sse(resp.iter_lines(), meta)
+            for kind, text in _iter_sse_events(resp.iter_lines(), meta):
+                if kind == "reasoning":
+                    self._reasoning += text
+                yield kind, text
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
+
+    def __iter__(self) -> Iterator[str]:
+        for kind, text in self.iter_events():
+            if kind == "response":
+                yield text
+
+    @property
+    def reasoning(self) -> str:
+        return self._reasoning
 
     @property
     def conversation_id(self) -> str:
         return _encode_cid(self._session_id, self._message_id)
 
 
-def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[str]:
-    """Turn DeepSeek's SSE completion stream into reply-text deltas.
+def _is_reasoning_type(ftype) -> bool:
+    """DeepSeek labels DeepThink fragments 'THINK' (older builds: 'THINKING')."""
+    if not ftype:
+        return False
+    ftype = str(ftype).upper()
+    return "THINK" in ftype or "REASON" in ftype
 
-    The stream sends an initial snapshot frame whose `v` is the full response
-    object (with `fragments[].content`), then a series of append frames:
-      * {"p":"response/fragments/-1/content","o":"APPEND","v":" what"}  (sets path)
-      * {"v":"'s"}                                                       (appends to it)
-    We track the active append path and emit only RESPONSE-fragment text.
 
-    If `meta` is given, the assistant's `message_id` is recorded into it (used to
-    build the resumable conversation_id). The exact field location can vary, so
-    we look in a few plausible spots defensively.
+def _idx_of(path: str, active_idx: Optional[int], count: int) -> int:
+    """Resolve a `.../fragments/<i>/...` path to a concrete fragment index."""
+    m = re.search(r"fragments/(-?\d+)/", path)
+    if m:
+        i = int(m.group(1))
+        if i >= 0:
+            return i
+    if active_idx is not None:
+        return active_idx
+    return max(0, count - 1)
+
+
+def _iter_sse_events(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
+    """Turn DeepSeek's SSE completion stream into typed events.
+
+    Yields ``("response", text)`` for the answer and ``("reasoning", text)`` for
+    DeepThink reasoning fragments. DeepSeek streams a snapshot frame (the full
+    response object with typed `fragments`), then path-based APPEND frames for
+    each fragment's content, and finally appends any NEW fragments — including
+    the answer — as a list under `response/fragments`.
+
+    We keep per-fragment accumulated content and emit only the newly-arrived
+    suffix, so reasoning and the answer are separated without duplication.
+
+    If `meta` is given, the assistant's `message_id` is recorded into it.
     """
-    active_path: Optional[str] = None
-    emitted_initial = False
+    frag_types: dict = {}
+    frag_content: dict = {}
+    emitted: dict = {}
+    active_idx: Optional[int] = None
+
+    def emit(idx: int) -> Iterator[tuple]:
+        full = frag_content.get(idx, "")
+        prev = emitted.get(idx, 0)
+        if len(full) <= prev:
+            return
+        emitted[idx] = len(full)
+        kind = "reasoning" if _is_reasoning_type(frag_types.get(idx)) else "response"
+        yield (kind, full[prev:])
 
     for line in lines:
         if not line or not line.startswith("data:"):
@@ -261,32 +315,62 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[str]:
 
         v = obj.get("v")
 
-        # Snapshot frame: full response object.
+        # Snapshot frame: the full response object with typed fragments.
         if isinstance(v, dict) and "response" in v:
             if meta is not None:
                 _capture_message_id(meta, v)
-            for frag in v["response"].get("fragments", []):
-                if frag.get("type") == "RESPONSE" and frag.get("content"):
-                    active_path = "response/fragments/-1/content"
-                    if not emitted_initial:
-                        emitted_initial = True
-                        yield frag["content"]
+            frag_types.clear()
+            frag_content.clear()
+            emitted.clear()
+            frags = v["response"].get("fragments", [])
+            for i, frag in enumerate(frags):
+                frag_types[i] = frag.get("type")
+                frag_content[i] = frag.get("content") or ""
+            active_idx = len(frags) - 1 if frags else None
+            for i in range(len(frags)):
+                yield from emit(i)
             continue
 
-        # Path-setting append frame.
-        if "p" in obj:
-            active_path = obj["p"]
-            if meta is not None and active_path.endswith("message_id") \
-                    and isinstance(v, int):
-                meta["message_id"] = v
-            if obj.get("o") == "APPEND" and isinstance(v, str) \
-                    and active_path.endswith("content"):
-                yield v
+        if "p" not in obj:
+            # Bare append to the currently active fragment's content.
+            if isinstance(v, str) and active_idx is not None:
+                frag_content[active_idx] = frag_content.get(active_idx, "") + v
+                yield from emit(active_idx)
             continue
 
-        # Bare append to the current path.
-        if isinstance(v, str) and active_path and active_path.endswith("content"):
-            yield v
+        path = obj["p"]
+        if meta is not None and path.endswith("message_id") and isinstance(v, int):
+            meta["message_id"] = v
+
+        if path.endswith("content") and isinstance(v, str):
+            idx = _idx_of(path, active_idx, len(frag_types))
+            if obj.get("o") == "APPEND":
+                frag_content[idx] = frag_content.get(idx, "") + v
+            else:
+                frag_content[idx] = v
+            active_idx = idx
+            frag_types.setdefault(idx, "RESPONSE")
+            yield from emit(idx)
+        elif path.endswith("fragments") and isinstance(v, list):
+            # A list of newly-appended fragments (the answer arrives this way).
+            for frag in v:
+                idx = len(frag_types)
+                frag_types[idx] = frag.get("type")
+                frag_content[idx] = frag.get("content") or ""
+                emitted[idx] = 0
+                active_idx = idx
+                yield from emit(idx)
+
+
+def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[str]:
+    """Backwards-compatible view: yield only the response-text deltas.
+
+    (Reasoning fragments are dropped here; use `_iter_sse_events` for typed
+    events. `meta` is still populated with the message id.)
+    """
+    for kind, text in _iter_sse_events(lines, meta):
+        if kind == "response":
+            yield text
 
 
 def _capture_message_id(meta: dict, snapshot: dict) -> None:

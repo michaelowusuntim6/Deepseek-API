@@ -7,3 +7,8 @@ pydantic>=2.7           # request/response models
 python-dotenv>=1.0      # load credentials from .env
 wasmtime>=21.0          # runs DeepSeek's PoW WASM module (deepseek/pow.py)
 openai
+
+# --- mike.py harness (see mike.py / README) ---
+rich>=13.7              # terminal rendering: tables, panels, dimmed thinking
+tiktoken>=0.7           # token estimation for context compaction
+pytest>=8.0             # test suite (tests/test_mike.py)

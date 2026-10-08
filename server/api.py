@@ -33,9 +33,13 @@ from deepseek.auth import LoginRequired
 from deepseek.client import DeepSeekClient
 
 from .config import (
+    MODEL_ALIASES,
+    MODEL_DISPLAY_NAME,
+    MODEL_ID,
     MODEL_MAP,
     RATE_LIMIT_PER_MINUTE,
     SERVER_INTERACTIVE_LOGIN,
+    canonicalize,
     is_known_model,
     resolve_model_type,
 )
@@ -45,7 +49,7 @@ from .schemas import ChatCompletionRequest
 
 load_dotenv()
 
-app = FastAPI(title="DeepSeek OpenAI-compatible API", version="0.1.0")
+app = FastAPI(title="DeepSeek OpenAI-compatible API", version="1.0.0")
 install_rate_limit(app, RateLimiter(limit=RATE_LIMIT_PER_MINUTE, window=60.0))
 
 # One shared client (and its signed-in session) built lazily on first use.
@@ -91,8 +95,15 @@ def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": name, "object": "model", "created": created, "owned_by": "deepseek"}
-            for name in MODEL_MAP
+            {
+                "id": MODEL_ID,
+                "object": "model",
+                "created": created,
+                "owned_by": "deepseek",
+                "name": MODEL_DISPLAY_NAME,
+                # Non-standard extension: every id we accept and rewrite to `id`.
+                "aliases": list(MODEL_ALIASES),
+            }
         ],
     }
 
@@ -104,14 +115,19 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if not is_known_model(req.model):
         return _error(
-            f"The model `{req.model}` does not exist. Available models: "
-            f"{', '.join(MODEL_MAP)}",
+            f"The model `{req.model}` does not exist. The only available model is "
+            f"`{MODEL_ID}` ({MODEL_DISPLAY_NAME}); accepted aliases: "
+            f"{', '.join(MODEL_ALIASES)}",
             status=404, err_type="model_not_found",
         )
 
+    # Compatibility shim: rewrite any legacy id to the canonical one. Logged once
+    # per alias per process (see server.config.canonicalize).
+    canonical_id, _rewritten = canonicalize(req.model)
+
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
-    model_type = None if req.conversation_id else resolve_model_type(req.model)
+    model_type = None if req.conversation_id else resolve_model_type(canonical_id)
     prompt = messages_to_prompt(req.messages)
 
     try:
@@ -129,7 +145,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 prompt, conversation_id=req.conversation_id,
                 model=model_type, thinking=req.thinking, search=req.search,
             )
-            yield from stream_chunks(req.model, stream)
+            yield from stream_chunks(canonical_id, stream, thinking=req.thinking)
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -141,4 +157,7 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
-    return completion_response(req.model, reply.text, prompt, reply.conversation_id)
+    return completion_response(
+        canonical_id, reply.text, prompt, reply.conversation_id,
+        reasoning=getattr(reply, "reasoning", None) if req.thinking else None,
+    )

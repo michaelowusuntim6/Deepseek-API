@@ -1,0 +1,2273 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mike - a self-contained, zero-cost DeepSeek coding harness.
+
+`mike.py` is a single file that:
+
+  * launches (or attaches to) the local DeepSeek-API server on 127.0.0.1,
+  * talks to it over the OpenAI-compatible ``/v1`` endpoints,
+  * and runs an interactive coding-agent CLI with tools, thinking-block
+    handling, inline compaction, resumable JSON sessions and auto-rollover.
+
+It surfaces exactly ONE model to the user - ``DeepSeek V4.1 Flash``
+(wire id ``deepseek-v4.1-flash``) - no matter what the backend advertises.
+Every legacy model name is accepted and routed to that single model.
+
+Everything mike needs (agent loop, tool registry, compactor, session manager,
+thinking parser, tool-call parser, server supervisor) lives in this file. It has
+no runtime dependency on ``~/nanocode`` or ``~/cipher-harness``.
+
+--------------------------------------------------------------------------------
+Licence / provenance (original headers preserved)
+
+  * mike.py is derived from ``nanocode.py`` - released under the MIT License.
+  * Tool logic and the compaction approach are ported from ``cipher-harness``
+    (compact.py, tools/*) - released under the MIT License.
+  * The surrounding DeepSeek-API project is MIT, Copyright (c) 2026 !(Not Sumit).
+
+  Runtime dependencies that are *not* in the standard library are declared in
+  ``requirements.txt`` (rich, openai/httpx, tiktoken - all optional at import
+  time with graceful fallbacks).
+--------------------------------------------------------------------------------
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import datetime as _dt
+import glob as _globlib
+import html as _html
+import json
+import os
+import re
+import select as _select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import uuid
+from collections import OrderedDict, deque
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Optional
+
+__version__ = "1.0.0"
+
+# --------------------------------------------------------------------------- #
+# 0. Optional third-party imports (graceful fallbacks keep mike runnable)      #
+# --------------------------------------------------------------------------- #
+
+try:  # pragma: no cover - exercised only when rich is installed
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    _RICH = True
+except Exception:  # pragma: no cover
+    _RICH = False
+
+
+def _make_console():  # pragma: no cover - trivial
+    if _RICH:
+        return Console()
+    return _PlainConsole()
+
+
+class _PlainConsole:
+    """A tiny rich.Console stand-in used when rich is unavailable."""
+
+    def print(self, *args, **kwargs):
+        text = " ".join(str(a) for a in args)
+        end = kwargs.get("end", "\n")
+        print(text, end=end)
+
+    def rule(self, title=""):
+        print(f"--- {title} " + "-" * max(0, 60 - len(title)))
+
+
+# --------------------------------------------------------------------------- #
+# 1. Configuration                                                            #
+# --------------------------------------------------------------------------- #
+
+ROOT = Path(__file__).resolve().parent
+SESSIONS_DIR = ROOT / "sessions"
+STATE_FILE = ROOT / ".mike_state.json"
+
+# --- The single surfaced model -------------------------------------------------
+MODEL_ID = "deepseek-v4.1-flash"          # wire id sent to the server
+MODEL_LABEL = "DeepSeek V4.1 Flash"       # human label shown everywhere
+
+# Every one of these is accepted and transparently routed to MODEL_ID. The
+# harness must never surface more than one model and must never warn beyond a
+# single info line at startup.
+MODEL_ALIASES = [
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "deepseek-v3",
+    "deepseek-v4",
+    "deepseek-v4.1-flash",
+    "deepseek-flash",
+    "deepseek-web",
+    "default",
+]
+
+# --- Context / compaction ------------------------------------------------------
+DEFAULT_MAX_CONTEXT_TOKENS = 500_000
+try:
+    MAX_CONTEXT_TOKENS = int(os.getenv("MIKE_MAX_CONTEXT", str(DEFAULT_MAX_CONTEXT_TOKENS)))
+except ValueError:
+    MAX_CONTEXT_TOKENS = DEFAULT_MAX_CONTEXT_TOKENS
+COMPACT_THRESHOLD = 0.80
+COMPACT_AT_TOKENS = int(MAX_CONTEXT_TOKENS * COMPACT_THRESHOLD)   # 400_000 by default
+KEEP_RECENT_TURNS = 6
+
+# --- Server --------------------------------------------------------------------
+DEFAULT_HOST = os.getenv("HOST", "127.0.0.1")
+DEFAULT_PORT = int(os.getenv("MIKE_PORT", os.getenv("PORT", "8000")))
+API_KEY = os.getenv("MIKE_API_KEY", "sk-local")
+STARTUP_TIMEOUT = 30.0
+
+SUMMARY_SECTIONS = [
+    "## Goal",
+    "## Constraints",
+    "## Files Touched",
+    "## Decisions Made",
+    "## Open Todos",
+    "## Last User Intent",
+    "## Next Steps",
+]
+
+
+# --------------------------------------------------------------------------- #
+# 2. Model alias routing                                                       #
+# --------------------------------------------------------------------------- #
+
+def resolve_model(name: Optional[str]) -> str:
+    """Route *any* model name to the single surfaced backend model.
+
+    mike only has one model. Aliases are accepted for compatibility; everything -
+    including unknown names - resolves to ``MODEL_ID`` so a stale config can
+    never turn into a hard error.
+    """
+    return MODEL_ID
+
+
+# --------------------------------------------------------------------------- #
+# 3. State file (.mike_state.json) with estimator choice + tool-mode cache     #
+# --------------------------------------------------------------------------- #
+
+def load_state() -> dict:
+    try:
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_state(state: dict) -> None:
+    try:
+        atomic_write_json(STATE_FILE, state)
+    except Exception:
+        pass
+
+
+def atomic_write_json(path: Path, obj: Any) -> None:
+    """Write JSON pretty-printed with sorted keys, atomically.
+
+    We never hand a partially-written file to the user: write to a temp file in
+    the same directory, fsync, then ``os.replace`` (atomic on POSIX). This is
+    what keeps a crash from corrupting an on-disk session.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
+    data = json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False)
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------- #
+# 4. Token estimation (tiktoken if available, else len//4)                     #
+# --------------------------------------------------------------------------- #
+
+class TokenCounter:
+    """Deterministic token estimator with a persisted implementation choice."""
+
+    def __init__(self, name: str, encoder: Any = None):
+        self.name = name
+        self._enc = encoder
+
+    @classmethod
+    def create(cls) -> "TokenCounter":
+        try:
+            import tiktoken  # type: ignore
+
+            enc = tiktoken.get_encoding("cl100k_base")
+            enc.encode("hello world")  # sanity check before committing to it
+            return cls("tiktoken", enc)
+        except Exception:
+            return cls("heuristic", None)
+
+    def count(self, text: str) -> int:
+        if not text:
+            return 0
+        if self._enc is not None:
+            try:
+                return len(self._enc.encode(text))
+            except Exception:
+                pass
+        return max(1, len(text) // 4)
+
+    def count_messages(self, messages: Iterable[dict]) -> int:
+        total = 0
+        for msg in messages:
+            total += 4  # per-message framing overhead
+            total += self._count_content(msg.get("content", ""))
+            reasoning = msg.get("reasoning")
+            if reasoning:
+                total += self.count(str(reasoning))
+            for call in msg.get("tool_calls", []) or []:
+                total += self.count(json.dumps(call, ensure_ascii=False))
+        return total
+
+    def _count_content(self, content: Any) -> int:
+        if content is None:
+            return 0
+        if isinstance(content, str):
+            return self.count(content)
+        if isinstance(content, list):
+            total = 0
+            for block in content:
+                if isinstance(block, dict):
+                    total += self.count(str(block.get("text") or block.get("content") or ""))
+                else:
+                    total += self.count(str(block))
+            return total
+        return self.count(str(content))
+
+
+# --------------------------------------------------------------------------- #
+# 5. Thinking-block + tool-call stream parsing                                 #
+# --------------------------------------------------------------------------- #
+
+# Matches both XML-ish tags (<think>, <thinking>, <reasoning>, <tool_call>) and
+# DeepSeek's full-width special tokens (<｜begin▁of▁thinking｜> /
+# <｜end▁of▁thinking｜>), tolerating stray whitespace.
+_TAG_RE = re.compile(
+    r"<｜(?:begin|end)▁of▁(?:thinking|reasoning)｜>"
+    r"|<\s*/?\s*(?:think|thinking|reasoning|tool_call)\s*>",
+    re.IGNORECASE,
+)
+_REASONING_TAGS = {"think", "thinking", "reasoning"}
+
+
+def _tag_name(raw_tag: str) -> tuple[str, bool]:
+    raw = raw_tag.strip()
+    low = raw.lower()
+    if "▁of▁" in raw:  # DeepSeek special token, e.g. <｜end▁of▁thinking｜>
+        closing = "end▁of▁" in low
+        if "thinking" in low:
+            return "thinking", closing
+        if "reasoning" in low:
+            return "reasoning", closing
+        return "think", closing
+    closing = raw.startswith("</")
+    name = re.sub(r"[<>/\s]", "", raw).lower()
+    return name, closing
+
+
+def extract_thinking(text: str) -> tuple[str, str]:
+    """Split *text* into (reasoning, clean_content).
+
+    Understands ``< -think->...`` style blocks, ``<thinking>...</thinking>`` and
+    ``<reasoning>...</reasoning>``. Any ``<tool_call>...</tool_call>`` blocks are
+    stripped from the clean content as well.
+    """
+    if not text:
+        return "", ""
+    reasoning_parts: list[str] = []
+    out: list[str] = []
+    mode = "content"
+    pos = 0
+    for m in _TAG_RE.finditer(text):
+        chunk = text[pos:m.start()]
+        if chunk:
+            if mode == "reasoning":
+                reasoning_parts.append(chunk)
+            elif mode != "hidden":
+                out.append(chunk)
+        pos = m.end()
+        name, closing = _tag_name(m.group(0))
+        if name in _REASONING_TAGS:
+            mode = "content" if closing else "reasoning"
+        elif name == "tool_call":
+            mode = "content" if closing else "hidden"
+    tail = text[pos:]
+    if tail:
+        if mode == "reasoning":
+            reasoning_parts.append(tail)
+        elif mode != "hidden":
+            out.append(tail)
+    return "".join(reasoning_parts).strip(), "".join(out).strip()
+
+
+def strip_thinking(text: str) -> str:
+    """Return assistant content with reasoning and tool_call blocks removed."""
+    return extract_thinking(text)[1]
+
+
+class StreamParser:
+    """Incremental parser for streamed deltas.
+
+    Classifies incoming text as ``content``, ``reasoning`` or hidden (inside a
+    ``<tool_call>`` block), holding back a small tail so a tag split across two
+    chunks is not leaked to the screen.
+    """
+
+    MAX_TAG_LEN = 32
+
+    def __init__(self):
+        self._buf = ""
+        self._mode = "content"
+        self.reasoning = ""
+        self.content = ""
+        self.raw = ""
+
+    def feed(self, chunk: str) -> list[tuple[str, str]]:
+        if not chunk:
+            return []
+        self.raw += chunk
+        self._buf += chunk
+        emitted: list[tuple[str, str]] = []
+        while True:
+            m = _TAG_RE.search(self._buf)
+            if m is None:
+                safe = self._safe_split()
+                if safe:
+                    emitted.append(self._emit(self._buf[:safe]))
+                    self._buf = self._buf[safe:]
+                break
+            if m.start() > 0:
+                emitted.append(self._emit(self._buf[:m.start()]))
+            name, closing = _tag_name(m.group(0))
+            if name in _REASONING_TAGS:
+                self._mode = "content" if closing else "reasoning"
+            elif name == "tool_call":
+                self._mode = "content" if closing else "hidden"
+            self._buf = self._buf[m.end():]
+        return [e for e in emitted if e[1]]
+
+    def _emit(self, text: str) -> tuple[str, str]:
+        if self._mode == "reasoning":
+            self.reasoning += text
+            return ("reasoning", text)
+        if self._mode == "hidden":
+            return ("hidden", "")
+        self.content += text
+        return ("content", text)
+
+    def _safe_split(self) -> int:
+        """Length of the buffer that is safe to emit (excludes a partial tag)."""
+        idx = self._buf.rfind("<")
+        if idx == -1:
+            return len(self._buf)
+        if ">" in self._buf[idx:]:
+            return len(self._buf)
+        if len(self._buf) - idx <= self.MAX_TAG_LEN:
+            return idx
+        return len(self._buf)
+
+    def finish(self) -> list[tuple[str, str]]:
+        if not self._buf:
+            return []
+        out = [self._emit(self._buf)]
+        self._buf = ""
+        return [e for e in out if e[1]]
+
+
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def parse_tool_calls(text: str) -> tuple[list[dict], str]:
+    """Parse ``<tool_call>`` envelopes out of an assistant message.
+
+    Returns ``(calls, clean_text)`` where each call is
+    ``{"name": str, "arguments": dict}``. Text outside the blocks is the
+    assistant's natural-language reply. Malformed JSON inside a block is ignored
+    (the block is still removed from the reply) rather than raising.
+    """
+    if not text:
+        return [], ""
+
+    calls: list[dict] = []
+    for raw in _TOOL_CALL_BLOCK_RE.findall(text):
+        parsed = _loads_tool_obj(raw)
+        if parsed is not None:
+            calls.append(parsed)
+
+    clean = _TOOL_CALL_BLOCK_RE.sub("", text)
+
+    # Fallback: some models wrap the envelope in a ```json fence without the
+    # <tool_call> tags. Only accept a fenced object that clearly names a tool.
+    if not calls:
+        for raw in _FENCED_JSON_RE.findall(clean):
+            parsed = _loads_tool_obj(raw)
+            if parsed is not None and parsed.get("name"):
+                calls.append(parsed)
+                clean = clean.replace(raw, "")
+                clean = re.sub(r"```(?:json)?\s*```", "", clean)
+
+    return calls, clean.strip()
+
+
+def _loads_tool_obj(raw: str) -> Optional[dict]:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name") or (obj.get("function") or {}).get("name")
+    if not name:
+        return None
+    if "arguments" in obj:
+        args = obj.get("arguments")
+    else:
+        args = obj.get("parameters", obj.get("input", {}))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    return {"name": str(name), "arguments": args}
+
+
+# --------------------------------------------------------------------------- #
+# 6. Tool registry (ported from nanocode + cipher-harness)                     #
+# --------------------------------------------------------------------------- #
+
+class ToolSpec:
+    def __init__(self, name: str, description: str, parameters: dict,
+                 fn: Callable[[dict, "Toolbox"], str],
+                 read_only: bool = True, concurrency_safe: bool = True,
+                 destructive: bool = False):
+        self.name = name
+        self.description = description
+        self.parameters = parameters
+        self.fn = fn
+        self.read_only = read_only
+        self.concurrency_safe = concurrency_safe
+        self.destructive = destructive
+
+    def openai_tool(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
+
+
+def _schema(props: dict, required: list) -> dict:
+    return {"type": "object", "properties": props, "required": required}
+
+
+class Toolbox:
+    """The set of tools mike exposes, plus the dispatcher."""
+
+    BLOCKED_BASH = [
+        "rm -rf /",
+        ":(){ :|:& };:",
+        "mkfs",
+        "dd if=/dev/zero",
+        "chmod -R 777 /",
+        "> /dev/sda",
+    ]
+
+    def __init__(self, cwd: str):
+        self.cwd = cwd
+        self.todos_path = os.path.join(cwd, ".mike", "todos.json")
+        self.specs: "OrderedDict[str, ToolSpec]" = OrderedDict()
+        self._register()
+
+    # -- registry ---------------------------------------------------------
+
+    def _register(self) -> None:
+        self._add(ToolSpec(
+            "read_file",
+            "Read a file from disk. Returns numbered lines; use offset/limit for large files.",
+            _schema({
+                "path": {"type": "string", "description": "Absolute or relative file path"},
+                "offset": {"type": "integer", "description": "1-indexed first line (default 1)"},
+                "limit": {"type": "integer", "description": "Max number of lines"},
+            }, ["path"]),
+            self._read_file, read_only=True, concurrency_safe=True,
+        ))
+        self._add(ToolSpec(
+            "write_file",
+            "Create a file or overwrite it with new content. Prefer edit_file for small changes.",
+            _schema({
+                "path": {"type": "string", "description": "File path to write"},
+                "content": {"type": "string", "description": "Full file content"},
+            }, ["path", "content"]),
+            self._write_file, read_only=False, concurrency_safe=False, destructive=True,
+        ))
+        self._add(ToolSpec(
+            "edit_file",
+            "Replace an exact string in a file. Fails if old_string is missing or ambiguous unless replace_all=true.",
+            _schema({
+                "path": {"type": "string"},
+                "old_string": {"type": "string", "description": "Exact text to find"},
+                "new_string": {"type": "string", "description": "Replacement text"},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"},
+            }, ["path", "old_string", "new_string"]),
+            self._edit_file, read_only=False, concurrency_safe=False, destructive=False,
+        ))
+        self._add(ToolSpec(
+            "list_dir",
+            "List the entries of a directory (directories suffixed with '/').",
+            _schema({
+                "path": {"type": "string", "description": "Directory (default: current working dir)"},
+            }, []),
+            self._list_dir, read_only=True, concurrency_safe=True,
+        ))
+        self._add(ToolSpec(
+            "glob",
+            "Find files matching a glob pattern, newest first. Example: '**/*.py'.",
+            _schema({
+                "pattern": {"type": "string", "description": "Glob pattern"},
+                "path": {"type": "string", "description": "Base directory (default '.')"},
+            }, ["pattern"]),
+            self._glob, read_only=True, concurrency_safe=True,
+        ))
+        self._add(ToolSpec(
+            "grep",
+            "Search file contents for a regex. Uses ripgrep when available, else a Python walk.",
+            _schema({
+                "pattern": {"type": "string"},
+                "path": {"type": "string", "description": "File or directory (default '.')"},
+                "glob": {"type": "string", "description": "Only search files matching this glob"},
+                "case_insensitive": {"type": "boolean"},
+                "context": {"type": "integer", "description": "Lines of context"},
+            }, ["pattern"]),
+            self._grep, read_only=True, concurrency_safe=True,
+        ))
+        self._add(ToolSpec(
+            "bash",
+            "Run a shell command in the working directory and return its combined output.",
+            _schema({
+                "command": {"type": "string"},
+                "timeout": {"type": "integer", "description": "Seconds (default 120)"},
+            }, ["command"]),
+            self._bash, read_only=False, concurrency_safe=False, destructive=True,
+        ))
+        self._add(ToolSpec(
+            "python",
+            "Execute a Python snippet with the current interpreter and return its output.",
+            _schema({
+                "code": {"type": "string", "description": "Python source to execute"},
+                "timeout": {"type": "integer"},
+            }, ["code"]),
+            self._python, read_only=False, concurrency_safe=False, destructive=True,
+        ))
+        self._add(ToolSpec(
+            "web_fetch",
+            "Fetch a URL and return its readable text (scripts/styles stripped).",
+            _schema({
+                "url": {"type": "string"},
+                "selector": {"type": "string", "description": "Optional CSS selector"},
+                "max_chars": {"type": "integer", "description": "Truncate output (default 8000)"},
+            }, ["url"]),
+            self._web_fetch, read_only=True, concurrency_safe=True,
+        ))
+        self._add(ToolSpec(
+            "todo_write",
+            "Create/replace the project TODO list. Pass the complete list of task strings.",
+            _schema({
+                "todos": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "The full todo list, oldest first",
+                },
+            }, ["todos"]),
+            self._todo_write, read_only=False, concurrency_safe=False,
+        ))
+        self._add(ToolSpec(
+            "todo_read",
+            "Read the current project TODO list.",
+            _schema({}, []),
+            self._todo_read, read_only=True, concurrency_safe=True,
+        ))
+
+    def _add(self, spec: ToolSpec) -> None:
+        self.specs[spec.name] = spec
+
+    # -- dispatch ---------------------------------------------------------
+
+    def call(self, name: str, args: dict) -> str:
+        spec = self.specs.get(name)
+        if spec is None:
+            return f"error: unknown tool '{name}'"
+        if not isinstance(args, dict):
+            args = {}
+        try:
+            return spec.fn(args, self)
+        except Exception as exc:  # never let a tool crash the loop
+            return f"error: {type(exc).__name__}: {exc}"
+
+    def openai_tools(self) -> list:
+        return [s.openai_tool() for s in self.specs.values()]
+
+    # -- implementations --------------------------------------------------
+
+    def _resolve(self, path: str) -> str:
+        path = os.path.expanduser(str(path))
+        if not os.path.isabs(path):
+            path = os.path.join(self.cwd, path)
+        return os.path.normpath(path)
+
+    def _read_file(self, args: dict, ctx: "Toolbox") -> str:
+        path = self._resolve(args["path"])
+        if not os.path.exists(path):
+            return f"error: file not found: {path}"
+        if not os.path.isfile(path):
+            return f"error: not a file: {path}"
+        with open(path, "r", errors="replace") as fh:
+            lines = fh.readlines()
+        offset = int(args.get("offset", 1) or 1)
+        limit = args.get("limit")
+        start = max(0, offset - 1)
+        end = start + int(limit) if limit else len(lines)
+        selected = lines[start:end]
+        if not selected:
+            return "(empty)"
+        return "".join(f"{start + i + 1:>5}\t{ln}" for i, ln in enumerate(selected)).rstrip("\n")
+
+    def _write_file(self, args: dict, ctx: "Toolbox") -> str:
+        path = self._resolve(args["path"])
+        content = str(args.get("content", ""))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+        return f"wrote {lines} line(s) to {path}"
+
+    def _edit_file(self, args: dict, ctx: "Toolbox") -> str:
+        path = self._resolve(args["path"])
+        if not os.path.isfile(path):
+            return f"error: file not found: {path}"
+        old = str(args.get("old_string", ""))
+        new = str(args.get("new_string", ""))
+        replace_all = bool(args.get("replace_all", False))
+        with open(path, "r", errors="replace") as fh:
+            original = fh.read()
+        count = original.count(old)
+        if count == 0:
+            return f"error: old_string not found in {path}"
+        if count > 1 and not replace_all:
+            return (f"error: old_string appears {count} times in {path}; "
+                    "add context to make it unique or pass replace_all=true")
+        updated = original.replace(old, new) if replace_all else original.replace(old, new, 1)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(updated)
+        n = count if replace_all else 1
+        return f"edited {path} ({n} replacement{'s' if n != 1 else ''})"
+
+    def _list_dir(self, args: dict, ctx: "Toolbox") -> str:
+        path = self._resolve(args.get("path", "."))
+        if not os.path.isdir(path):
+            return f"error: not a directory: {path}"
+        entries = []
+        with os.scandir(path) as it:
+            for e in sorted(it, key=lambda x: (not x.is_dir(), x.name.lower())):
+                entries.append(e.name + ("/" if e.is_dir() else ""))
+        return "\n".join(entries) if entries else "(empty directory)"
+
+    def _glob(self, args: dict, ctx: "Toolbox") -> str:
+        pattern = str(args["pattern"])
+        base = self._resolve(args.get("path", "."))
+        matches = _globlib.glob(os.path.join(base, pattern), recursive=True)
+        matches = [m for m in matches if os.path.isfile(m)]
+        matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        if not matches:
+            return "no files matched"
+        return "\n".join(matches[:200])
+
+    def _grep(self, args: dict, ctx: "Toolbox") -> str:
+        pattern = str(args["pattern"])
+        path = self._resolve(args.get("path", "."))
+        glob_filter = args.get("glob")
+        ci = bool(args.get("case_insensitive"))
+        context_lines = int(args.get("context", 0) or 0)
+
+        if shutil.which("rg"):
+            cmd = ["rg", "--line-number", "--no-heading", "--color", "never"]
+            if ci:
+                cmd.append("-i")
+            if context_lines:
+                cmd += ["-C", str(context_lines)]
+            if glob_filter:
+                cmd += ["-g", str(glob_filter)]
+            cmd += [pattern, path]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if proc.returncode == 1:
+                return "no matches"
+            out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+            lines = out.splitlines()
+            if len(lines) > 200:
+                out = "\n".join(lines[:200]) + f"\n... ({len(lines)} matches total)"
+            return out or "no matches"
+
+        try:
+            rx = re.compile(pattern, re.IGNORECASE if ci else 0)
+        except re.error as exc:
+            return f"error: bad regex: {exc}"
+        hits: list[str] = []
+        for dirpath, _dirs, files in os.walk(path):
+            for fn in files:
+                if glob_filter and not _globlib.fnmatch.fnmatch(fn, glob_filter):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    with open(fp, "r", errors="ignore") as fh:
+                        for i, line in enumerate(fh, 1):
+                            if rx.search(line):
+                                hits.append(f"{fp}:{i}:{line.rstrip()}")
+                                if len(hits) >= 200:
+                                    break
+                except Exception:
+                    continue
+                if len(hits) >= 200:
+                    break
+        return "\n".join(hits) if hits else "no matches"
+
+    def _bash(self, args: dict, ctx: "Toolbox") -> str:
+        cmd = str(args["command"])
+        timeout = int(args.get("timeout", 120) or 120)
+        for blocked in self.BLOCKED_BASH:
+            if blocked in cmd:
+                return f"error: refused - blocked dangerous pattern {blocked!r}"
+        try:
+            proc = subprocess.run(cmd, shell=True, cwd=self.cwd,
+                                  capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return f"error: command timed out after {timeout}s"
+        out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if proc.returncode != 0:
+            return f"(exit {proc.returncode})\n{out}" if out else f"(exit {proc.returncode})"
+        return out or "(no output)"
+
+    def _python(self, args: dict, ctx: "Toolbox") -> str:
+        code = str(args["code"])
+        timeout = int(args.get("timeout", 120) or 120)
+        try:
+            proc = subprocess.run([sys.executable, "-c", code], cwd=self.cwd,
+                                  capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return f"error: timed out after {timeout}s"
+        out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if proc.returncode != 0:
+            return f"(exit {proc.returncode})\n{out}" if out else f"(exit {proc.returncode})"
+        return out or "(no output)"
+
+    def _web_fetch(self, args: dict, ctx: "Toolbox") -> str:
+        url = str(args["url"])
+        selector = args.get("selector")
+        max_chars = int(args.get("max_chars", 8000) or 8000)
+        try:
+            import httpx
+        except Exception:
+            return "error: httpx is not installed"
+        try:
+            resp = httpx.get(url, timeout=20, follow_redirects=True, headers={
+                "User-Agent": "mike/1.0 (+local coding harness)",
+            })
+            resp.raise_for_status()
+            body = resp.text
+        except Exception as exc:
+            return f"error: fetch failed: {exc}"
+        text = _html_to_text(body, selector)
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n... (truncated at {max_chars} chars)"
+        return text or "(no readable text)"
+
+    def _load_todos(self) -> list:
+        try:
+            with open(self.todos_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_todos(self, todos: list) -> None:
+        os.makedirs(os.path.dirname(self.todos_path), exist_ok=True)
+        atomic_write_json(Path(self.todos_path), todos)
+
+    def _todo_write(self, args: dict, ctx: "Toolbox") -> str:
+        todos = args.get("todos", [])
+        if not isinstance(todos, list):
+            return "error: 'todos' must be a list of strings"
+        todos = [str(t) for t in todos]
+        self._save_todos(todos)
+        return self._format_todos(todos)
+
+    def _todo_read(self, args: dict, ctx: "Toolbox") -> str:
+        return self._format_todos(self._load_todos())
+
+    @staticmethod
+    def _format_todos(todos: list) -> str:
+        if not todos:
+            return "(no todos)"
+        return "\n".join(f"{i + 1}. [ ] {t}" for i, t in enumerate(todos))
+
+
+def _html_to_text(body: str, selector: Optional[str] = None) -> str:
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+
+        soup = BeautifulSoup(body, "html.parser")
+        for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+            tag.decompose()
+        if selector:
+            els = soup.select(selector)
+            if els:
+                return re.sub(r"\n{3,}", "\n\n",
+                              "\n\n".join(e.get_text("\n", strip=True) for e in els)).strip()
+        return re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True)).strip()
+    except Exception:
+        pass
+    stripped = re.sub(r"(?is)<(script|style|noscript|header|footer|nav).*?</\1>", " ", body)
+    stripped = re.sub(r"(?s)<[^>]+>", " ", stripped)
+    text = _html.unescape(stripped)
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+# --------------------------------------------------------------------------- #
+# 7. Compactor (logic ported from cipher-harness/compact.py)                   #
+# --------------------------------------------------------------------------- #
+
+class Compactor:
+    """Summarise older turns once the context grows past the threshold."""
+
+    def __init__(self, counter: TokenCounter,
+                 max_context: int = MAX_CONTEXT_TOKENS,
+                 threshold: float = COMPACT_THRESHOLD,
+                 keep_recent: int = KEEP_RECENT_TURNS,
+                 summarizer: Optional[Callable[[str], str]] = None):
+        self.counter = counter
+        self.max_context = max_context
+        self.threshold = threshold
+        self.keep_recent = keep_recent
+        self.summarizer = summarizer
+
+    # -- estimation -------------------------------------------------------
+
+    @property
+    def trigger_tokens(self) -> int:
+        return int(self.max_context * self.threshold)
+
+    def estimate(self, messages: list) -> int:
+        return self.counter.count_messages(messages)
+
+    def should_compact(self, messages: list) -> bool:
+        return self.estimate(messages) > self.trigger_tokens
+
+    # -- summarisation ----------------------------------------------------
+
+    def build_summary(self, messages: list) -> str:
+        """Return a summary that ALWAYS contains the seven required sections."""
+        sections = self._extract_sections(messages)
+        if self.summarizer is not None:
+            try:
+                requested = self.summarizer(self._summary_prompt(messages))
+                if requested:
+                    sections.update(self._parse_sections(requested, sections))
+            except Exception:
+                pass  # deterministic summary is the safety net
+        parts = []
+        for header in SUMMARY_SECTIONS:
+            body = (sections.get(header) or "").strip() or "-"
+            parts.append(f"{header}\n{body}")
+        return "\n\n".join(parts)
+
+    def compact(self, messages: list) -> list:
+        """Return a new history: one summary message + the recent turns verbatim."""
+        if len(messages) <= self.keep_recent:
+            summary = self.build_summary(messages)
+            return [{"role": "user", "content": f"[CONTEXT SUMMARY]\n\n{summary}"}]
+        older = messages[:-self.keep_recent]
+        tail = messages[-self.keep_recent:]
+        summary = self.build_summary(older)
+        head = {"role": "user", "content": f"[CONTEXT SUMMARY]\n\n{summary}"}
+        return [head] + list(tail)
+
+    # -- deterministic extraction ----------------------------------------
+
+    def _extract_sections(self, messages: list) -> dict:
+        users = [m for m in messages if m.get("role") == "user"]
+        touched = _files_touched(messages)
+
+        goal = ""
+        for m in users:
+            text = strip_thinking(_content_text(m.get("content")))
+            if text and not text.startswith("[CONTEXT SUMMARY"):
+                goal = text
+                break
+        if not goal and users:
+            goal = strip_thinking(_content_text(users[0].get("content")))
+
+        last_user = ""
+        for m in reversed(users):
+            text = strip_thinking(_content_text(m.get("content")))
+            if text and not text.startswith("[CONTEXT SUMMARY") and "<tool_result>" not in text:
+                last_user = text
+                break
+
+        constraints = _find_lines(messages, ("must ", "never ", "do not ", "don't ", "constraint"))
+        decisions = _find_lines(messages, ("decid", "decision", "chose", "approach", "instead of"))
+        todos = _latest_todos(messages)
+        next_steps = todos or [
+            "Continue the current task from the last user intent.",
+            "Verify changes (run the relevant tests/commands).",
+        ]
+
+        return {
+            "## Goal": _clip(goal, 600),
+            "## Constraints": _clip("\n".join(f"- {c}" for c in constraints[:8]), 600),
+            "## Files Touched": _clip("\n".join(f"- {p}" for p in sorted(touched)), 600),
+            "## Decisions Made": _clip("\n".join(f"- {d}" for d in decisions[:8]), 600),
+            "## Open Todos": _clip("\n".join(f"- {t}" for t in todos[:12]), 600),
+            "## Last User Intent": _clip(last_user, 400),
+            "## Next Steps": _clip("\n".join(f"- {s}" for s in next_steps[:8]), 600),
+        }
+
+    @staticmethod
+    def _summary_prompt(messages: list) -> str:
+        return (
+            "Summarise this coding-agent conversation. Reply with markdown that has "
+            "EXACTLY these seven sections, in this order, each starting with '## ':\n"
+            "## Goal\n## Constraints\n## Files Touched\n## Decisions Made\n"
+            "## Open Todos\n## Last User Intent\n## Next Steps\n\n"
+            "Be concise and concrete. Conversation:\n\n"
+            + _serialize_messages(messages)
+        )
+
+    @staticmethod
+    def _parse_sections(text: str, fallback: dict) -> dict:
+        """Split a model summary by '## ' headers into the known sections."""
+        found: dict = {}
+        current = None
+        buf: list = []
+        for line in text.splitlines():
+            if line.strip().startswith("## "):
+                if current is not None:
+                    found[current] = "\n".join(buf).strip()
+                current = line.strip()
+                buf = []
+            elif current is not None:
+                buf.append(line)
+        if current is not None:
+            found[current] = "\n".join(buf).strip()
+        merged = dict(fallback)
+        for header, body in found.items():
+            for known in SUMMARY_SECTIONS:
+                if header.lower().startswith(known.lower()) and body:
+                    merged[known] = body
+        return merged
+
+
+def _content_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text") or block.get("content") or ""))
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _serialize_messages(messages: list, limit: int = 500) -> str:
+    parts = []
+    for m in messages:
+        role = m.get("role", "?").upper()
+        text = strip_thinking(_content_text(m.get("content")))
+        for call in m.get("tool_calls", []) or []:
+            fn = (call.get("function") or {})
+            text += f"\n[tool: {fn.get('name')} {str(fn.get('arguments', ''))[:120]}]"
+        parts.append(f"{role}: {text[:limit]}")
+    return "\n\n".join(parts)
+
+
+def _files_touched(messages: list) -> set:
+    files: set = set()
+    for m in messages:
+        text = _content_text(m.get("content"))
+        for match in re.finditer(r'"(?:path|file_path)"\s*:\s*"([^"]+)"', text):
+            files.add(match.group(1))
+        for match in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL):
+            parsed = _loads_tool_obj(match.group(1))
+            if parsed and "path" in parsed["arguments"]:
+                files.add(str(parsed["arguments"]["path"]))
+        for call in m.get("tool_calls", []) or []:
+            fn = call.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            if isinstance(args, dict) and args.get("path"):
+                files.add(str(args["path"]))
+    return files
+
+
+def _find_lines(messages: list, keywords: tuple, max_lines: int = 8) -> list:
+    hits: list = []
+    for m in messages:
+        for line in _content_text(m.get("content")).splitlines():
+            low = line.lower()
+            if any(k in low for k in keywords) and 8 < len(line.strip()) < 200:
+                cleaned = line.strip().lstrip("-*# ").strip()
+                if cleaned and cleaned not in hits:
+                    hits.append(cleaned)
+    return hits[:max_lines]
+
+
+def _latest_todos(messages: list) -> list:
+    for m in reversed(messages):
+        text = _content_text(m.get("content"))
+        match = re.search(r"<tool_result>\s*(.*?)\s*</tool_result>", text, re.DOTALL)
+        if match and "[ ]" in match.group(1):
+            todos = []
+            for line in match.group(1).splitlines():
+                mm = re.match(r"\s*\d+\.\s*\[( |x)\]\s*(.+)", line)
+                if mm:
+                    todos.append(mm.group(2).strip())
+            if todos:
+                return todos
+    return []
+
+
+def _clip(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " ..."
+
+
+# --------------------------------------------------------------------------- #
+# 8. Session store (JSON on disk, atomic, resumable, rollover)                 #
+# --------------------------------------------------------------------------- #
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(text: str, max_words: int = 6) -> str:
+    text = (text or "").strip().lower()
+    words = [w for w in _SLUG_RE.split(text) if w]
+    return "-".join(words[:max_words]) or "session"
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now().isoformat(timespec="seconds")
+
+
+def _human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}GB"
+
+
+class Session:
+    def __init__(self, data: dict, path: Optional[Path] = None):
+        self.id: str = data.get("id") or str(uuid.uuid4())
+        self.name: str = data.get("name") or "session"
+        self.created_at: str = data.get("created_at") or _now_iso()
+        self.updated_at: str = data.get("updated_at") or self.created_at
+        self.model: str = data.get("model") or MODEL_LABEL
+        self.messages: list = data.get("messages") or []
+        self.compactions: list = data.get("compactions") or []
+        self.path: Optional[Path] = Path(path) if path else None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "model": self.model,
+            "messages": self.messages,
+            "compactions": self.compactions,
+        }
+
+    @classmethod
+    def load(cls, path: Path) -> "Session":
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls(data, path=path)
+
+    def save(self) -> Path:
+        self.updated_at = _now_iso()
+        if self.path is None:
+            raise RuntimeError("session has no path; created in memory only")
+        atomic_write_json(self.path, self.to_dict())
+        return self.path
+
+    @property
+    def size_bytes(self) -> int:
+        try:
+            return self.path.stat().st_size if self.path else len(json.dumps(self.to_dict()))
+        except Exception:
+            return 0
+
+    def last_user_preview(self, limit: int = 60) -> str:
+        for m in reversed(self.messages):
+            if m.get("role") == "user":
+                text = strip_thinking(_content_text(m.get("content")))
+                text = re.sub(r"<tool_result>.*?</tool_result>", "", text, flags=re.DOTALL)
+                text = re.sub(r"This is a continuation of session.*?follows:", "", text, flags=re.DOTALL)
+                text = " ".join(text.split())
+                if text:
+                    return text[:limit]
+        return "(empty)"
+
+
+class SessionStore:
+    def __init__(self, directory: Path = SESSIONS_DIR):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def new_session(self, name: Optional[str] = None, first_message: str = "") -> Session:
+        slug = slugify(name or first_message or "session")
+        session = Session({
+            "id": str(uuid.uuid4()),
+            "name": slug,
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+            "model": MODEL_LABEL,
+            "messages": [],
+            "compactions": [],
+        })
+        session.path = self._path_for(slug)
+        session.save()
+        return session
+
+    def _path_for(self, slug: str) -> Path:
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        candidate = self.directory / f"{stamp}__{slug}.json"
+        counter = 1
+        while candidate.exists():
+            candidate = self.directory / f"{stamp}__{slug}-{counter}.json"
+            counter += 1
+        return candidate
+
+    def unique_name(self, base: str) -> str:
+        existing = {s.name for s in self.list_sessions()}
+        if base not in existing:
+            return base
+        i = 2
+        while f"{base}-{i}" in existing:
+            i += 1
+        return f"{base}-{i}"
+
+    def rollover(self, old: Session, summary: str) -> Session:
+        """Create ``<slug>-contN`` seeded with the continuation header + summary."""
+        n = 1
+        existing = {s.name for s in self.list_sessions()}
+        while f"{old.name}-cont{n}" in existing:
+            n += 1
+        new_name = f"{old.name}-cont{n}"
+        seeded = {
+            "role": "user",
+            "content": (
+                f"This is a continuation of session {old.name}. Summary follows:\n\n{summary}"
+            ),
+        }
+        new_session = Session({
+            "id": str(uuid.uuid4()),
+            "name": new_name,
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+            "model": MODEL_LABEL,
+            "messages": [seeded],
+            "compactions": [],
+        })
+        new_session.path = self._path_for(slugify(new_name))
+        old.compactions.append({
+            "at_tokens": None,
+            "summary": summary,
+            "new_session": new_session.name,
+        })
+        old.save()
+        new_session.save()
+        return new_session
+
+    def list_sessions(self) -> list:
+        sessions = []
+        for path in self.directory.glob("*.json"):
+            try:
+                sessions.append(Session.load(path))
+            except Exception:
+                continue
+        sessions.sort(key=lambda s: s.updated_at, reverse=True)
+        return sessions
+
+    def find(self, key: str) -> Optional[Session]:
+        sessions = self.list_sessions()
+        if key.isdigit():
+            idx = int(key)
+            if 1 <= idx <= len(sessions):
+                return sessions[idx - 1]
+        for s in sessions:
+            if s.name == key:
+                return s
+        for s in sessions:
+            if s.name.startswith(key):
+                return s
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# 9. Server supervisor (auto-launch / attach, idempotent)                      #
+# --------------------------------------------------------------------------- #
+
+class ServerStartError(RuntimeError):
+    pass
+
+
+class ServerManager:
+    """Start the local DeepSeek-API server, or attach to one already running."""
+
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+                 root: Path = ROOT, console=None, no_server: bool = False):
+        self.host = host
+        self.port = port
+        self.root = Path(root)
+        self.console = console or _make_console()
+        self.no_server = no_server
+        self.process: Optional[subprocess.Popen] = None
+        self.owned = False
+        self._log: deque = deque(maxlen=200)
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}/v1"
+
+    def port_open(self, timeout: float = 0.3) -> bool:
+        try:
+            with socket.create_connection((self.host, self.port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def _models_endpoint_ready(self) -> bool:
+        try:
+            import httpx
+
+            resp = httpx.get(f"{self.base_url}/models", timeout=3.0)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def ensure_running(self) -> None:
+        if self.port_open():
+            # Someone already serves this port - reuse it, never claim ownership.
+            self.owned = False
+            return
+        if self.no_server:
+            raise ServerStartError(
+                f"No server is listening on {self.host}:{self.port} and --no-server was passed."
+            )
+        env = os.environ.copy()
+        env.setdefault("HOST", self.host)
+        env.setdefault("PORT", str(self.port))
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, "app.py"],
+                cwd=str(self.root),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            raise ServerStartError(f"Failed to spawn the server: {exc}") from exc
+        self.owned = True
+        threading.Thread(target=self._drain_log, daemon=True).start()
+        self._install_cleanup()
+        self._wait_ready()
+
+    def _drain_log(self) -> None:
+        proc = self.process
+        if proc is None or proc.stdout is None:
+            return
+        for line in proc.stdout:
+            self._log.append(line.rstrip("\n"))
+
+    def _wait_ready(self, timeout: float = STARTUP_TIMEOUT) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.process is not None and self.process.poll() is not None:
+                break
+            if self._models_endpoint_ready():
+                return
+            time.sleep(0.25)
+        tail = "\n".join(list(self._log)[-50:])
+        self.stop()
+        raise ServerStartError(
+            "The DeepSeek-API server did not become ready within "
+            f"{timeout:.0f}s.\nLast server output:\n{tail}"
+        )
+
+    def _install_cleanup(self) -> None:
+        atexit.register(self.stop)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                previous = signal.getsignal(sig)
+                signal.signal(sig, self._wrap_signal(previous))
+            except Exception:
+                pass
+
+    def _wrap_signal(self, previous):
+        def handler(signum, frame):
+            self.stop()
+            if callable(previous) and previous not in (signal.SIG_DFL, signal.SIG_IGN):
+                previous(signum, frame)
+            else:
+                raise KeyboardInterrupt
+        return handler
+
+    def restart_once(self) -> bool:
+        """Restart the server if *we* own it. Returns True on success."""
+        if not self.owned:
+            return False
+        self.stop()
+        try:
+            self.ensure_running()
+            return True
+        except ServerStartError:
+            return False
+
+    def stop(self) -> None:
+        if not self.owned or self.process is None:
+            return
+        proc = self.process
+        self.process = None
+        self.owned = False
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
+# --------------------------------------------------------------------------- #
+# 10. OpenAI-compatible LLM client (openai SDK, else httpx)                    #
+# --------------------------------------------------------------------------- #
+
+class StreamEvent(dict):
+    """Dict subclass for readability; keys: type, text/calls/finish_reason."""
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    if "connection" in name or "timeout" in name or "connect" in name:
+        return True
+    text = str(exc).lower()
+    return any(k in text for k in ("connection refused", "connection reset",
+                                   "remote end closed", "timed out", "broken pipe"))
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    if "ratelimit" in type(exc).__name__.lower():
+        return True
+    return "429" in str(exc) or "rate limit" in str(exc).lower()
+
+
+class DeepSeekLLM:
+    """Thin OpenAI-compatible client pointed at the local server.
+
+    Uses the ``openai`` SDK when installed, otherwise falls back to ``httpx``
+    with a hand-rolled SSE reader. Only ever talks to ``base_url`` (127.0.0.1).
+    """
+
+    def __init__(self, base_url: str, api_key: str = API_KEY, model: str = MODEL_ID,
+                 timeout: float = 300.0):
+        self.base_url = base_url
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+        self._openai = None
+        try:
+            from openai import OpenAI  # type: ignore
+
+            self._openai = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+            self.backend = "openai-sdk"
+        except Exception:
+            self.backend = "httpx"
+
+    def chat_stream(self, messages: list, tools: Optional[list] = None,
+                    thinking: bool = False, search: bool = False,
+                    max_retries: int = 3) -> Iterator[StreamEvent]:
+        """Yield StreamEvents: {'type': 'content'|'reasoning'|'tool_calls'|'done'}."""
+        for attempt in range(max_retries):
+            try:
+                yield from self._chat_stream_once(messages, tools, thinking, search)
+                return
+            except Exception as exc:
+                if _is_rate_limited(exc) and attempt < max_retries - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+
+    def complete(self, messages: list, thinking: bool = False,
+                 max_tokens: int = 2048) -> str:
+        parts = []
+        for event in self.chat_stream(messages, tools=None, thinking=thinking):
+            if event["type"] == "content":
+                parts.append(event["text"])
+        return "".join(parts)
+
+    # -- internals --------------------------------------------------------
+
+    def _extra_body(self, thinking: bool, search: bool) -> dict:
+        return {"thinking": bool(thinking), "search": bool(search)}
+
+    def _chat_stream_once(self, messages, tools, thinking, search) -> Iterator[StreamEvent]:
+        if self._openai is not None:
+            yield from self._stream_openai(messages, tools, thinking, search)
+        else:
+            yield from self._stream_httpx(messages, tools, thinking, search)
+
+    @staticmethod
+    def _finalize_tool_calls(tool_calls) -> list:
+        calls = []
+        for idx in sorted(tool_calls):
+            entry = tool_calls[idx]
+            try:
+                args = json.loads(entry["arguments"]) if entry["arguments"] else {}
+            except json.JSONDecodeError:
+                args = {}
+            calls.append({
+                "id": entry["id"] or f"call_{uuid.uuid4().hex[:8]}",
+                "name": entry["name"],
+                "arguments": args,
+            })
+        return calls
+
+    def _stream_openai(self, messages, tools, thinking, search) -> Iterator[StreamEvent]:
+        kwargs: dict = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "extra_body": self._extra_body(thinking, search),
+        }
+        if tools:
+            kwargs["tools"] = tools
+        stream = self._openai.chat.completions.create(**kwargs)
+        tool_calls: "OrderedDict[int, dict]" = OrderedDict()
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None)
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                reasoning = (getattr(delta, "reasoning_content", None)
+                             or getattr(delta, "reasoning", None))
+                if reasoning:
+                    yield StreamEvent(type="reasoning", text=str(reasoning))
+                content = getattr(delta, "content", None)
+                if content:
+                    yield StreamEvent(type="content", text=str(content))
+                for tc in (getattr(delta, "tool_calls", None) or []):
+                    idx = getattr(tc, "index", 0) or 0
+                    entry = tool_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                    if getattr(tc, "id", None):
+                        entry["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            entry["name"] += fn.name
+                        if getattr(fn, "arguments", None):
+                            entry["arguments"] += fn.arguments
+            if getattr(choice, "finish_reason", None):
+                yield StreamEvent(type="finish", finish_reason=choice.finish_reason)
+        if tool_calls:
+            yield StreamEvent(type="tool_calls", calls=self._finalize_tool_calls(tool_calls))
+        yield StreamEvent(type="done")
+
+    def _stream_httpx(self, messages, tools, thinking, search) -> Iterator[StreamEvent]:
+        import httpx
+
+        body: dict = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            **self._extra_body(thinking, search),
+        }
+        if tools:
+            body["tools"] = tools
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        tool_calls: "OrderedDict[int, dict]" = OrderedDict()
+        with httpx.stream("POST", f"{self.base_url}/chat/completions",
+                          json=body, headers=headers, timeout=self.timeout) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    obj = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                for choice in obj.get("choices", []):
+                    delta = choice.get("delta") or {}
+                    if delta.get("reasoning_content"):
+                        yield StreamEvent(type="reasoning", text=delta["reasoning_content"])
+                    if delta.get("content"):
+                        yield StreamEvent(type="content", text=delta["content"])
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        entry = tool_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                        if tc.get("id"):
+                            entry["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            entry["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            entry["arguments"] += fn["arguments"]
+                    if choice.get("finish_reason"):
+                        yield StreamEvent(type="finish", finish_reason=choice["finish_reason"])
+        if tool_calls:
+            yield StreamEvent(type="tool_calls", calls=self._finalize_tool_calls(tool_calls))
+        yield StreamEvent(type="done")
+
+
+# --------------------------------------------------------------------------- #
+# 11. System prompts                                                           #
+# --------------------------------------------------------------------------- #
+
+BASE_SYSTEM_PROMPT = f"""You are mike, an autonomous coding agent running on the user's machine.
+You DO things - you use your tools instead of explaining how. Be concise and concrete.
+
+Rules:
+1. Read a file before editing it. Prefer edit_file for small changes, write_file for new files.
+2. Keep calling tools until the task is genuinely complete; don't stop after one step.
+3. Never print raw JSON tool schemas or fake tool output to the user.
+4. Use absolute or repo-relative paths. Never guess - use glob/grep/list_dir to find things.
+5. After you finish, give a one-line summary of what changed and how to run/test it.
+
+You always run as the single model {MODEL_LABEL}. Working directory: {{cwd}}.
+Context budget: {MAX_CONTEXT_TOKENS:,} tokens (auto-compaction at {COMPACT_AT_TOKENS:,}).
+"""
+
+
+def build_prompted_tool_prompt(toolbox: Toolbox) -> str:
+    lines = [
+        "## Tools",
+        "",
+        "You can call tools. To call one, emit one or more blocks in EXACTLY this format:",
+        "",
+        "<tool_call>",
+        '{"name": "<tool_name>", "arguments": { ... }}',
+        "</tool_call>",
+        "",
+        "Rules for tool calls:",
+        "- Emit ONLY the envelope for the call; put any message to the user OUTSIDE the blocks.",
+        "- You may emit several <tool_call> blocks in one turn.",
+        "- Arguments must be a JSON object matching the tool's parameters.",
+        "- After the tools run you will receive a <tool_result> message; keep going until done.",
+        "",
+        "Available tools:",
+    ]
+    for spec in toolbox.specs.values():
+        lines.append(f"- {spec.name}: {spec.description}")
+        lines.append(f"  parameters: {json.dumps(spec.parameters, ensure_ascii=False)}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# 12. The agent                                                                #
+# --------------------------------------------------------------------------- #
+
+class MikeAgent:
+    """The agentic loop: stream, parse tools, execute, repeat."""
+
+    def __init__(self, llm: DeepSeekLLM, session: Session, store: SessionStore,
+                 compactor: Compactor, toolbox: Toolbox, console,
+                 tool_mode: str = "prompted", thinking_mode: str = "spinner",
+                 server: Optional[ServerManager] = None,
+                 cwd: Optional[str] = None):
+        self.llm = llm
+        self.session = session
+        self.store = store
+        self.compactor = compactor
+        self.toolbox = toolbox
+        self.console = console
+        self.tool_mode = tool_mode
+        self.thinking_mode = thinking_mode  # spinner | on | off
+        self.server = server
+        self.cwd = cwd or os.getcwd()
+        self.last_reasoning = ""
+        self._system = BASE_SYSTEM_PROMPT.format(cwd=self.cwd)
+
+    # -- helpers ----------------------------------------------------------
+
+    def _save(self) -> None:
+        try:
+            self.session.save()
+        except Exception as exc:  # never lose data silently
+            self.console.print(f"[red]warning: could not save session: {exc}[/red]")
+
+    def _api_messages(self) -> list:
+        """Build the OpenAI message list sent upstream (reasoning stripped)."""
+        out = [{"role": "system", "content": self._system}]
+        if self.tool_mode == "prompted":
+            out.append({"role": "system", "content": build_prompted_tool_prompt(self.toolbox)})
+        for msg in self.session.messages:
+            role = msg.get("role", "user")
+            if role == "assistant":
+                entry: dict = {"role": "assistant", "content": msg.get("content") or None}
+                if msg.get("tool_calls"):
+                    entry["tool_calls"] = msg["tool_calls"]
+                if not entry["content"] and not entry.get("tool_calls"):
+                    continue
+                out.append(entry)
+            elif role == "tool":
+                out.append({
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id", ""),
+                    "content": msg.get("content", ""),
+                })
+            else:
+                out.append({"role": role, "content": msg.get("content", "")})
+        return out
+
+    # -- main turn --------------------------------------------------------
+
+    def run(self, user_input: str) -> str:
+        user_input = user_input.strip()
+        if not user_input:
+            return ""
+
+        if not self.session.messages:
+            self._name_from(user_input)
+
+        self.session.messages.append({"role": "user", "content": user_input})
+        self._save()
+        self._maybe_compact()
+
+        final_text = ""
+        guard = 0
+        while True:
+            guard += 1
+            if guard > 40:
+                self.console.print("[yellow]stopping: too many tool iterations[/yellow]")
+                break
+            text, reasoning, native_calls, _finish = self._stream_once()
+            if reasoning:
+                self.last_reasoning = reasoning
+
+            if self.tool_mode == "native":
+                calls = native_calls
+                clean_text = strip_thinking(text)
+            else:
+                calls, clean_text = parse_tool_calls(text)
+                clean_text = strip_thinking(clean_text)
+                if not reasoning:
+                    maybe_reasoning, _ = extract_thinking(text)
+                    if maybe_reasoning:
+                        self.last_reasoning = maybe_reasoning
+
+            assistant_msg: dict = {"role": "assistant", "content": clean_text}
+            if reasoning:
+                assistant_msg["reasoning"] = reasoning
+            if calls:
+                if self.tool_mode == "native":
+                    assistant_msg["tool_calls"] = [
+                        {
+                            "id": c["id"],
+                            "type": "function",
+                            "function": {
+                                "name": c["name"],
+                                "arguments": json.dumps(c["arguments"], ensure_ascii=False),
+                            },
+                        }
+                        for c in calls
+                    ]
+                self.session.messages.append(assistant_msg)
+                self._save()
+                self._run_tools(calls)
+                self._save()
+                self._maybe_compact()
+                continue
+
+            self.session.messages.append(assistant_msg)
+            self._save()
+            final_text = clean_text
+            break
+        return final_text
+
+    def _name_from(self, first_message: str) -> None:
+        """Name/label the session from its first user message (kept on disk)."""
+        new_name = self.store.unique_name(slugify(first_message))
+        old_path = self.session.path
+        self.session.name = new_name
+        self.session.path = self.store._path_for(new_name)
+        try:
+            if old_path and old_path.exists() and old_path != self.session.path:
+                old_path.unlink()
+        except Exception:
+            pass
+
+    # -- streaming --------------------------------------------------------
+
+    def _stream_once(self):
+        messages = self._api_messages()
+        tools = self.toolbox.openai_tools() if self.tool_mode == "native" else None
+        thinking = self.thinking_mode != "off"
+
+        parser = StreamParser()
+        native_calls: list = []
+        finish = None
+        printed_any = False
+        reasoning_displayed = False
+
+        live = None
+        if self.thinking_mode == "spinner" and _RICH and hasattr(self.console, "set_live"):
+            live = Live(Text("thinking...", style="dim"), console=self.console,
+                        refresh_per_second=12, transient=True, auto_refresh=True)
+            live.start()
+
+        def stop_live():
+            nonlocal live
+            if live is not None:
+                live.stop()
+                live = None
+
+        try:
+            for event in self.llm.chat_stream(messages, tools=tools, thinking=thinking):
+                etype = event.get("type")
+                if etype == "reasoning":
+                    if live is not None:
+                        live.update(self._spinner_text(parser.reasoning + event["text"]))
+                    elif self.thinking_mode == "on":
+                        self.console.print(Text(event["text"], style="dim"),
+                                           end="", soft_wrap=True)
+                        reasoning_displayed = True
+                    parser.reasoning += event["text"]
+                elif etype == "content":
+                    for kind, chunk in parser.feed(event["text"]):
+                        if kind == "reasoning":
+                            if live is not None:
+                                live.update(self._spinner_text(parser.reasoning))
+                            elif self.thinking_mode == "on":
+                                self.console.print(Text(chunk, style="dim"),
+                                                   end="", soft_wrap=True)
+                                reasoning_displayed = True
+                        else:
+                            stop_live()
+                            if reasoning_displayed:
+                                self.console.print("")
+                                reasoning_displayed = False
+                            self.console.print(chunk, end="", soft_wrap=True)
+                            printed_any = True
+                elif etype == "tool_calls":
+                    native_calls.extend(event.get("calls", []))
+                elif etype == "finish":
+                    finish = event.get("finish_reason")
+            for kind, chunk in parser.finish():
+                if kind == "reasoning":
+                    parser.reasoning += chunk
+                elif kind == "content":
+                    stop_live()
+                    self.console.print(chunk, end="", soft_wrap=True)
+                    printed_any = True
+        finally:
+            stop_live()
+            if reasoning_displayed or printed_any:
+                self.console.print("")
+
+        # Return the RAW assistant text (including hidden tool_call blocks) so the
+        # prompted-mode parser can find them; the visible text was already
+        # streamed to the console from `parser.content`.
+        return parser.raw, parser.reasoning, native_calls, finish
+
+    def _spinner_text(self, reasoning: str):
+        tail = reasoning[-80:].replace("\n", " ")
+        return Text(f"... {tail}", style="dim")
+
+    # -- tools ------------------------------------------------------------
+
+    def _run_tools(self, calls: list) -> None:
+        for call in calls:
+            name = call.get("name", "")
+            args = call.get("arguments", {}) or {}
+            self.console.print(Text(f"* {name}({_tool_preview(name, args)})", style="cyan"))
+            output = self.toolbox.call(name, args)
+            self.console.print(Text(_result_preview(output), style="dim"))
+            if self.tool_mode == "native":
+                self.session.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": output,
+                })
+            else:
+                self.session.messages.append({
+                    "role": "user",
+                    "content": f"<tool_result>\n{output}\n</tool_result>",
+                })
+
+    # -- compaction / rollover -------------------------------------------
+
+    def _maybe_compact(self) -> None:
+        if self.compactor.should_compact(self.session.messages):
+            self.compact(force=False)
+
+    def compact(self, force: bool = True) -> str:
+        before = self.compactor.estimate(self.session.messages)
+        if not force and before <= self.compactor.trigger_tokens:
+            return ""
+        summary = self.compactor.build_summary(self.session.messages)
+        self.session.compactions.append({
+            "at_tokens": before,
+            "summary": summary,
+            "new_session": None,
+        })
+        self.session.messages = self.compactor.compact(self.session.messages)
+        self._save()
+        after = self.compactor.estimate(self.session.messages)
+        if after > self.compactor.trigger_tokens:
+            self.rollover(summary)
+        return summary
+
+    def rollover(self, summary: Optional[str] = None) -> Session:
+        if summary is None:
+            summary = self.compactor.build_summary(self.session.messages)
+        old = self.session
+        new = self.store.rollover(old, summary)
+        self.session = new
+        self.console.print(Text(f"-> rolled over to session {new.name}", style="yellow"))
+        return new
+
+
+def _tool_preview(name: str, args: dict) -> str:
+    if not isinstance(args, dict):
+        return ""
+    for key in ("path", "command", "pattern", "url", "code"):
+        if key in args:
+            val = str(args[key]).replace("\n", " ")
+            return val[:60] + ("..." if len(val) > 60 else "")
+    return ", ".join(f"{k}={str(v)[:20]}" for k, v in list(args.items())[:2])
+
+
+def _result_preview(output: str) -> str:
+    lines = (output or "").splitlines()
+    if not lines:
+        return "  | (no output)"
+    first = lines[0][:70]
+    if len(lines) > 1:
+        return f"  | {first} ... +{len(lines) - 1} lines"
+    if len(lines[0]) > 70:
+        return f"  | {first}..."
+    return f"  | {first}"
+
+
+# --------------------------------------------------------------------------- #
+# 13. Tool-mode probe (native vs prompted), cached in .mike_state.json         #
+# --------------------------------------------------------------------------- #
+
+PING_TOOL = [{
+    "type": "function",
+    "function": {
+        "name": "ping",
+        "description": "Health probe. Call this to confirm you can use tools.",
+        "parameters": {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": [],
+        },
+    },
+}]
+
+
+def detect_tool_mode(llm: DeepSeekLLM) -> str:
+    """Return 'native' if the backend returns structured tool_calls, else 'prompted'."""
+    messages = [
+        {"role": "system", "content": "You must use the provided tool. Reply only by calling it."},
+        {"role": "user", "content": "Call the ping tool now."},
+    ]
+    try:
+        saw_native = False
+        for event in llm.chat_stream(messages, tools=PING_TOOL, thinking=False):
+            if event.get("type") == "tool_calls" and event.get("calls"):
+                saw_native = True
+        return "native" if saw_native else "prompted"
+    except Exception:
+        # Can't probe (offline / hiccup) -> prompted works against any
+        # text-completion backend, so it is the safe default.
+        return "prompted"
+
+
+# --------------------------------------------------------------------------- #
+# 14. REPL + slash commands                                                    #
+# --------------------------------------------------------------------------- #
+
+HELP_TEXT = """\
+Commands:
+  /help                 show this help
+  /quit, /exit          quit (saves the session)
+  /clear                clear the screen
+  /model [name]         show the model (there is exactly one)
+  /thinking on|off|last thinking display: on / off / show last block
+  /sessions             list saved sessions
+  /resume <n|name>      switch to a saved session
+  /rename <name>        rename the current session
+  /compact              force compaction now
+  /tokens               show the current token estimate + threshold
+  /tools                list the available tools
+  /rollover             force a session rollover
+"""
+
+
+def run_repl(agent: MikeAgent, console) -> None:
+    _print_banner(agent, console)
+    while True:
+        try:
+            console.print()
+            user_input = input("> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\nbye.")
+            break
+        if not user_input:
+            continue
+
+        if user_input in ("/quit", "/exit"):
+            console.print("bye.")
+            break
+        if user_input == "/help":
+            console.print(HELP_TEXT)
+            continue
+        if user_input == "/clear":
+            os.system("clear")
+            continue
+        if user_input == "/tools":
+            for spec in agent.toolbox.specs.values():
+                mode = "read-only" if spec.read_only else "read-write"
+                console.print(f"  {spec.name} [{mode}] - {spec.description}")
+            continue
+        if user_input == "/tokens":
+            est = agent.compactor.estimate(agent.session.messages)
+            console.print(
+                f"estimated {est:,} tokens / threshold {agent.compactor.trigger_tokens:,} "
+                f"(max {agent.compactor.max_context:,}) via {agent.compactor.counter.name}"
+            )
+            continue
+        if user_input.startswith("/model"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) > 1:
+                resolve_model(parts[1].strip())  # accepted; single model either way
+            console.print(f"{MODEL_LABEL} ({MODEL_ID}) - the only model")
+            continue
+        if user_input.startswith("/thinking"):
+            parts = user_input.split()
+            arg = parts[1] if len(parts) > 1 else ""
+            if arg == "on":
+                agent.thinking_mode = "on"
+                console.print("thinking: full reasoning shown (dim)")
+            elif arg == "off":
+                agent.thinking_mode = "off"
+                console.print("thinking: hidden")
+            elif arg == "last":
+                if agent.last_reasoning:
+                    console.print(Panel(Text(agent.last_reasoning, style="dim"),
+                                        title="last reasoning", border_style="dim"))
+                else:
+                    console.print("(no reasoning captured yet)")
+            else:
+                console.print(f"thinking mode: {agent.thinking_mode} (use on|off|last)")
+            continue
+        if user_input == "/sessions":
+            _print_sessions_table(agent.store, console)
+            continue
+        if user_input.startswith("/resume"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                console.print("usage: /resume <n|name>")
+                continue
+            chosen = agent.store.find(parts[1].strip())
+            if chosen is None:
+                console.print("no such session")
+            else:
+                agent.session = chosen
+                console.print(f"resumed session {chosen.name} ({len(chosen.messages)} messages)")
+            continue
+        if user_input.startswith("/rename"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                console.print("usage: /rename <name>")
+                continue
+            new_name = slugify(parts[1])
+            old_path = agent.session.path
+            agent.session.name = new_name
+            agent.session.path = agent.store._path_for(new_name)
+            try:
+                if old_path and old_path.exists() and old_path != agent.session.path:
+                    old_path.unlink()
+            except Exception:
+                pass
+            agent.session.save()
+            console.print(f"renamed -> {new_name}")
+            continue
+        if user_input == "/compact":
+            console.print("compacting...")
+            summary = agent.compact(force=True)
+            console.print(Panel(Text(summary, style="dim"), title="summary", border_style="dim"))
+            continue
+        if user_input == "/rollover":
+            old_name = agent.session.name
+            new = agent.rollover()
+            console.print(f"-> rolled over to session {new.name} (from {old_name})")
+            continue
+        if user_input.startswith("/"):
+            console.print(f"unknown command: {user_input}. Try /help.")
+            continue
+
+        try:
+            agent.run(user_input)
+        except KeyboardInterrupt:
+            console.print("\n[interrupted]")
+        except Exception as exc:
+            _handle_crash(agent, console, exc)
+
+
+def _print_banner(agent: MikeAgent, console) -> None:
+    console.print(f"[bold]mike[/bold] v{__version__} - {MODEL_LABEL} "
+                  f"[dim]({agent.tool_mode} tools, thinking:{agent.thinking_mode}, "
+                  f"ctx {agent.compactor.max_context:,})[/dim]")
+    console.print(f"[dim]server {agent.llm.base_url} | session {agent.session.name} | "
+                  f"cwd {agent.cwd}[/dim]")
+    console.print("[dim]type /help for commands[/dim]")
+
+
+def _print_sessions_table(store: SessionStore, console) -> None:
+    sessions = store.list_sessions()
+    if not sessions:
+        console.print("No sessions yet.")
+        return
+    if _RICH:
+        table = Table(title="Sessions", show_header=True, header_style="bold")
+        table.add_column("#", width=3)
+        table.add_column("name", style="cyan")
+        table.add_column("updated", style="dim")
+        table.add_column("messages")
+        table.add_column("size", style="dim")
+        table.add_column("preview")
+        for i, s in enumerate(sessions, 1):
+            table.add_row(str(i), s.name, s.updated_at, str(len(s.messages)),
+                          _human_size(s.size_bytes), s.last_user_preview())
+        console.print(table)
+    else:
+        for i, s in enumerate(sessions, 1):
+            console.print(f"{i}. {s.name} | {s.updated_at} | {len(s.messages)} msgs | "
+                          f"{_human_size(s.size_bytes)} | {s.last_user_preview()}")
+
+
+def _prompt_resume(store: SessionStore, console) -> Optional[Session]:
+    sessions = store.list_sessions()
+    if not sessions:
+        console.print("No sessions yet.")
+        return None
+    _print_sessions_table(store, console)
+    try:
+        choice = input(f"Select a session to resume [1-{len(sessions)}, or q]: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    if not choice or choice.lower() == "q":
+        return None
+    chosen = store.find(choice)
+    if chosen is None:
+        console.print("no such session; starting a new one.")
+    return chosen
+
+
+# --------------------------------------------------------------------------- #
+# 15. Crash handling                                                           #
+# --------------------------------------------------------------------------- #
+
+def _handle_crash(agent: MikeAgent, console, exc: Exception) -> None:
+    try:
+        agent._save()
+    except Exception:
+        pass
+    tb = traceback.format_exc()
+    if _RICH:
+        console.print(Panel(tb, title=f"{type(exc).__name__}: {exc}", border_style="red"))
+    else:
+        print(tb)
+    console.print("[dim]session saved. Send this traceback to the model for a "
+                  "self-diagnosis pass? (y/n, default y in 5s)[/dim]")
+    if _ask_yes_no(timeout=5.0, default=True):
+        try:
+            diagnosis = agent.llm.complete([
+                {"role": "system", "content": "You are debugging a Python coding-agent harness."},
+                {"role": "user", "content": "Explain the likely cause and a fix:\n\n" + tb},
+            ])
+            console.print(Panel(diagnosis, title="self-diagnosis", border_style="yellow"))
+        except Exception as secondary:
+            console.print(f"[red]diagnosis failed too: {secondary}[/red]")
+
+
+def _ask_yes_no(timeout: float = 5.0, default: bool = True) -> bool:
+    if not sys.stdin.isatty():
+        return default
+    try:
+        ready, _, _ = _select.select([sys.stdin], [], [], timeout)
+    except Exception:
+        return default
+    if not ready:
+        return default
+    line = sys.stdin.readline().strip().lower()
+    if not line:
+        return default
+    return line.startswith("y")
+
+
+# --------------------------------------------------------------------------- #
+# 16. CLI                                                                      #
+# --------------------------------------------------------------------------- #
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mike",
+        description=(
+            "mike - a self-contained, zero-cost DeepSeek coding harness. "
+            "Launches the local DeepSeek-API server, talks to its OpenAI-compatible "
+            "endpoint, and runs an interactive agent with tools, compaction and "
+            f"resumable sessions. Exactly one model is surfaced: {MODEL_LABEL}."
+        ),
+        epilog="Examples:\n  python mike.py\n  python mike.py resume\n"
+               "  python mike.py --model deepseek-chat",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("command", nargs="?", choices=["resume"],
+                        help="'resume' opens the interactive session picker")
+    parser.add_argument("--resume", action="store_true",
+                        help="same as the 'resume' command")
+    parser.add_argument("--model", default=None,
+                        help="select a model by name/alias (all aliases route to "
+                             f"{MODEL_ID})")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--no-server", action="store_true",
+                        help="assume a server is already running; never launch one")
+    parser.add_argument("--version", action="version", version=f"mike {__version__}")
+    return parser
+
+
+def main(argv: Optional[list] = None) -> int:
+    parser = build_argparser()
+    args = parser.parse_args(argv)
+
+    console = _make_console()
+    state = load_state()
+    counter = TokenCounter.create()
+    if state.get("estimator") != counter.name:
+        state["estimator"] = counter.name
+        save_state(state)
+
+    # --- start / attach the server (argparse already handled --help) -------------
+    server = ServerManager(args.host, args.port, ROOT, console=console,
+                           no_server=args.no_server)
+    try:
+        server.ensure_running()
+    except ServerStartError as exc:
+        console.print(f"[red]could not start the DeepSeek-API server:[/red]\n{exc}")
+        return 1
+
+    llm = DeepSeekLLM(server.base_url, API_KEY, resolve_model(args.model))
+
+    # --- tool mode: cached, else probe once --------------------------------------
+    tool_mode = state.get("tool_mode")
+    if tool_mode not in ("native", "prompted"):
+        tool_mode = detect_tool_mode(llm)
+        state["tool_mode"] = tool_mode
+        state["port"] = args.port
+        save_state(state)
+
+    console.print(
+        f"[dim]info: single model {MODEL_LABEL} ({MODEL_ID}); "
+        f"{len(MODEL_ALIASES)} legacy aliases route to it; tools: {tool_mode}[/dim]"
+    )
+    if args.model:
+        resolve_model(args.model)  # explicit selection, still one backend model
+
+    store = SessionStore(SESSIONS_DIR)
+    compactor = Compactor(
+        counter,
+        max_context=MAX_CONTEXT_TOKENS,
+        threshold=COMPACT_THRESHOLD,
+        keep_recent=KEEP_RECENT_TURNS,
+        summarizer=None,  # deterministic, guaranteed 7-section summaries
+    )
+    toolbox = Toolbox(os.getcwd())
+
+    want_resume = args.resume or args.command == "resume"
+    session = None
+    if want_resume:
+        session = _prompt_resume(store, console)
+    if session is None:
+        session = store.new_session()
+
+    agent = MikeAgent(
+        llm=llm, session=session, store=store, compactor=compactor,
+        toolbox=toolbox, console=console, tool_mode=tool_mode,
+        thinking_mode=state.get("thinking_mode", "spinner"),
+        server=server, cwd=os.getcwd(),
+    )
+
+    try:
+        run_repl(agent, console)
+    finally:
+        agent._save()
+        server.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

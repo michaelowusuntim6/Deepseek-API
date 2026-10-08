@@ -9,3 +9,8 @@ session
 *.env.*
 !.env.example
 CLAUDE.md
+
+# mike agent sessions + cached state (user data, never committed)
+sessions/
+.mike/
+.mike_state.json
