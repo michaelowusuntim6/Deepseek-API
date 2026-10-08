@@ -1409,6 +1409,10 @@ class Session:
         self.model: str = data.get("model") or MODEL_LABEL
         self.messages: list = data.get("messages") or []
         self.compactions: list = data.get("compactions") or []
+        # Upstream DeepSeek thread id. Kept so every turn — including tool
+        # result feedback — continues the SAME server-side chat instead of
+        # starting a new one on each request.
+        self.conversation_id: Optional[str] = data.get("conversation_id")
         self.path: Optional[Path] = Path(path) if path else None
 
     def to_dict(self) -> dict:
@@ -1420,6 +1424,7 @@ class Session:
             "model": self.model,
             "messages": self.messages,
             "compactions": self.compactions,
+            "conversation_id": self.conversation_id,
         }
 
     @classmethod
@@ -1982,11 +1987,19 @@ class DeepSeekLLM:
 
     def chat_stream(self, messages: list, tools: Optional[list] = None,
                     thinking: bool = False, search: bool = False,
+                    conversation_id: Optional[str] = None,
                     max_retries: int = 3) -> Iterator[StreamEvent]:
-        """Yield StreamEvents: {'type': 'content'|'reasoning'|'tool_calls'|'done'}."""
+        """Yield StreamEvents: content / reasoning / tool_calls / conversation_id / done.
+
+        Pass ``conversation_id`` to continue an existing upstream DeepSeek thread
+        (so tool results and follow-up prompts land in the *same* chat instead of
+        a fresh one). The server echoes the thread id back on the final chunk;
+        the caller stores it and passes it on subsequent requests.
+        """
         for attempt in range(max_retries):
             try:
-                yield from self._chat_stream_once(messages, tools, thinking, search)
+                yield from self._chat_stream_once(
+                    messages, tools, thinking, search, conversation_id)
                 return
             except Exception as exc:
                 if _is_rate_limited(exc) and attempt < max_retries - 1:
@@ -2004,14 +2017,19 @@ class DeepSeekLLM:
 
     # -- internals --------------------------------------------------------
 
-    def _extra_body(self, thinking: bool, search: bool) -> dict:
-        return {"thinking": bool(thinking), "search": bool(search)}
+    def _extra_body(self, thinking: bool, search: bool,
+                    conversation_id: Optional[str] = None) -> dict:
+        body = {"thinking": bool(thinking), "search": bool(search)}
+        if conversation_id:
+            body["conversation_id"] = conversation_id
+        return body
 
-    def _chat_stream_once(self, messages, tools, thinking, search) -> Iterator[StreamEvent]:
+    def _chat_stream_once(self, messages, tools, thinking, search,
+                          conversation_id=None) -> Iterator[StreamEvent]:
         if self._openai is not None:
-            yield from self._stream_openai(messages, tools, thinking, search)
+            yield from self._stream_openai(messages, tools, thinking, search, conversation_id)
         else:
-            yield from self._stream_httpx(messages, tools, thinking, search)
+            yield from self._stream_httpx(messages, tools, thinking, search, conversation_id)
 
     @staticmethod
     def _finalize_tool_calls(tool_calls) -> list:
@@ -2029,18 +2047,24 @@ class DeepSeekLLM:
             })
         return calls
 
-    def _stream_openai(self, messages, tools, thinking, search) -> Iterator[StreamEvent]:
+    def _stream_openai(self, messages, tools, thinking, search,
+                       conversation_id=None) -> Iterator[StreamEvent]:
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
             "stream": True,
-            "extra_body": self._extra_body(thinking, search),
+            "extra_body": self._extra_body(thinking, search, conversation_id),
         }
         if tools:
             kwargs["tools"] = tools
         stream = self._openai.chat.completions.create(**kwargs)
         tool_calls: "OrderedDict[int, dict]" = OrderedDict()
+        returned_cid = None
         for chunk in stream:
+            cid = getattr(chunk, "conversation_id", None) or \
+                (getattr(chunk, "model_extra", None) or {}).get("conversation_id")
+            if cid:
+                returned_cid = cid
             choices = getattr(chunk, "choices", None)
             if not choices:
                 continue
@@ -2069,21 +2093,25 @@ class DeepSeekLLM:
                 yield StreamEvent(type="finish", finish_reason=choice.finish_reason)
         if tool_calls:
             yield StreamEvent(type="tool_calls", calls=self._finalize_tool_calls(tool_calls))
+        if returned_cid:
+            yield StreamEvent(type="conversation_id", id=returned_cid)
         yield StreamEvent(type="done")
 
-    def _stream_httpx(self, messages, tools, thinking, search) -> Iterator[StreamEvent]:
+    def _stream_httpx(self, messages, tools, thinking, search,
+                      conversation_id=None) -> Iterator[StreamEvent]:
         import httpx
 
         body: dict = {
             "model": self.model,
             "messages": messages,
             "stream": True,
-            **self._extra_body(thinking, search),
+            **self._extra_body(thinking, search, conversation_id),
         }
         if tools:
             body["tools"] = tools
         headers = {"Authorization": f"Bearer {self.api_key}"}
         tool_calls: "OrderedDict[int, dict]" = OrderedDict()
+        returned_cid = None
         with httpx.stream("POST", f"{self.base_url}/chat/completions",
                           json=body, headers=headers, timeout=self.timeout) as resp:
             resp.raise_for_status()
@@ -2097,6 +2125,8 @@ class DeepSeekLLM:
                     obj = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
+                if obj.get("conversation_id"):
+                    returned_cid = obj["conversation_id"]
                 for choice in obj.get("choices", []):
                     delta = choice.get("delta") or {}
                     if delta.get("reasoning_content"):
@@ -2117,6 +2147,8 @@ class DeepSeekLLM:
                         yield StreamEvent(type="finish", finish_reason=choice["finish_reason"])
         if tool_calls:
             yield StreamEvent(type="tool_calls", calls=self._finalize_tool_calls(tool_calls))
+        if returned_cid:
+            yield StreamEvent(type="conversation_id", id=returned_cid)
         yield StreamEvent(type="done")
 
 
@@ -2201,6 +2233,10 @@ class MikeAgent:
         # `self.context` is what we actually send upstream; compaction shrinks
         # only this, so a crash or a compact never loses the transcript.
         self.context: list = list(self.session.messages)
+        # Messages the upstream thread has not seen yet (new user turns and tool
+        # results). When a conversation_id exists we send only these, so a
+        # single DeepSeek chat grows turn by turn instead of many throwaway ones.
+        self._unsent: list = []
 
     def _last_reasoning_from_history(self) -> str:
         for msg in reversed(self.session.messages):
@@ -2240,6 +2276,35 @@ class MikeAgent:
                 out.append({"role": role, "content": msg.get("content", "")})
         return out
 
+    def _render_outgoing(self, msg: dict) -> dict:
+        """Convert one stored message to the shape sent upstream."""
+        role = msg.get("role", "user")
+        if role == "assistant":
+            entry = {"role": "assistant", "content": msg.get("content") or ""}
+            if msg.get("tool_calls") and self.tool_mode == "native":
+                entry["tool_calls"] = msg["tool_calls"]
+            return entry
+        if role == "tool":
+            return {"role": "tool", "tool_call_id": msg.get("tool_call_id", ""),
+                    "content": msg.get("content", "")}
+        return {"role": role, "content": msg.get("content", "")}
+
+    def _request_messages(self) -> list:
+        """Choose what to send upstream for the next request.
+
+        * No upstream thread yet -> the full context (system + tools + history),
+          which starts a new DeepSeek chat and returns its ``conversation_id``.
+        * Thread exists -> only the messages added since the last request (the
+          new user turn and/or tool results), so everything stays in that one
+          chat instead of spawning a new one per request.
+        """
+        if self.session.conversation_id:
+            pending = list(self._unsent)
+            if not pending:
+                pending = self.context[-1:] or [{"role": "user", "content": "(continue)"}]
+            return [self._render_outgoing(m) for m in pending]
+        return self._api_messages()
+
     # -- main turn --------------------------------------------------------
 
     def run(self, user_input: str) -> str:
@@ -2250,7 +2315,7 @@ class MikeAgent:
         if not self.session.messages:
             self._name_from(user_input)
 
-        self._append({"role": "user", "content": user_input})
+        self._append({"role": "user", "content": user_input}, unsent=True)
         self._save()
         self._maybe_compact()
 
@@ -2262,6 +2327,9 @@ class MikeAgent:
                 self.console.print("[yellow]stopping: too many tool iterations[/yellow]")
                 break
             text, reasoning, native_calls, _finish = self._stream_once()
+            # The request reached the server (and the upstream thread): the
+            # pending messages are now inside the conversation.
+            self._unsent = []
             if reasoning:
                 self.last_reasoning = reasoning
 
@@ -2306,10 +2374,12 @@ class MikeAgent:
             break
         return final_text
 
-    def _append(self, message: dict) -> None:
-        """Append to BOTH the full on-disk history and the in-context view."""
+    def _append(self, message: dict, unsent: bool = False) -> None:
+        """Append to the full history, the in-context view, and the send queue."""
         self.session.messages.append(message)
         self.context.append(message)
+        if unsent:
+            self._unsent.append(message)
 
     def _name_from(self, first_message: str) -> None:
         """Name/label the session from its first user message (kept on disk)."""
@@ -2326,7 +2396,7 @@ class MikeAgent:
     # -- streaming --------------------------------------------------------
 
     def _stream_once(self):
-        messages = self._api_messages()
+        messages = self._request_messages()
         tools = self.toolbox.openai_tools() if self.tool_mode == "native" else None
         thinking = self.thinking_mode != THINKING_OFF
 
@@ -2349,9 +2419,16 @@ class MikeAgent:
                 live = None
 
         try:
-            for event in self.llm.chat_stream(messages, tools=tools, thinking=thinking):
+            for event in self.llm.chat_stream(
+                    messages, tools=tools, thinking=thinking,
+                    conversation_id=self.session.conversation_id):
                 etype = event.get("type")
-                if etype == "reasoning":
+                if etype == "conversation_id":
+                    cid = event.get("id")
+                    if cid and cid != self.session.conversation_id:
+                        self.session.conversation_id = cid
+                        self._save()
+                elif etype == "reasoning":
                     if live is not None:
                         live.update(self._spinner_text(parser.reasoning + event["text"]))
                     elif self.thinking_mode == "on":
@@ -2414,12 +2491,12 @@ class MikeAgent:
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
                     "content": output,
-                })
+                }, unsent=True)
             else:
                 self._append({
                     "role": "user",
                     "content": f"<tool_result>\n{output}\n</tool_result>",
-                })
+                }, unsent=True)
 
     # -- compaction / rollover -------------------------------------------
 
@@ -2439,7 +2516,14 @@ class MikeAgent:
         })
         # Only the in-context view shrinks; session.messages keeps the full
         # transcript on disk (never lose user data).
+        pending = list(self._unsent)
         self.context = self.compactor.compact(self.context)
+        if self.session.conversation_id:
+            # The upstream thread keeps the old turns, so send the fresh summary
+            # plus anything still pending (e.g. the user turn we just added).
+            self._unsent = [self.context[0]] + [m for m in pending if m is not self.context[0]]
+        else:
+            self._unsent = []
         self._save()
         after = self.compactor.estimate(self.context)
         if after > self.compactor.trigger_tokens:
@@ -2453,6 +2537,7 @@ class MikeAgent:
         new = self.store.rollover(old, summary)
         self.session = new
         self.context = list(new.messages)
+        self._unsent = []
         self.console.print(Text(f"-> rolled over to session {new.name}", style="yellow"))
         return new
 
@@ -2609,6 +2694,7 @@ def run_repl(agent: MikeAgent, console, cfg: Optional[dict] = None) -> None:
             else:
                 agent.session = chosen
                 agent.context = list(chosen.messages)
+                agent._unsent = []
                 console.print(f"resumed session {chosen.name} ({len(chosen.messages)} messages)")
             continue
         if user_input.startswith("/rename"):

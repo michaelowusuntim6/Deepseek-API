@@ -330,10 +330,13 @@ class _FakeLLM:
         self.turns = list(turns)
         self.calls = 0
         self.seen_messages = []
+        self.seen_conversation_ids = []
         self.base_url = "http://stub/v1"
 
-    def chat_stream(self, messages, tools=None, thinking=False, search=False):
+    def chat_stream(self, messages, tools=None, thinking=False, search=False,
+                    conversation_id=None):
         self.seen_messages.append(messages)
+        self.seen_conversation_ids.append(conversation_id)
         turn = self.turns[min(self.calls, len(self.turns) - 1)]
         self.calls += 1
         for event in turn:
@@ -839,3 +842,28 @@ class TestToolCallRoundTrip:
         assert tool_msgs and tool_msgs[0]["tool_call_id"] == "call_1"
         assert "native path" in tool_msgs[0]["content"]
         _assert_no_syntax(console.text)
+
+    def test_threads_one_conversation(self, tmp_path):
+        """Tool results and follow-ups must reuse ONE upstream chat."""
+        (tmp_path / "x.py").write_text("thread\n")
+        turns = [
+            [{"type": "content", "text": _dsml_block("read_file", [("path", "x.py")])},
+             {"type": "conversation_id", "id": "conv-123"}],
+            [{"type": "content", "text": "done"}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+        agent.run("read x.py")
+
+        # First request opened the thread (no id); the tool-result follow-up
+        # reused the same id instead of spawning a new chat.
+        assert llm.seen_conversation_ids[0] is None
+        assert llm.seen_conversation_ids[1] == "conv-123"
+        assert session.conversation_id == "conv-123"
+
+        # The follow-up carried ONLY the new tool result, not the whole history.
+        follow_up = llm.seen_messages[1]
+        assert len(follow_up) == 1
+        assert "<tool_result>" in str(follow_up[0]["content"])
+
+        # And the thread id is persisted on the session for resume.
+        assert session.to_dict()["conversation_id"] == "conv-123"

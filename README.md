@@ -145,6 +145,12 @@ view; the on-disk transcript is never truncated. When a session is still over
 budget after compaction, mike transparently **rolls over** to a new
 `<slug>-contN` session seeded with the summary.
 
+Each session is also pinned to **one upstream DeepSeek chat**: mike stores the
+server's `conversation_id` and reuses it for every follow-up request, so tool
+results and later prompts continue the same chat instead of spawning a new one
+per request. After the first turn, only the new messages are sent (the thread
+already holds the rest).
+
 ### Changing the context budget
 
 The max context is **500,000 tokens** by default, and auto-compaction triggers at

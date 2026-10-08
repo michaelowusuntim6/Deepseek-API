@@ -492,3 +492,38 @@ Done — `e2e_edit_scratch.txt` line 2 now reads `NEW_VALUE`.
 
 Reasoning is visible (dim), the file was edited (diff identical to above), and
 the tool-syntax leak check was again **0 matches**.
+
+---
+
+## v0.2 conversation threading (bug fix)
+
+**Symptom (reported):** every request — the initial prompt, each tool result,
+and every follow-up — showed up as a *separate* DeepSeek chat upstream, even
+though no compaction had happened.
+
+**Cause:** `DeepSeekLLM` never sent the server's non-standard `conversation_id`
+field. The server creates a new upstream chat whenever `conversation_id` is
+absent, so each of mike's requests (one per agent step) opened a fresh chat.
+
+**Fix:** mike now threads the upstream thread id end to end.
+
+* `DeepSeekLLM.chat_stream(..., conversation_id=...)` sends it in the request
+  body (`extra_body` for the SDK, JSON for httpx) and yields a
+  `conversation_id` event when the server echoes it on the final chunk.
+* `MikeAgent` stores it on the session (`Session.conversation_id`, persisted in
+  the session JSON, so resume keeps the same chat).
+* A send queue (`self._unsent`) tracks messages the thread has not seen. While a
+  `conversation_id` exists, mike sends **only the new messages** (the user turn
+  and/or tool results) — the thread already holds the earlier turns, so nothing
+  is duplicated. The very first request of a thread sends the full context
+  (system + tools + history) to establish it.
+* Compaction keeps the thread: after compacting, the summary message is queued
+  ahead of anything still pending. Rollover/resume reset the queue (a new
+  session opens its own thread).
+
+**Verified:** unit test `test_threads_one_conversation` asserts the first request
+has no id, the follow-up reuses it, and the follow-up carries only the tool
+result. Live check: asking "Remember BANANA", then in a *later* turn "What word
+did I ask you to remember?" returned `BANANA` while only the new prompt was sent
+— i.e. the same upstream chat was reused. (`sessions/…json` shows the stored
+`conversation_id`.)
