@@ -418,3 +418,80 @@ class _FakeCompletions:
 class _FakeOpenAI:
     def __init__(self, chunks):
         self.chat = SimpleNamespace(completions=_FakeCompletions(chunks))
+
+
+# --------------------------------------------------------------------------- #
+# 8. Layered config (v0.2)                                                     #
+# --------------------------------------------------------------------------- #
+
+class TestConfig:
+    def _clean_env(self, monkeypatch):
+        for name in list(mike.ENV_MAP.values()) + ["HOST", "PORT", "MIKE_PORT"]:
+            monkeypatch.delenv(name, raising=False)
+
+    def test_defaults_when_no_toml(self, tmp_path, monkeypatch):
+        self._clean_env(monkeypatch)
+        cfg, src = mike.load_config({}, user_config=tmp_path / "u.toml",
+                                    repo_config=tmp_path / "r.toml")
+        assert cfg["max_context"] == 500_000
+        assert cfg["compact_threshold"] == 0.80
+        assert cfg["server_port"] == 8000
+        assert cfg["model_id"] == "deepseek-v4.1-flash"
+        assert set(src.values()) == {"default"}
+
+    def test_precedence_default_user_repo_env_cli(self, tmp_path, monkeypatch):
+        self._clean_env(monkeypatch)
+        u = tmp_path / "u.toml"
+        r = tmp_path / "r.toml"
+        u.write_text("max_context = 100000\n")
+        r.write_text("max_context = 300000\n")
+
+        cfg, src = mike.load_config({}, user_config=u, repo_config=r)
+        assert (cfg["max_context"], src["max_context"]) == (300_000, "repo")
+
+        monkeypatch.setenv("MIKE_MAX_CONTEXT", "250000")
+        cfg, src = mike.load_config({}, user_config=u, repo_config=r)
+        assert (cfg["max_context"], src["max_context"]) == (250_000, "env")
+
+        cfg, src = mike.load_config({"max_context": 200_000}, user_config=u, repo_config=r)
+        assert (cfg["max_context"], src["max_context"]) == (200_000, "cli")
+
+    def test_all_keys_optional_and_typed(self, tmp_path, monkeypatch):
+        self._clean_env(monkeypatch)
+        r = tmp_path / "r.toml"
+        r.write_text('server_port = 8123\ncompact_threshold = 0.5\n'
+                     'log_level = "debug"\nthinking_default = "on"\n')
+        cfg, src = mike.load_config({}, user_config=tmp_path / "u.toml", repo_config=r)
+        assert cfg["server_port"] == 8123 and src["server_port"] == "repo"
+        assert cfg["compact_threshold"] == 0.5
+        assert cfg["log_level"] == "debug"
+        assert cfg["thinking_default"] == "on"
+
+    def test_invalid_toml_is_ignored(self, tmp_path, monkeypatch):
+        self._clean_env(monkeypatch)
+        r = tmp_path / "r.toml"
+        r.write_text("this is not = valid toml [[[\n")
+        cfg, src = mike.load_config({}, user_config=tmp_path / "u.toml", repo_config=r)
+        assert cfg["max_context"] == mike.DEFAULTS["max_context"]
+        assert src["max_context"] == "default"
+
+    def test_env_alias_host_port(self, tmp_path, monkeypatch):
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("PORT", "9123")
+        cfg, src = mike.load_config({}, user_config=tmp_path / "u.toml",
+                                    repo_config=tmp_path / "r.toml")
+        assert cfg["server_port"] == 9123
+        assert src["server_port"] == "env"
+
+    def test_compact_at_derived_from_max(self):
+        cfg = dict(mike.DEFAULTS)
+        cfg["max_context"] = 500_000
+        cfg["compact_threshold"] = 0.80
+        assert mike.compact_at(cfg) == 400_000
+        cfg["max_context"] = 200_000
+        assert mike.compact_at(cfg) == 160_000
+
+    def test_dir_resolution(self, tmp_path):
+        cfg = {"session_dir": str(tmp_path / "s"), "export_dir": ""}
+        assert mike.resolved_session_dir(cfg) == tmp_path / "s"
+        assert mike.resolved_export_dir(cfg) == mike.ROOT / "exports"

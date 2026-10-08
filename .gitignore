@@ -1,6 +1,7 @@
 venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 .env
 
 # Session artifacts — contain session tokens + cookies. NEVER commit.
@@ -14,3 +15,7 @@ CLAUDE.md
 sessions/
 .mike/
 .mike_state.json
+
+# mike local config + exports (user data; mike.toml.example is committed)
+mike.toml
+exports/

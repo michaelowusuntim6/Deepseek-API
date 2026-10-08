@@ -10,9 +10,10 @@ mike - a self-contained, zero-cost DeepSeek coding harness.
   * and runs an interactive coding-agent CLI with tools, thinking-block
     handling, inline compaction, resumable JSON sessions and auto-rollover.
 
-It surfaces exactly ONE model to the user - ``DeepSeek V4.1 Flash``
-(wire id ``deepseek-v4.1-flash``) - no matter what the backend advertises.
-Every legacy model name is accepted and routed to that single model.
+It surfaces exactly ONE model to the user - the single free DeepSeek web model,
+whose display name and wire id live in the ``DEFAULTS`` config block below - no
+matter what the backend advertises. Every legacy model name is accepted and
+routed to that one model.
 
 Everything mike needs (agent loop, tool registry, compactor, session manager,
 thinking parser, tool-call parser, server supervisor) lives in this file. It has
@@ -40,9 +41,11 @@ import datetime as _dt
 import glob as _globlib
 import html as _html
 import json
+import logging
 import os
 import re
 import select as _select
+import shlex
 import shutil
 import signal
 import socket
@@ -95,44 +98,191 @@ class _PlainConsole:
 # --------------------------------------------------------------------------- #
 # 1. Configuration                                                            #
 # --------------------------------------------------------------------------- #
+#
+# Layered config, resolved once at startup. Later layers override earlier ones:
+#   1. DEFAULTS (below)
+#   2. ~/.config/mike/config.toml   (source: "user")
+#   3. ./mike.toml                  (source: "repo")
+#   4. environment MIKE_* variables (source: "env")
+#   5. CLI flags                    (source: "cli")
+# Merge is a shallow per-key dict.update, not a deep merge. `mike.py config`
+# prints the resolved value and winning source for every key.
 
 ROOT = Path(__file__).resolve().parent
-SESSIONS_DIR = ROOT / "sessions"
 STATE_FILE = ROOT / ".mike_state.json"
+USER_CONFIG = Path(os.path.expanduser("~/.config/mike/config.toml"))
+REPO_CONFIG = ROOT / "mike.toml"
 
-# --- The single surfaced model -------------------------------------------------
-MODEL_ID = "deepseek-v4.1-flash"          # wire id sent to the server
-MODEL_LABEL = "DeepSeek V4.1 Flash"       # human label shown everywhere
+# Every key is optional; these are the defaults. This block is the ONLY place
+# these literals occur in mike.py.
+DEFAULTS = {
+    "max_context": 500_000,        # total tokens before compaction is possible
+    "compact_threshold": 0.80,     # fraction of max_context that triggers compaction
+    "keep_recent_turns": 6,        # turns preserved verbatim across a compaction
+    "server_host": "127.0.0.1",
+    "server_port": 8000,
+    "server_cmd": "",              # empty => auto-detect (python app.py)
+    "model": "DeepSeek V4.1 Flash",
+    "model_id": "deepseek-v4.1-flash",   # wire id sent to the server
+    "thinking_default": "off",     # off | on | spinner | last
+    "tool_call_mode": "auto",      # "auto" | "native" | "prompted"
+    "session_dir": "",             # empty => <repo>/sessions/
+    "export_dir": "",              # empty => <repo>/exports/
+    "log_level": "info",           # "debug" | "info" | "warn" | "error"
+}
 
-# Every one of these is accepted and transparently routed to MODEL_ID. The
-# harness must never surface more than one model and must never warn beyond a
-# single info line at startup.
+# Types used to coerce string values from the environment.
+_INT_KEYS = {"max_context", "keep_recent_turns", "server_port"}
+_FLOAT_KEYS = {"compact_threshold"}
+
+ENV_MAP = {
+    "max_context": "MIKE_MAX_CONTEXT",
+    "compact_threshold": "MIKE_COMPACT_THRESHOLD",
+    "keep_recent_turns": "MIKE_KEEP_RECENT_TURNS",
+    "server_host": "MIKE_SERVER_HOST",
+    "server_port": "MIKE_SERVER_PORT",
+    "model": "MIKE_MODEL",
+    "thinking_default": "MIKE_THINKING_DEFAULT",
+    "tool_call_mode": "MIKE_TOOL_CALL_MODE",
+    "session_dir": "MIKE_SESSION_DIR",
+    "export_dir": "MIKE_EXPORT_DIR",
+    "log_level": "MIKE_LOG_LEVEL",
+}
+
+# Backwards-compatible env aliases (v0.1 documented HOST / PORT / MIKE_PORT).
+ENV_ALIASES = {
+    "server_host": ["HOST"],
+    "server_port": ["MIKE_PORT", "PORT"],
+}
+
+# Convenience constants derived from the defaults block (no duplicated literals).
+MODEL_ID = DEFAULTS["model_id"]
+MODEL_LABEL = DEFAULTS["model"]
+THINKING_OFF = DEFAULTS["thinking_default"]
+THINKING_CHOICES = [THINKING_OFF, "on", "spinner", "last"]
+
+# Every one of these aliases is accepted and transparently routed to MODEL_ID.
 MODEL_ALIASES = [
     "deepseek-chat",
     "deepseek-reasoner",
     "deepseek-v3",
     "deepseek-v4",
-    "deepseek-v4.1-flash",
+    MODEL_ID,
     "deepseek-flash",
     "deepseek-web",
     "default",
 ]
 
-# --- Context / compaction ------------------------------------------------------
-DEFAULT_MAX_CONTEXT_TOKENS = 500_000
-try:
-    MAX_CONTEXT_TOKENS = int(os.getenv("MIKE_MAX_CONTEXT", str(DEFAULT_MAX_CONTEXT_TOKENS)))
-except ValueError:
-    MAX_CONTEXT_TOKENS = DEFAULT_MAX_CONTEXT_TOKENS
-COMPACT_THRESHOLD = 0.80
-COMPACT_AT_TOKENS = int(MAX_CONTEXT_TOKENS * COMPACT_THRESHOLD)   # 400_000 by default
-KEEP_RECENT_TURNS = 6
-
-# --- Server --------------------------------------------------------------------
-DEFAULT_HOST = os.getenv("HOST", "127.0.0.1")
-DEFAULT_PORT = int(os.getenv("MIKE_PORT", os.getenv("PORT", "8000")))
 API_KEY = os.getenv("MIKE_API_KEY", "sk-local")
 STARTUP_TIMEOUT = 30.0
+
+# Module logger. Configured by `configure_logging()` at startup; tests capture
+# it directly. Kept handler-free here so importing mike stays side-effect free.
+log = logging.getLogger("mike")
+
+
+def _read_toml(path: Path) -> dict:
+    """Load a TOML file, returning {} if it is missing or unreadable."""
+    try:
+        if not Path(path).exists():
+            return {}
+        raw = Path(path).read_bytes()
+    except Exception:
+        return {}
+    parser = None
+    try:
+        import tomllib as parser  # Python 3.11+
+    except Exception:
+        try:
+            import tomli as parser  # type: ignore  # Python < 3.11 fallback
+        except Exception:
+            parser = None
+    if parser is None:
+        return {}
+    try:
+        data = parser.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _coerce(key: str, value):
+    if value is None:
+        return None
+    if key in _INT_KEYS:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return DEFAULTS[key]
+    if key in _FLOAT_KEYS:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return DEFAULTS[key]
+    return value if isinstance(value, str) else str(value)
+
+
+def load_config(cli_overrides: Optional[dict] = None,
+                user_config: Optional[Path] = None,
+                repo_config: Optional[Path] = None) -> tuple:
+    """Resolve the layered config. Returns ``(values, sources)`` dicts."""
+    values = dict(DEFAULTS)
+    sources = {k: "default" for k in DEFAULTS}
+
+    for path, label in ((user_config or USER_CONFIG, "user"),
+                        (repo_config or REPO_CONFIG, "repo")):
+        for key, val in _read_toml(path).items():
+            if key in DEFAULTS:
+                values[key] = _coerce(key, val)
+                sources[key] = label
+
+    for key, env_name in ENV_MAP.items():
+        if os.environ.get(env_name, "") != "":
+            values[key] = _coerce(key, os.environ[env_name])
+            sources[key] = "env"
+    for key, aliases in ENV_ALIASES.items():
+        if sources.get(key) == "default":
+            for alias in aliases:
+                if os.environ.get(alias, "") != "":
+                    values[key] = _coerce(key, os.environ[alias])
+                    sources[key] = "env"
+                    break
+
+    for key, val in (cli_overrides or {}).items():
+        if val is None or key not in DEFAULTS:
+            continue
+        values[key] = _coerce(key, val)
+        sources[key] = "cli"
+
+    return values, sources
+
+
+def compact_at(cfg: dict) -> int:
+    """The token count at which compaction triggers (threshold × max)."""
+    return int(cfg["max_context"] * cfg["compact_threshold"])
+
+
+def resolved_session_dir(cfg: dict) -> Path:
+    d = (cfg.get("session_dir") or "").strip()
+    return Path(os.path.expanduser(d)) if d else (ROOT / "sessions")
+
+
+def resolved_export_dir(cfg: dict) -> Path:
+    d = (cfg.get("export_dir") or "").strip()
+    return Path(os.path.expanduser(d)) if d else (ROOT / "exports")
+
+
+def configure_logging(level: str = "info") -> None:
+    """Attach a stderr handler to the `mike` logger at the configured level."""
+    levels = {"debug": logging.DEBUG, "info": logging.INFO,
+              "warn": logging.WARNING, "warning": logging.WARNING,
+              "error": logging.ERROR}
+    log.setLevel(levels.get(str(level).lower(), logging.INFO))
+    if not log.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        log.addHandler(handler)
+        log.propagate = False
 
 SUMMARY_SECTIONS = [
     "## Goal",
@@ -652,7 +802,7 @@ class Toolbox:
             _schema({
                 "url": {"type": "string"},
                 "selector": {"type": "string", "description": "Optional CSS selector"},
-                "max_chars": {"type": "integer", "description": "Truncate output (default 8000)"},
+                "max_chars": {"type": "integer", "description": "Truncate output (default 8192)"},
             }, ["url"]),
             self._web_fetch, read_only=True, concurrency_safe=True,
         ))
@@ -849,7 +999,7 @@ class Toolbox:
     def _web_fetch(self, args: dict, ctx: "Toolbox") -> str:
         url = str(args["url"])
         selector = args.get("selector")
-        max_chars = int(args.get("max_chars", 8000) or 8000)
+        max_chars = int(args.get("max_chars", 8192) or 8192)
         try:
             import httpx
         except Exception:
@@ -928,14 +1078,14 @@ class Compactor:
     """Summarise older turns once the context grows past the threshold."""
 
     def __init__(self, counter: TokenCounter,
-                 max_context: int = MAX_CONTEXT_TOKENS,
-                 threshold: float = COMPACT_THRESHOLD,
-                 keep_recent: int = KEEP_RECENT_TURNS,
+                 max_context: Optional[int] = None,
+                 threshold: Optional[float] = None,
+                 keep_recent: Optional[int] = None,
                  summarizer: Optional[Callable[[str], str]] = None):
         self.counter = counter
-        self.max_context = max_context
-        self.threshold = threshold
-        self.keep_recent = keep_recent
+        self.max_context = DEFAULTS["max_context"] if max_context is None else max_context
+        self.threshold = DEFAULTS["compact_threshold"] if threshold is None else threshold
+        self.keep_recent = DEFAULTS["keep_recent_turns"] if keep_recent is None else keep_recent
         self.summarizer = summarizer
 
     # -- estimation -------------------------------------------------------
@@ -1222,8 +1372,8 @@ class Session:
 
 
 class SessionStore:
-    def __init__(self, directory: Path = SESSIONS_DIR):
-        self.directory = Path(directory)
+    def __init__(self, directory: Optional[Path] = None):
+        self.directory = Path(directory) if directory else (ROOT / "sessions")
         self.directory.mkdir(parents=True, exist_ok=True)
 
     def new_session(self, name: Optional[str] = None, first_message: str = "") -> Session:
@@ -1327,13 +1477,15 @@ class ServerStartError(RuntimeError):
 class ServerManager:
     """Start the local DeepSeek-API server, or attach to one already running."""
 
-    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
-                 root: Path = ROOT, console=None, no_server: bool = False):
-        self.host = host
-        self.port = port
+    def __init__(self, host: Optional[str] = None, port: Optional[int] = None,
+                 root: Path = ROOT, console=None, no_server: bool = False,
+                 server_cmd: str = ""):
+        self.host = host if host is not None else DEFAULTS["server_host"]
+        self.port = int(port) if port is not None else DEFAULTS["server_port"]
         self.root = Path(root)
         self.console = console or _make_console()
         self.no_server = no_server
+        self.server_cmd = (server_cmd or "").strip()
         self.process: Optional[subprocess.Popen] = None
         self.owned = False
         self._log: deque = deque(maxlen=200)
@@ -1370,9 +1522,13 @@ class ServerManager:
         env = os.environ.copy()
         env.setdefault("HOST", self.host)
         env.setdefault("PORT", str(self.port))
+        if self.server_cmd:
+            argv = shlex.split(self.server_cmd)
+        else:
+            argv = [sys.executable, "app.py"]
         try:
             self.process = subprocess.Popen(
-                [sys.executable, "app.py"],
+                argv,
                 cwd=str(self.root),
                 env=env,
                 stdout=subprocess.PIPE,
@@ -1656,8 +1812,13 @@ Rules:
 5. After you finish, give a one-line summary of what changed and how to run/test it.
 
 You always run as the single model {MODEL_LABEL}. Working directory: {{cwd}}.
-Context budget: {MAX_CONTEXT_TOKENS:,} tokens (auto-compaction at {COMPACT_AT_TOKENS:,}).
+Context budget: {{max_context:,}} tokens (auto-compaction at {{compact_at:,}}).
 """
+
+
+def build_system_prompt(cwd: str, max_context: int, compact_at_tokens: int) -> str:
+    return BASE_SYSTEM_PROMPT.format(cwd=cwd, max_context=max_context,
+                                     compact_at=compact_at_tokens)
 
 
 def build_prompted_tool_prompt(toolbox: Toolbox) -> str:
@@ -1709,7 +1870,9 @@ class MikeAgent:
         self.server = server
         self.cwd = cwd or os.getcwd()
         self.last_reasoning = self._last_reasoning_from_history()
-        self._system = BASE_SYSTEM_PROMPT.format(cwd=self.cwd)
+        self._system = build_system_prompt(
+            self.cwd, self.compactor.max_context, self.compactor.trigger_tokens
+        )
         # `session.messages` is the FULL, append-only history kept on disk.
         # `self.context` is what we actually send upstream; compaction shrinks
         # only this, so a crash or a compact never loses the transcript.
@@ -1841,7 +2004,7 @@ class MikeAgent:
     def _stream_once(self):
         messages = self._api_messages()
         tools = self.toolbox.openai_tools() if self.tool_mode == "native" else None
-        thinking = self.thinking_mode != "off"
+        thinking = self.thinking_mode != THINKING_OFF
 
         parser = StreamParser()
         native_calls: list = []
@@ -2094,8 +2257,8 @@ def run_repl(agent: MikeAgent, console) -> None:
             if arg == "on":
                 agent.thinking_mode = "on"
                 console.print("thinking: full reasoning shown (dim)")
-            elif arg == "off":
-                agent.thinking_mode = "off"
+            elif arg == THINKING_OFF:
+                agent.thinking_mode = THINKING_OFF
                 console.print("thinking: hidden")
             elif arg == "last":
                 if agent.last_reasoning:
@@ -2264,32 +2427,99 @@ def build_argparser() -> argparse.ArgumentParser:
             "mike - a self-contained, zero-cost DeepSeek coding harness. "
             "Launches the local DeepSeek-API server, talks to its OpenAI-compatible "
             "endpoint, and runs an interactive agent with tools, compaction and "
-            f"resumable sessions. Exactly one model is surfaced: {MODEL_LABEL}."
+            f"resumable sessions. Exactly one model is surfaced: {MODEL_LABEL}. "
+            "Config is layered: defaults < ~/.config/mike/config.toml < ./mike.toml "
+            "< MIKE_* env vars < CLI flags."
         ),
-        epilog="Examples:\n  python mike.py\n  python mike.py resume\n"
-               "  python mike.py --model deepseek-chat",
+        epilog=("Examples:\n"
+                "  python mike.py\n"
+                "  python mike.py resume\n"
+                "  python mike.py config\n"
+                "  python mike.py --max-context 200000 config\n"
+                "  python mike.py export my-session ./out.md"),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("command", nargs="?", choices=["resume"],
-                        help="'resume' opens the interactive session picker")
+    parser.add_argument("command", nargs="?", choices=["resume", "config"],
+                        help="'resume' opens the session picker; 'config' prints the "
+                             "resolved config")
+    parser.add_argument("rest", nargs="*", help="arguments for the 'export' command")
     parser.add_argument("--resume", action="store_true",
                         help="same as the 'resume' command")
-    parser.add_argument("--model", default=None,
-                        help="select a model by name/alias (all aliases route to "
-                             f"{MODEL_ID})")
-    parser.add_argument("--host", default=DEFAULT_HOST)
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--no-server", action="store_true",
                         help="assume a server is already running; never launch one")
     parser.add_argument("--version", action="version", version=f"mike {__version__}")
+
+    # Config-mirroring flags. default=SUPPRESS so an unset flag is simply absent
+    # from the namespace — that is how `load_config` tells "cli" from "default".
+    S = argparse.SUPPRESS
+    parser.add_argument("--max-context", dest="max_context", type=int, default=S,
+                        metavar="N", help="total token budget (compaction threshold × max)")
+    parser.add_argument("--compact-threshold", dest="compact_threshold", type=float, default=S,
+                        metavar="F", help="fraction of the budget that triggers compaction")
+    parser.add_argument("--keep-recent-turns", dest="keep_recent_turns", type=int, default=S,
+                        metavar="N", help="turns preserved verbatim across a compaction")
+    parser.add_argument("--host", dest="server_host", default=S, help="server host")
+    parser.add_argument("--port", dest="server_port", type=int, default=S, help="server port")
+    parser.add_argument("--server-cmd", dest="server_cmd", default=S,
+                        help="command to launch the server (empty => auto-detect)")
+    parser.add_argument("--model", dest="model", default=S,
+                        help="model name/alias (all aliases route to "
+                             f"{MODEL_ID})")
+    parser.add_argument("--thinking", dest="thinking_default",
+                        choices=THINKING_CHOICES, default=S,
+                        help="default thinking display")
+    parser.add_argument("--tool-call-mode", dest="tool_call_mode",
+                        choices=["auto", "native", "prompted"], default=S)
+    parser.add_argument("--session-dir", dest="session_dir", default=S)
+    parser.add_argument("--export-dir", dest="export_dir", default=S)
+    parser.add_argument("--log-level", dest="log_level",
+                        choices=["debug", "info", "warn", "warning", "error"], default=S)
     return parser
+
+
+def _fmt_cfg_value(value) -> str:
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def print_config(cfg: dict, sources: dict, console) -> None:
+    """Print the resolved config as a deterministic key | value | source table."""
+    if _RICH:
+        table = Table(title="mike config", show_header=True, header_style="bold")
+        table.add_column("key", style="cyan")
+        table.add_column("value")
+        table.add_column("source", style="dim")
+        for key in DEFAULTS:
+            table.add_row(key, _fmt_cfg_value(cfg[key]), sources.get(key, "default"))
+        console.print(table)
+        console.print(f"[dim]user config: {USER_CONFIG} "
+                      f"({'found' if USER_CONFIG.exists() else 'missing'})[/dim]")
+        console.print(f"[dim]repo config: {REPO_CONFIG} "
+                      f"({'found' if REPO_CONFIG.exists() else 'missing'})[/dim]")
+    else:
+        for key in DEFAULTS:
+            console.print(f"{key} | {_fmt_cfg_value(cfg[key])} | {sources.get(key, 'default')}")
+
+
+def _cli_overrides(args) -> dict:
+    ns = vars(args)
+    return {k: v for k, v in ns.items() if k in DEFAULTS and v is not None}
 
 
 def main(argv: Optional[list] = None) -> int:
     parser = build_argparser()
     args = parser.parse_args(argv)
 
+    cfg, sources = load_config(_cli_overrides(args))
+    configure_logging(cfg["log_level"])
     console = _make_console()
+
+    # --- pure/local subcommands that do not need the server ----------------------
+    if args.command == "config":
+        print_config(cfg, sources, console)
+        return 0
+
     state = load_state()
     counter = TokenCounter.create()
     if state.get("estimator") != counter.name:
@@ -2297,37 +2527,39 @@ def main(argv: Optional[list] = None) -> int:
         save_state(state)
 
     # --- start / attach the server (argparse already handled --help) -------------
-    server = ServerManager(args.host, args.port, ROOT, console=console,
-                           no_server=args.no_server)
+    server = ServerManager(cfg["server_host"], cfg["server_port"], ROOT, console=console,
+                           no_server=args.no_server, server_cmd=cfg["server_cmd"])
     try:
         server.ensure_running()
     except ServerStartError as exc:
         console.print(f"[red]could not start the DeepSeek-API server:[/red]\n{exc}")
         return 1
 
-    llm = DeepSeekLLM(server.base_url, API_KEY, resolve_model(args.model))
+    llm = DeepSeekLLM(server.base_url, API_KEY, resolve_model(cfg["model_id"]))
 
     # --- tool mode: cached, else probe once --------------------------------------
-    tool_mode = state.get("tool_mode")
+    forced = cfg["tool_call_mode"]
+    if forced in ("native", "prompted"):
+        tool_mode = forced
+    else:
+        tool_mode = state.get("tool_mode")
     if tool_mode not in ("native", "prompted"):
         tool_mode = detect_tool_mode(llm)
-        state["tool_mode"] = tool_mode
-        state["port"] = args.port
-        save_state(state)
+    state["tool_mode"] = tool_mode
+    state["port"] = cfg["server_port"]
+    save_state(state)
 
     console.print(
         f"[dim]info: single model {MODEL_LABEL} ({MODEL_ID}); "
         f"{len(MODEL_ALIASES)} legacy aliases route to it; tools: {tool_mode}[/dim]"
     )
-    if args.model:
-        resolve_model(args.model)  # explicit selection, still one backend model
 
-    store = SessionStore(SESSIONS_DIR)
+    store = SessionStore(resolved_session_dir(cfg))
     compactor = Compactor(
         counter,
-        max_context=MAX_CONTEXT_TOKENS,
-        threshold=COMPACT_THRESHOLD,
-        keep_recent=KEEP_RECENT_TURNS,
+        max_context=cfg["max_context"],
+        threshold=cfg["compact_threshold"],
+        keep_recent=cfg["keep_recent_turns"],
         summarizer=None,  # deterministic, guaranteed 7-section summaries
     )
     toolbox = Toolbox(os.getcwd())
@@ -2342,7 +2574,8 @@ def main(argv: Optional[list] = None) -> int:
     agent = MikeAgent(
         llm=llm, session=session, store=store, compactor=compactor,
         toolbox=toolbox, console=console, tool_mode=tool_mode,
-        thinking_mode=state.get("thinking_mode", "spinner"),
+        thinking_mode=(THINKING_OFF if cfg["thinking_default"] in ("last", THINKING_OFF)
+                       else cfg["thinking_default"]),
         server=server, cwd=os.getcwd(),
     )
 
