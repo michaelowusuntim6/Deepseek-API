@@ -350,3 +350,145 @@ with sorted keys). Schema:
 Message dicts are OpenAI-shaped and may additionally carry `reasoning` (stripped
 from anything sent upstream) and `tool_calls`; compaction entries are
 `{"at_tokens", "summary", "new_session"}`.
+
+---
+
+## v0.2 config precedence
+
+Five layers, resolved once at startup; later wins. Merge is a shallow per-key
+`dict.update` (not a deep merge). `mike.py config` prints the winning source.
+
+| # | Layer | Source label |
+| - | ----- | ------------ |
+| 1 | `DEFAULTS` in `mike.py` | `default` |
+| 2 | `~/.config/mike/config.toml` | `user` |
+| 3 | `./mike.toml` | `repo` |
+| 4 | `MIKE_*` environment variables | `env` |
+| 5 | CLI flags | `cli` |
+
+Worked example — `max_context`:
+
+* no config, no env → `500000` (`default`)
+* `./mike.toml` says `max_context = 300000` → `300000` (`repo`)
+* …and `MIKE_MAX_CONTEXT=250000` is exported → `250000` (`env`)
+* …and the command is `mike.py --max-context 200000 config` → `200000` (`cli`)
+
+`MIKE_MAX_CONTEXT` keeps working exactly as documented in v0.1 (env beats
+default/repo); it is now simply one layer of the same ladder.
+
+### v0.2 decisions
+
+**D1. `model_id` is an extra config key.** *Decision:* the wire model id lives in
+`DEFAULTS["model_id"]` alongside `model` (the display name). *Rationale:* §3.6
+wants the model-id literal to occur exactly once; putting it in the defaults
+block satisfies both §3.6 and acceptance I, and `MODEL_ID`/`MODEL_ALIASES` derive
+from it. *Alternatives:* a bare module constant — rejected (duplicate literal).
+
+**D2. `config` and `export` do not start the server.** *Decision:* these two
+subcommands resolve config and either print it or write a file, then exit.
+*Rationale:* neither needs the model; launching the server would be slow and
+could pop a login window. *Alternatives:* start the server anyway — rejected as
+wasteful.
+
+**D3. Default `thinking_default` changed to `off`.** *Decision:* the v0.2 schema
+specifies `off`, so the interactive default is now hidden reasoning (v0.1
+defaulted to the dimmed spinner). `/thinking on|spinner|last` still work.
+*Rationale:* matches §3.2 exactly. *Alternatives:* keep `spinner` — rejected
+(contradicts the specified schema default).
+
+**D4. `session_dir` / `export_dir` default to empty string = repo dirs.**
+*Decision:* empty means `<repo>/sessions/` and `<repo>/exports/`; a set value is
+`expanduser`'d. *Rationale:* keeps the v0.1 locations while allowing overrides.
+
+**D5. Overwrite guard defaults to NO.** *Decision:* `/export` and the export
+subcommand refuse to overwrite unless `--force` is given (or the user answers
+`y` at an interactive prompt). *Rationale:* never destroy data by default.
+
+## v0.2 export format
+
+One sentence on the reasoning block: reasoning is wrapped in a GitHub
+`<details><summary>reasoning</summary>` block so it collapses by default and
+stays out of the way when reading a transcript, while still being present
+verbatim for audit.
+
+## v0.2 DSML hardening
+
+Parsing is done by `parse_dsml_calls()` (one pass, emission order) and hidden
+from user output by `strip_dsml()` / `StreamParser`. Edge cases:
+
+* **Standard open/close invoke** — `_DSML_OPEN_RE` finds the invoke tag,
+  `_DSML_CLOSE_RE` finds its close, `_DSML_PARAM_RE` collects the
+  `parameter` children. Dispatched with the parsed dict.
+* **Self-closing invoke** (`invoke … /`) — detected via the trailing `/` in the
+  open tag; dispatched with `{}` as arguments.
+* **Self-closing with attributes** — `_attrs_to_args()` turns non-`name`
+  attributes into arguments (e.g. `path="x.py"` → `{"path": "x.py"}`).
+* **Truncated / unclosed invoke** — when no close tag follows, the rest of the
+  message is treated as the body, the partial call is still dispatched, and a
+  WARN `tool_call_truncated name=<name>` is logged (test asserts the record).
+* **Malformed parameter JSON** — `_dsml_value()` keeps the raw string when
+  `json.loads` fails, so the call is dispatched rather than dropped.
+* **Multiple invokes** — the scanner iterates every invoke tag in order, so all
+  are dispatched, in emission order.
+* **Mixed envelope** — `parse_tool_calls()` runs the `<tool_call>` JSON parser
+  and the DSML parser over the same message and concatenates the results, so a
+  message containing both is fully handled.
+
+`edit_file` also accepts the short `{path, old, new}` form in addition to v0.1's
+`{path, old_string, new_string}`, matching §5.2.
+
+## v0.2 e2e — tool-call round-trip
+
+Manual verification of §5.4 against the real model (server auto-launched).
+Scratch file `e2e_edit_scratch.txt` started as:
+
+```
+line one
+OLD_VALUE
+line three
+```
+
+### Steps 1–3 — edit an existing file, check the disk diff, check scrollback
+
+```
+> Use the edit_file tool to edit the file e2e_edit_scratch.txt: replace the exact line OLD_VALUE with NEW_VALUE.
+I'll read the file first, then make the edit.
+* read_file(e2e_edit_scratch.txt)
+  |     1       line one ... +2 lines
+* edit_file(e2e_edit_scratch.txt)
+  | edited /home/mike/Deepseek-API/e2e_edit_scratch.txt (1 replacement)
+* read_file(e2e_edit_scratch.txt)
+  |     1       line one ... +2 lines
+The edit is done — line 2 of `e2e_edit_scratch.txt` now reads `NEW_VALUE`.
+```
+
+On-disk diff confirmed the mutation:
+
+```
+ line one
+-OLD_VALUE
++NEW_VALUE
+ line three
+```
+
+Scrollback leak check for real tool syntax markers
+(`｜DSML｜`, `<tool_call>`, `invoke name=`, `parameter name=`): **0 matches**.
+
+### Step 4 — repeat with `/thinking on`
+
+```
+> /thinking on
+thinking: full reasoning shown (dim)
+> Use the edit_file tool to edit e2e_edit_scratch.txt: replace the exact line OLD_VALUE with NEW_VALUE.
+Let me first read the file, then edit it.            <- dim reasoning (visible)
+* read_file(/home/mike/Deepseek-API/e2e_edit_scratch.txt)
+  |     1       line one ... +2 lines
+The user wants me to edit the file, replacing OLD_VALUE with NEW_VALUE…  <- dim reasoning
+* edit_file(e2e_edit_scratch.txt)
+  | edited /home/mike/Deepseek-API/e2e_edit_scratch.txt (1 replacement)
+…
+Done — `e2e_edit_scratch.txt` line 2 now reads `NEW_VALUE`.
+```
+
+Reasoning is visible (dim), the file was edited (diff identical to above), and
+the tool-syntax leak check was again **0 matches**.

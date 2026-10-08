@@ -557,35 +557,90 @@ class StreamParser:
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
-# DeepSeek's native DSML tool-call syntax:
-#   <|DSML| ... calls> <|DSML| ... invoke name="tool"> ... </|DSML| ... invoke> ...
-# Written as tolerant patterns so the exact full-width markers don't matter.
-_DSML_INVOKE_RE = re.compile(
-    r"<[^<>]*?invoke\s+name=\"([^\"]+)\"[^<>]*>(.*?)</[^<>]*?invoke\s*>",
-    re.DOTALL | re.IGNORECASE,
-)
+# DeepSeek's native DSML tool-call syntax. The exact marker characters vary, so
+# these patterns are deliberately tolerant: they key off the ASCII words
+# (invoke / parameter / calls) rather than the surrounding full-width glyphs.
+#
+#   container tag named ...calls...
+#     <... invoke name="tool"> ... <... parameter name="k">v</... parameter> ... </... invoke>
+#     <... invoke name="tool" />            (self-closing -> {} args)
+#     <... invoke name="tool" path="x" />   (attribute-style args)
+_DSML_OPEN_RE = re.compile(r"<(?!/)[^<>]*?invoke\b([^<>]*?)(/?)>", re.IGNORECASE)
+_DSML_CLOSE_RE = re.compile(r"</[^<>]*?invoke\s*>", re.IGNORECASE)
 _DSML_PARAM_RE = re.compile(
-    r"<[^<>]*?parameter\s+name=\"([^\"]+)\"([^<>]*)>(.*?)</[^<>]*?parameter\s*>",
+    r"<(?!/)[^<>]*?parameter\b([^<>]*?)>(.*?)(?:</[^<>]*?parameter\s*>|$)",
     re.DOTALL | re.IGNORECASE,
 )
+_DSML_ATTR_RE = re.compile(r'([A-Za-z_][\w.-]*)\s*=\s*"([^"]*)"')
 _DSML_BLOCK_RE = re.compile(
     r"<[^<>]*?calls[^<>]*>.*?</[^<>]*?calls\s*>",
     re.DOTALL | re.IGNORECASE,
 )
+_DSML_CALLS_OPEN_RE = re.compile(r"<[^<>]*?calls[^<>]*>", re.IGNORECASE)
+
+
+def _attr_value(attrs: str, key: str) -> Optional[str]:
+    for name, value in _DSML_ATTR_RE.findall(attrs or ""):
+        if name.lower() == key.lower():
+            return value
+    return None
+
+
+def _attrs_to_args(attrs: str) -> dict:
+    """Attribute-style arguments, used by self-closing invoke tags."""
+    args: dict = {}
+    for name, value in _DSML_ATTR_RE.findall(attrs or ""):
+        if name.lower() in ("name", "string"):
+            continue
+        args[name] = value
+    return args
+
+
+def _parse_param_tags(body: str) -> dict:
+    args: dict = {}
+    for pm in _DSML_PARAM_RE.finditer(body or ""):
+        attrs = pm.group(1)
+        args[_attr_value(attrs, "name") or "value"] = _dsml_value(pm.group(2), attrs)
+    return args
 
 
 def parse_dsml_calls(text: str) -> list[dict]:
-    """Parse DeepSeek's native DSML invoke/parameter tool-call syntax."""
+    """Parse DeepSeek's native DSML invoke/parameter tool-call syntax.
+
+    Handles, in one pass and in emission order: standard open/close invokes,
+    self-closing invokes with no arguments, attribute-style arguments on a
+    self-closing invoke, multiple invokes per message, and a truncated invoke
+    with no closing tag (the partial call is still dispatched, and a WARN is
+    logged as ``tool_call_truncated name=<name>``).
+    """
+    text = text or ""
     calls: list[dict] = []
-    for m in _DSML_INVOKE_RE.finditer(text or ""):
-        args: dict = {}
-        for pm in _DSML_PARAM_RE.finditer(m.group(2)):
-            args[pm.group(1)] = _dsml_value(pm.group(3), pm.group(2))
-        calls.append({"name": m.group(1), "arguments": args})
+    for m in _DSML_OPEN_RE.finditer(text):
+        attrs = m.group(1) or ""
+        self_closing = m.group(2) == "/"
+        name = _attr_value(attrs, "name")
+        if not name:
+            continue
+        if self_closing:
+            calls.append({"name": name, "arguments": _attrs_to_args(attrs)})
+            continue
+        close = _DSML_CLOSE_RE.search(text, m.end())
+        if close is not None:
+            body = text[m.end():close.start()]
+            calls.append({"name": name, "arguments": _parse_param_tags(body)})
+        else:
+            body = text[m.end():]
+            calls.append({"name": name, "arguments": _parse_param_tags(body)})
+            log.warning("tool_call_truncated name=%s", name)
     return calls
 
 
 def _dsml_value(raw: str, attrs: str):
+    """Decode a parameter value.
+
+    ``string="true"`` values are returned verbatim; anything else is parsed as
+    JSON and, if that fails, kept as the raw string rather than dropped.
+    """
     if re.search(r'string\s*=\s*"true"', attrs or "", re.IGNORECASE):
         value = raw
         if value.startswith("\n"):
@@ -600,7 +655,21 @@ def _dsml_value(raw: str, attrs: str):
 def strip_dsml(text: str) -> str:
     if not text:
         return text
-    return _DSML_BLOCK_RE.sub("", text)
+    out = _DSML_BLOCK_RE.sub("", text)
+    # Bare invoke blocks (no container).
+    out = re.sub(r"<(?!/)[^<>]*?invoke\b[^<>]*>.*?</[^<>]*?invoke\s*>", "",
+                 out, flags=re.DOTALL | re.IGNORECASE)
+    out = re.sub(r"<(?!/)[^<>]*?invoke\b[^<>]*/>", "", out, flags=re.IGNORECASE)
+    # Drop a truncated (unclosed) container or invoke too, so nothing leaks.
+    m = _DSML_CALLS_OPEN_RE.search(out)
+    if m is not None:
+        out = out[:m.start()]
+    m = re.search(r"<(?!/)[^<>]*?invoke\b", out, re.IGNORECASE)
+    if m is not None:
+        out = out[:m.start()]
+    # Any leftover parameter tags.
+    out = re.sub(r"</?[^<>]*?parameter\b[^<>]*>", "", out, flags=re.IGNORECASE)
+    return out
 
 
 def parse_tool_calls(text: str) -> tuple[list[dict], str]:
@@ -743,10 +812,12 @@ class Toolbox:
             "Replace an exact string in a file. Fails if old_string is missing or ambiguous unless replace_all=true.",
             _schema({
                 "path": {"type": "string"},
-                "old_string": {"type": "string", "description": "Exact text to find"},
-                "new_string": {"type": "string", "description": "Replacement text"},
+                "old_string": {"type": "string", "description": "Exact text to find (alias: old)"},
+                "new_string": {"type": "string", "description": "Replacement text (alias: new)"},
+                "old": {"type": "string", "description": "Alias of old_string"},
+                "new": {"type": "string", "description": "Alias of new_string"},
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"},
-            }, ["path", "old_string", "new_string"]),
+            }, ["path"]),
             self._edit_file, read_only=False, concurrency_safe=False, destructive=False,
         ))
         self._add(ToolSpec(
@@ -882,8 +953,19 @@ class Toolbox:
         path = self._resolve(args["path"])
         if not os.path.isfile(path):
             return f"error: file not found: {path}"
-        old = str(args.get("old_string", ""))
-        new = str(args.get("new_string", ""))
+        # Accept both {old_string, new_string} and the shorter {old, new} form.
+        if "old_string" in args:
+            old = str(args.get("old_string") or "")
+        elif "old" in args:
+            old = str(args.get("old") or "")
+        else:
+            return "error: edit_file requires 'old_string' (alias: 'old')"
+        if "new_string" in args:
+            new = str(args.get("new_string") or "")
+        elif "new" in args:
+            new = str(args.get("new") or "")
+        else:
+            new = ""
         replace_all = bool(args.get("replace_all", False))
         with open(path, "r", errors="replace") as fh:
             original = fh.read()

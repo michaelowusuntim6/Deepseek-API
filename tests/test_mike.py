@@ -7,6 +7,7 @@ hermetic. Run with:
 """
 
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -561,3 +562,280 @@ def test_export_escapes_leading_hr(tmp_path):
     s.messages = [{"role": "user", "content": "---\nnot a rule"}]
     md = mike.render_transcript(s)
     assert "\\---\nnot a rule" in md
+
+
+# --------------------------------------------------------------------------- #
+# 10. Hardened tool-call round-trip (v0.2) — the acceptance gate               #
+# --------------------------------------------------------------------------- #
+
+def _calls_open():
+    return f"<{BAR}DSML{BAR}{BAR} calls>"
+
+
+def _calls_close():
+    return f"</{BAR}{BAR}DSML{BAR}{BAR} calls>"
+
+
+def _invoke_open(name):
+    return f"<{BAR}{BAR}DSML{BAR}{BAR} invoke name=\"{name}\">"
+
+
+def _invoke_close():
+    return f"</{BAR}{BAR}DSML{BAR}{BAR} invoke>"
+
+
+def _param(name, value, as_string=True):
+    attr = ' string="true"' if as_string else ""
+    return (f"<{BAR}{BAR}DSML{BAR}{BAR} parameter name=\"{name}\"{attr}>"
+            f"{value}</{BAR}{BAR}DSML{BAR}{BAR} parameter>")
+
+
+def _dsml_block(name, params):
+    lines = [_calls_open(), _invoke_open(name)]
+    lines += [_param(k, v) for k, v in params]
+    lines += [_invoke_close(), _calls_close()]
+    return "\n".join(lines)
+
+
+def _selfclosing(name, **attrs):
+    extra = "".join(f' {k}="{v}"' for k, v in attrs.items())
+    return (f"<{BAR}DSML{BAR}{BAR} calls>\n"
+            f"<{BAR}{BAR}DSML{BAR}{BAR} invoke name=\"{name}\"{extra} />\n"
+            f"{_calls_close()}")
+
+
+def _truncated(name, param_name, value):
+    # No closing tags anywhere: the stream stops mid-invoke.
+    return (f"<{BAR}DSML{BAR}{BAR} calls>\n"
+            f"<{BAR}{BAR}DSML{BAR}{BAR} invoke name=\"{name}\">\n"
+            f"<{BAR}{BAR}DSML{BAR}{BAR} parameter name=\"{param_name}\" string=\"true\">"
+            f"{value}")
+
+
+class _RecordingConsole(mike._PlainConsole):
+    def __init__(self):
+        self.lines = []
+
+    def print(self, *args, **kwargs):
+        self.lines.append(" ".join(str(a) for a in args))
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+
+def _assert_no_syntax(text):
+    for bad in ("DSML", "<tool_call>", f"<{BAR}", f"</{BAR}"):
+        assert bad not in text, f"tool syntax leaked into user-visible output: {bad!r}"
+
+
+def _make_roundtrip_agent(tmp_path, turns, tool_mode="prompted", cwd=None):
+    llm = _FakeLLM(turns)
+    store = mike.SessionStore(tmp_path / "sessions")
+    session = store.new_session(name="rt")
+    comp = mike.Compactor(mike.TokenCounter("heuristic"))
+    console = _RecordingConsole()
+    agent = mike.MikeAgent(
+        llm=llm, session=session, store=store, compactor=comp,
+        toolbox=mike.Toolbox(str(cwd or tmp_path)), console=console,
+        tool_mode=tool_mode, cwd=str(cwd or tmp_path),
+    )
+    return agent, llm, console, session
+
+
+def _spy(agent):
+    """Wrap Toolbox.call, recording (name, args) for every dispatch."""
+    recorded = []
+    original = agent.toolbox.call
+
+    def wrapper(name, args):
+        recorded.append((name, args))
+        return original(name, args)
+
+    agent.toolbox.call = wrapper
+    return recorded
+
+
+class TestToolCallRoundTrip:
+    def test_dsml_standard_roundtrip(self, tmp_path):
+        (tmp_path / "x.py").write_text("hello world\n")
+        turns = [
+            [{"type": "content", "text": _dsml_block("read_file", [("path", "x.py")])}],
+            [{"type": "content", "text": "I read the file."}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+        recorded = _spy(agent)
+        result = agent.run("read x.py")
+
+        assert recorded == [("read_file", {"path": "x.py"})]
+        assert result == "I read the file."
+        fed = [m for m in session.messages if "<tool_result>" in str(m.get("content"))]
+        assert fed and "hello world" in str(fed[0]["content"])
+        assert "DSML" not in result
+        _assert_no_syntax(console.text)
+
+    def test_dsml_selfclosing(self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        turns = [
+            [{"type": "content", "text": _selfclosing("list_dir")}],
+            [{"type": "content", "text": "listed it"}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+        recorded = _spy(agent)
+        result = agent.run("list the dir")
+
+        assert recorded == [("list_dir", {})]
+        assert result == "listed it"
+        assert any("<tool_result>" in str(m.get("content")) for m in session.messages)
+        _assert_no_syntax(console.text)
+
+    def test_dsml_selfclosing_with_attrs(self, tmp_path):
+        (tmp_path / "x.py").write_text("attr style\n")
+        turns = [
+            [{"type": "content", "text": _selfclosing("read_file", path="x.py")}],
+            [{"type": "content", "text": "ok"}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+        recorded = _spy(agent)
+        agent.run("read it")
+
+        assert recorded == [("read_file", {"path": "x.py"})]
+        assert any("attr style" in str(m.get("content")) for m in session.messages)
+        _assert_no_syntax(console.text)
+
+    def test_dsml_truncated(self, tmp_path, caplog):
+        (tmp_path / "x.py").write_text("partial\n")
+        turns = [
+            [{"type": "content", "text": _truncated("read_file", "path", "x.py")}],
+            [{"type": "content", "text": "done"}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+        recorded = _spy(agent)
+        with caplog.at_level(logging.WARNING, logger="mike"):
+            agent.run("read it")
+
+        assert recorded == [("read_file", {"path": "x.py"})]
+        assert any("tool_call_truncated" in r.getMessage() for r in caplog.records)
+        assert any("partial" in str(m.get("content")) for m in session.messages)
+        _assert_no_syntax(console.text)
+
+    def test_malformed_param_json(self, tmp_path):
+        (tmp_path / "x.py").write_text("malformed\n")
+        # No string="true" -> claimed as JSON, but "{not json" is not valid JSON.
+        text = _dsml_block("read_file", [("path", "{not json")])
+        calls, _clean = mike.parse_tool_calls(text)
+        assert calls == [{"name": "read_file", "arguments": {"path": "{not json"}}]
+
+        turns = [
+            [{"type": "content", "text": text}],
+            [{"type": "content", "text": "handled"}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+        recorded = _spy(agent)
+        agent.run("go")
+        assert recorded == [("read_file", {"path": "{not json"})]
+        _assert_no_syntax(console.text)
+
+    def test_multiple_invokes(self, tmp_path):
+        (tmp_path / "a.py").write_text("AAA\n")
+        (tmp_path / "b.py").write_text("BBB\n")
+        text = (_invoke_open("read_file") + "\n" + _param("path", "a.py") + "\n"
+                + _invoke_close() + "\n" + _invoke_open("read_file") + "\n"
+                + _param("path", "b.py") + "\n" + _invoke_close())
+        turns = [
+            [{"type": "content", "text": text}],
+            [{"type": "content", "text": "both read"}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+        recorded = _spy(agent)
+        agent.run("read both")
+
+        assert [r[0] for r in recorded] == ["read_file", "read_file"]
+        assert [r[1]["path"] for r in recorded] == ["a.py", "b.py"]
+        _assert_no_syntax(console.text)
+
+    def test_mixed_envelope(self, tmp_path):
+        (tmp_path / "a.py").write_text("AAA\n")
+        (tmp_path / "b.py").write_text("BBB\n")
+        json_block = ('<tool_call>{"name": "read_file", '
+                      '"arguments": {"path": "a.py"}}</tool_call>')
+        text = json_block + "\n" + _dsml_block("read_file", [("path", "b.py")])
+        turns = [
+            [{"type": "content", "text": text}],
+            [{"type": "content", "text": "both read"}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+        recorded = _spy(agent)
+        agent.run("read both")
+
+        paths = sorted(r[1]["path"] for r in recorded)
+        assert paths == ["a.py", "b.py"]
+        assert all(r[0] == "read_file" for r in recorded)
+        _assert_no_syntax(console.text)
+        assert "<tool_call>" not in console.text
+
+    def test_edit_file_roundtrip(self, tmp_path):
+        target = tmp_path / "code.txt"
+        target.write_text("alpha\nbeta\ngamma\n")
+        (tmp_path / "note").write_text("")
+        text = _dsml_block("edit_file", [("path", str(target)),
+                                         ("old", "beta"),
+                                         ("new", "BETA")])
+        turns = [
+            [{"type": "content", "text": text}],
+            [{"type": "content", "text": "Renamed beta to BETA."}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+        recorded = _spy(agent)
+        result = agent.run("change beta to BETA")
+
+        assert recorded[0][0] == "edit_file"
+        assert recorded[0][1]["old"] == "beta" and recorded[0][1]["new"] == "BETA"
+        # The file on disk was really mutated.
+        on_disk = target.read_text()
+        assert "BETA" in on_disk and "beta" not in on_disk
+        assert result == "Renamed beta to BETA."
+        _assert_no_syntax(console.text)
+
+    def test_edit_file_not_unique(self, tmp_path):
+        target = tmp_path / "dup.txt"
+        original = "same\nsame\n"
+        target.write_text(original)
+        text = _dsml_block("edit_file", [("path", str(target)),
+                                         ("old", "same"),
+                                         ("new", "diff")])
+        turns = [
+            [{"type": "content", "text": text}],
+            [{"type": "content", "text": "I could not make that edit."}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+        recorded = _spy(agent)
+        result = agent.run("replace same")
+
+        # The tool ran, returned an error, and did NOT write the file.
+        assert recorded[0][0] == "edit_file"
+        assert target.read_text() == original
+        fed = [m for m in session.messages if "<tool_result>" in str(m.get("content"))]
+        assert fed and "error" in str(fed[0]["content"]).lower()
+        assert "appears 2 times" in str(fed[0]["content"])
+        assert result == "I could not make that edit."
+        _assert_no_syntax(console.text)
+
+    def test_native_mode_still_works(self, tmp_path):
+        (tmp_path / "x.py").write_text("native path\n")
+        turns = [
+            [{"type": "tool_calls", "calls": [
+                {"id": "call_1", "name": "read_file", "arguments": {"path": "x.py"}}]}],
+            [{"type": "content", "text": "native done"}],
+        ]
+        agent, llm, console, session = _make_roundtrip_agent(
+            tmp_path, turns, tool_mode="native")
+        recorded = _spy(agent)
+        result = agent.run("read x.py")
+
+        assert recorded == [("read_file", {"path": "x.py"})]
+        assert result == "native done"
+        tool_msgs = [m for m in session.messages if m.get("role") == "tool"]
+        assert tool_msgs and tool_msgs[0]["tool_call_id"] == "call_1"
+        assert "native path" in tool_msgs[0]["content"]
+        _assert_no_syntax(console.text)
