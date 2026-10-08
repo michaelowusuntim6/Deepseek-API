@@ -292,3 +292,61 @@ full 8-message transcript (compaction did not truncate it).
 | I | `pytest tests/test_mike.py` passes | ✅ 35 passed |
 | J | README.md and DECISIONS.md updated | ✅ |
 | K | all work committed, final message `feat(mike): self-contained free-DeepSeek harness with 500k ctx + resume.` | ✅ |
+
+---
+
+# v0.2 — config, /export, hardened tool-call round-trip
+
+## v0.2 Recon
+
+Read-only reconnaissance of the v0.1 codebase before any v0.2 change.
+
+**1. Current precedence for `MIKE_MAX_CONTEXT` and `COMPACT_THRESHOLD`.**
+There is no config file layer yet. `MIKE_MAX_CONTEXT` is read exactly once, at
+module import time (`mike.py` ~lines 122-126):
+`DEFAULT_MAX_CONTEXT_TOKENS = 500_000`, then
+`MAX_CONTEXT_TOKENS = int(os.getenv("MIKE_MAX_CONTEXT", str(DEFAULT_MAX_CONTEXT_TOKENS)))`
+(wrapped in try/except, falling back to the default on a bad value). So today the
+precedence is simply **env > hard-coded default**. `COMPACT_THRESHOLD` is a bare
+literal `0.80` with **no** env/CLI override, and `COMPACT_AT_TOKENS` is derived
+as `int(MAX_CONTEXT_TOKENS * COMPACT_THRESHOLD)`. (`MIKE_PORT` / `PORT` and
+`HOST` similarly feed `DEFAULT_PORT` / `DEFAULT_HOST` at import time.)
+
+**2. Functions that parse DSML and `<tool_call>` envelopes.**
+One entry point, `parse_tool_calls(text) -> (calls, clean_text)` (mike.py:456). It
+extracts `<tool_call>…</tool_call>` blocks with `_TOOL_CALL_BLOCK_RE`, falls back
+to fenced ```json objects (`_FENCED_JSON_RE` + `_loads_tool_obj`), then calls
+`parse_dsml_calls(text)` and strips the DSML blocks with `strip_dsml(text)`.
+DSML itself is parsed by `parse_dsml_calls(text)` (mike.py:427) using
+`_DSML_INVOKE_RE` and `_DSML_PARAM_RE`; each parameter value goes through
+`_dsml_value(raw, attrs)`. Display-side hiding of both syntaxes is done by
+`StreamParser` via `_TAG_RE` / `_tag_name`.
+
+**3. Functions that dispatch a parsed call and format the result back.**
+Dispatch is `Toolbox.call(name, args) -> str` (mike.py:683), which looks the tool
+up in `Toolbox.specs` and wraps exceptions into an `error: …` string. Feeding the
+result back into the conversation is `MikeAgent._run_tools(calls)` (mike.py:1918):
+in **prompted** mode it appends `{"role": "user", "content": "<tool_result>…</tool_result>"}`;
+in **native** mode it appends `{"role": "tool", "tool_call_id": …}`. Both go
+through `MikeAgent._append(msg)` (mike.py:1822) so they land in the on-disk
+`session.messages` *and* the in-context `self.context`.
+
+**4. Does the DSML parser handle self-closing / unclosed tags?**
+**No.** `_DSML_INVOKE_RE` is
+`<[^<>]*?invoke\s+name="…"[^<>]*>(.*?)</[^<>]*?invoke\s*>` — it *requires* a
+matching close tag. A self-closing `<…invoke name="x" />`, attribute-style args
+(`<…invoke name="read_file" path="x.py" />`), and a truncated/unclosed invoke all
+match nothing and are silently dropped today. `_dsml_value` also silently
+converts malformed "JSON" parameter values to the raw string only when the tag
+lacks `string="true"` (it does keep them as raw strings — so that part is fine).
+
+**5. Session JSON location and schema.**
+Sessions live in `SESSIONS_DIR = ROOT / "sessions"` (`~/Deepseek-API/sessions/`)
+as `YYYYMMDD-HHMMSS__<slug>.json`. `SessionStore.list_sessions()` / `.find()` read
+them via the `Session.load(path)` classmethod (`json.loads`); `Session.save()`
+writes via `atomic_write_json` (temp file + `fsync` + `os.replace`, pretty-printed
+with sorted keys). Schema:
+`{"id", "name", "created_at", "updated_at", "model", "messages": [...], "compactions": [...]}`.
+Message dicts are OpenAI-shaped and may additionally carry `reasoning` (stripped
+from anything sent upstream) and `tool_calls`; compaction entries are
+`{"at_tokens", "summary", "new_session"}`.
