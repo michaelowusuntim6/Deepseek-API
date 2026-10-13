@@ -36,7 +36,12 @@ DEFAULT_SESSION_FILE = ROOT / "session" / "session.json"
 CHAT_URL = "https://chat.deepseek.com/"
 SIGNIN_URL = "https://chat.deepseek.com/sign_in"
 
-LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
+# Standard, banner-free startup flags. `--no-first-run`/`--no-default-browser-check`
+# keep Chrome from opening the first-run welcome / default-browser prompt (an extra
+# about:blank-style tab). We do NOT pass `--disable-blink-features=AutomationControlled`
+# — Chrome shows a security banner for it and it is unnecessary here; navigator.webdriver
+# stealth is applied via CDP instead (see _open_context).
+LAUNCH_ARGS = ["--no-first-run", "--no-default-browser-check"]
 # Token is trusted for this long before we refresh it from the browser again.
 SESSION_MAX_AGE = 6 * 60 * 60  # 6 hours
 
@@ -290,6 +295,12 @@ def _open_context(p, *, headless: bool, fallback_profile: Path):
         try:
             udd.mkdir(parents=True, exist_ok=True)
             context = p.chromium.launch_persistent_context(str(udd), **kwargs)
+            # navigator.webdriver stealth via CDP init script — replaces the
+            # `--disable-blink-features=AutomationControlled` flag (which triggered
+            # Chrome's "unsupported flag" banner). Applies to every current and
+            # future page in the context, before any navigation, with no banner.
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             log.info("[auth] using profile: %s (mode: %s)", udd, label)
             return context
         except Exception as exc:
@@ -320,6 +331,13 @@ def login(
     with sync_playwright() as p:
         context = _open_context(p, headless=headless, fallback_profile=profile_dir)
         page = context.pages[0] if context.pages else context.new_page()
+        # A restored Chrome profile can open several session tabs; keep exactly
+        # one so the visible tab is the one we navigate (no stray about:blank).
+        for extra in context.pages[1:]:
+            try:
+                extra.close()
+            except Exception:
+                pass
 
         # Normally we first land on CHAT_URL to reuse an already-signed-in
         # profile. When the caller already knows we're logged out, skip straight
