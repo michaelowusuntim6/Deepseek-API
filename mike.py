@@ -417,7 +417,8 @@ class TokenCounter:
 _TAG_RE = re.compile(
     r"<｜(?:begin|end)▁of▁(?:thinking|reasoning)｜>"
     r"|<\s*/?\s*(?:think|thinking|reasoning|tool_call)\s*>"
-    r"|<[^<>]*?(?:DSML|dsml)[^<>]*>",
+    r"|<[^<>]*?(?:DSML|dsml)[^<>]*>"
+    r"|<\s*tool_result\b[^>]*>|<\s*/\s*tool_result\s*>",
     re.IGNORECASE,
 )
 _REASONING_TAGS = {"think", "thinking", "reasoning"}
@@ -426,6 +427,11 @@ _REASONING_TAGS = {"think", "thinking", "reasoning"}
 def _tag_name(raw_tag: str) -> tuple[str, bool]:
     raw = raw_tag.strip()
     low = raw.lower()
+    # mike's tool_result wrapper echoed by the model: hide it entirely (never
+    # treated as reasoning). The \b guard keeps near-tags like <tool_result_log>
+    # from being classified as tool_result.
+    if re.match(r"<\s*/?\s*tool_result\b", low):
+        return "tool_result", raw.startswith("</")
     # DeepSeek's native DSML tool-call tags. The container tags mention "calls";
     # the inner invoke/parameter tags do not, so they are no-ops for the parser
     # (their text is swallowed while the container keeps us in "hidden" mode).
@@ -471,6 +477,8 @@ def extract_thinking(text: str) -> tuple[str, str]:
             mode = "content" if closing else "reasoning"
         elif name == "tool_call":
             mode = "content" if closing else "hidden"
+        elif name == "tool_result":
+            mode = "content" if closing else "hidden"
     tail = text[pos:]
     if tail:
         if mode == "reasoning":
@@ -483,6 +491,32 @@ def extract_thinking(text: str) -> tuple[str, str]:
 def strip_thinking(text: str) -> str:
     """Return assistant content with reasoning and tool_call blocks removed."""
     return extract_thinking(text)[1]
+
+
+# mike feeds tool output back to the model wrapped as <tool_result>...</tool_result>
+# inside USER messages (the reference encoding shape). The model sometimes mimics that
+# wrapper inside its own assistant reply; it must never reach the user's terminal. These
+# remove a full block (content and all), a lone opening tag (with or without attributes),
+# or a lone closing tag — including whitespace/case variants — while never matching a
+# plain <result> or a near-tag like <tool_result_log> (the `\b` guard).
+_TOOL_RESULT_RE = re.compile(
+    r"<\s*tool_result\b[^>]*>.*?<\s*/\s*tool_result\s*>"   # full block (with attrs)
+    r"|<\s*/\s*tool_result\s*>"                            # lone closing tag
+    r"|<\s*tool_result\b[^>]*>",                           # lone opening tag (with attrs)
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_tool_results(text: str) -> str:
+    """Remove tool_result tags from the assistant's visible output.
+
+    The tool_result wrapper is a marker mike sends INSIDE user messages to feed tool
+    output back to the model. The model sometimes mimics the wrapper in its own
+    responses. That wrapper must never be visible in the assistant's reply.
+    """
+    if not text:
+        return text
+    return _TOOL_RESULT_RE.sub("", text)
 
 
 class StreamParser:
@@ -522,6 +556,10 @@ class StreamParser:
             if name in _REASONING_TAGS:
                 self._mode = "content" if closing else "reasoning"
             elif name == "tool_call":
+                self._mode = "content" if closing else "hidden"
+            elif name == "tool_result":
+                # Echoed tool_result wrapper: discard its content entirely (it is
+                # feedback the model saw, not reasoning), never accumulate it.
                 self._mode = "content" if closing else "hidden"
             self._buf = self._buf[m.end():]
         return [e for e in emitted if e[1]]
@@ -2392,6 +2430,11 @@ class MikeAgent:
                     maybe_reasoning, _ = extract_thinking(text)
                     if maybe_reasoning:
                         self.last_reasoning = maybe_reasoning
+
+            # Strip any echoed <tool_result> wrapper the model leaked into its reply
+            # (both tool modes). Idempotent; the stored assistant content stays clean
+            # so the next turn's history has no stray fragments.
+            clean_text = strip_tool_results(clean_text)
 
             if stream_error:
                 # The server sent a terminal error frame (Fix 1). Show the exact

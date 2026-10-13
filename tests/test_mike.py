@@ -1190,3 +1190,85 @@ def test_error_frame_shape_and_server_emits_on_failure():
     assert '"finish_reason": "error"' in resp.text
     assert "Authorization Failed" in resp.text
     assert "data: [DONE]" in resp.text
+
+
+# --------------------------------------------------------------------------- #
+# 14. Stray <tool_result> wrapper echo must never be visible (assistant side)  #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("text", [
+    "<tool_result>abc</tool_result>",   # full block
+    "<tool_result>",                     # lone opening tag
+    '<tool_result foo="bar">',           # lone opening tag with attributes
+    "</tool_result>",                    # lone closing tag
+    "< tool_result >",                   # whitespace inside brackets
+    "</ tool_result >",                  # whitespace inside closing bracket
+    "<TOOL_RESULT>",                     # case-insensitive open
+    "</Tool_Result>",                    # case-insensitive close
+    "<tool_result>x</TOOL_RESULT>",      # full block, mixed case
+])
+def test_strip_tool_results_removes_wrappers(text):
+    assert mike.strip_tool_results(text) == ""
+
+
+def test_strip_tool_results_preserves_surrounding_content():
+    close = "<" + "/tool_result" + ">"
+    # A stray closing tag between words is removed; the surrounding words stay.
+    assert mike.strip_tool_results("hello " + close + " world") == "hello  world"
+    # Text with no wrapper is returned unchanged (idempotent passthrough).
+    assert mike.strip_tool_results("plain  text") == "plain  text"
+
+
+def test_strip_tool_results_keeps_near_tags():
+    # Plain <result> is not the tool_result wrapper.
+    assert mike.strip_tool_results("<result>x</result>") == "<result>x</result>"
+    # A tag that merely starts with the substring must not be stripped (the \b guard).
+    assert mike.strip_tool_results(
+        "<tool_result_log>x</tool_result_log>") == "<tool_result_log>x</tool_result_log>"
+
+
+def test_strip_tool_results_empty_passthrough():
+    assert mike.strip_tool_results("") == ""
+    assert mike.strip_tool_results("plain text") == "plain text"
+
+
+def test_stream_parser_hides_tool_result_blocks():
+    sp = mike.StreamParser()
+    events = []
+    for chunk in ["Hi", "<tool_result>", " .git/", "</tool_result>", " done"]:
+        events += sp.feed(chunk)
+    events += sp.finish()
+    content = "".join(t for k, t in events if k == "content")
+    reasoning = "".join(t for k, t in events if k == "reasoning")
+    # tool_result content is discarded entirely, never accumulated as reasoning.
+    assert content == "Hi done"
+    assert reasoning == ""
+
+
+def test_stream_parser_hides_tool_result_split_across_chunks():
+    sp = mike.StreamParser()
+    events = sp.feed("Hi <tool_")            # partial tag held back by _safe_split
+    events += sp.feed("result>HIDDEN</tool_result> bye")
+    events += sp.finish()
+    content = "".join(t for k, t in events if k == "content")
+    reasoning = "".join(t for k, t in events if k == "reasoning")
+    assert content == "Hi  bye"
+    assert "HIDDEN" not in content and "HIDDEN" not in reasoning
+
+
+def test_run_strips_tool_result_from_assistant(tmp_path):
+    # Model echoes a stray wrapper around a tool call; it must not leak into
+    # stored assistant content or the visible terminal output.
+    (tmp_path / "x.py").write_text("contents\n")
+    text = ("Looking.\n</tool_result>\n<tool_call>" + json.dumps({"name": "read_file", "arguments": {"path": "x.py"}}) + "</tool_call>")
+    turn1 = [{"type": "content", "text": text}]
+    agent, llm, console, session = _make_roundtrip_agent(
+        tmp_path, [turn1, [{"type": "content", "text": "done"}]])
+    recorded = _spy(agent)
+    agent.run("read x.py")
+
+    assert ("read_file", {"path": "x.py"}) in recorded
+    asst = [m.get("content") or "" for m in session.messages if m.get("role") == "assistant"]
+    assert asst and all("tool_result" not in t for t in asst)
+    assert "Looking." in asst[0]
+    assert "tool_result" not in console.text
