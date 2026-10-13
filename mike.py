@@ -557,26 +557,47 @@ class StreamParser:
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
-# DeepSeek's native DSML tool-call syntax. The exact marker characters vary, so
-# these patterns are deliberately tolerant: they key off the ASCII words
-# (invoke / parameter / calls) rather than the surrounding full-width glyphs.
+# Parser adapted from the DeepSeek reference encoding.py
+# (https://huggingface.co/msuiche/DeepSeek-V4.1-Flash-NVFP4)
+# Handles V4 and V4.1 DSML, full-width bar U+FF5C.
 #
-#   container tag named ...calls...
-#     <... invoke name="tool"> ... <... parameter name="k">v</... parameter> ... </... invoke>
+# The reference tag token is "<｜DSML｜" (the bar is the full-width character
+# U+FF5C, never ASCII '|'). V4 tags carry no space after the token
+# ("<｜DSML｜tool_calls>", "<｜DSML｜invoke>"); V4.1 tags add a leading space
+# ("<｜DSML｜ calls>", "<｜DSML｜ invoke>"). Both forms are accepted here, keyed
+# off the "｜DSML｜" token plus the ASCII words (calls / invoke / parameter),
+# exactly as the Rust reference stream parser (deepseek-recipe) treats them.
+#
+#   container tag ...calls...
+#     <... invoke name="tool"> <... parameter name="k" string="true|false">v</... parameter> </... invoke>
 #     <... invoke name="tool" />            (self-closing -> {} args)
-#     <... invoke name="tool" path="x" />   (attribute-style args)
-_DSML_OPEN_RE = re.compile(r"<(?!/)[^<>]*?invoke\b([^<>]*?)(/?)>", re.IGNORECASE)
-_DSML_CLOSE_RE = re.compile(r"</[^<>]*?invoke\s*>", re.IGNORECASE)
+#     <... invoke name="tool" path="x" />   (attribute-style args, superset)
+_DSML_TOKEN = "\uff5cDSML\uff5c"  # full-width bar U+FF5C, not ASCII '|'
+_DSML_OPEN_RE = re.compile(
+    r"<\s*\uff5cDSML\uff5c\s*invoke\b([^<>]*?)(/?)>", re.IGNORECASE
+)
+_DSML_CLOSE_RE = re.compile(
+    r"</\s*\uff5cDSML\uff5c\s*invoke\s*>", re.IGNORECASE
+)
 _DSML_PARAM_RE = re.compile(
-    r"<(?!/)[^<>]*?parameter\b([^<>]*?)>(.*?)(?:</[^<>]*?parameter\s*>|$)",
+    r"<\s*\uff5cDSML\uff5c\s*parameter\b([^<>]*?)>(.*?)(?:"
+    r"</\s*\uff5cDSML\uff5c\s*parameter\s*>|$)",
     re.DOTALL | re.IGNORECASE,
 )
 _DSML_ATTR_RE = re.compile(r'([A-Za-z_][\w.-]*)\s*=\s*"([^"]*)"')
+# The container block spans from a (V4 or V4.1) calls-open tag to its close.
 _DSML_BLOCK_RE = re.compile(
-    r"<[^<>]*?calls[^<>]*>.*?</[^<>]*?calls\s*>",
+    r"<\s*\uff5cDSML\uff5c\s*(?:tool_calls|calls)\s*>.*?"
+    r"</\s*\uff5cDSML\uff5c\s*(?:tool_calls|calls)\s*>",
     re.DOTALL | re.IGNORECASE,
 )
-_DSML_CALLS_OPEN_RE = re.compile(r"<[^<>]*?calls[^<>]*>", re.IGNORECASE)
+_DSML_CALLS_OPEN_RE = re.compile(
+    r"<\s*\uff5cDSML\uff5c\s*(?:tool_calls|calls)\s*>", re.IGNORECASE
+)
+_DSML_INVOKE_OPEN_BARE_RE = re.compile(r"<\s*\uff5cDSML\uff5c\s*invoke\b", re.IGNORECASE)
+_DSML_PARAM_ANY_RE = re.compile(
+    r"</?\s*\uff5cDSML\uff5c\s*parameter\b[^<>]*>", re.IGNORECASE
+)
 
 
 def _attr_value(attrs: str, key: str) -> Optional[str]:
@@ -587,7 +608,11 @@ def _attr_value(attrs: str, key: str) -> Optional[str]:
 
 
 def _attrs_to_args(attrs: str) -> dict:
-    """Attribute-style arguments, used by self-closing invoke tags."""
+    """Attribute-style arguments, used by self-closing invoke tags.
+
+    The reference encoder never emits attribute-style args (parameters are
+    always child tags), so this is a tolerant superset, not a reference path.
+    """
     args: dict = {}
     for name, value in _DSML_ATTR_RE.findall(attrs or ""):
         if name.lower() in ("name", "string"):
@@ -597,6 +622,7 @@ def _attrs_to_args(attrs: str) -> dict:
 
 
 def _parse_param_tags(body: str) -> dict:
+    """Collect child ``<｜DSML｜ parameter>`` tags into an arguments dict."""
     args: dict = {}
     for pm in _DSML_PARAM_RE.finditer(body or ""):
         attrs = pm.group(1)
@@ -611,7 +637,8 @@ def parse_dsml_calls(text: str) -> list[dict]:
     self-closing invokes with no arguments, attribute-style arguments on a
     self-closing invoke, multiple invokes per message, and a truncated invoke
     with no closing tag (the partial call is still dispatched, and a WARN is
-    logged as ``tool_call_truncated name=<name>``).
+    logged as ``tool_call_truncated name=<name>``). Both the V4 (no space after
+    the token) and V4.1 (leading space) tag forms are accepted.
     """
     text = text or ""
     calls: list[dict] = []
@@ -629,6 +656,8 @@ def parse_dsml_calls(text: str) -> list[dict]:
             body = text[m.end():close.start()]
             calls.append({"name": name, "arguments": _parse_param_tags(body)})
         else:
+            # Truncated invoke: no close tag. Keep the partial call, parse what
+            # arrived, and warn — the reference stream parser flushes on finish().
             body = text[m.end():]
             calls.append({"name": name, "arguments": _parse_param_tags(body)})
             log.warning("tool_call_truncated name=%s", name)
@@ -636,10 +665,12 @@ def parse_dsml_calls(text: str) -> list[dict]:
 
 
 def _dsml_value(raw: str, attrs: str):
-    """Decode a parameter value.
+    """Decode a parameter value using the reference rule.
 
-    ``string="true"`` values are returned verbatim; anything else is parsed as
-    JSON and, if that fails, kept as the raw string rather than dropped.
+    The reference (`decode_dsml_to_arguments`) treats ``string="true"`` values
+    as verbatim strings and everything else as JSON. JSON that fails to parse
+    is kept as the raw string rather than dropped, so a malformed argument
+    still dispatches the call.
     """
     if re.search(r'string\s*=\s*"true"', attrs or "", re.IGNORECASE):
         value = raw
@@ -653,22 +684,29 @@ def _dsml_value(raw: str, attrs: str):
 
 
 def strip_dsml(text: str) -> str:
+    """Remove every DSML tool-call fragment so nothing leaks to the terminal."""
     if not text:
         return text
     out = _DSML_BLOCK_RE.sub("", text)
-    # Bare invoke blocks (no container).
-    out = re.sub(r"<(?!/)[^<>]*?invoke\b[^<>]*>.*?</[^<>]*?invoke\s*>", "",
-                 out, flags=re.DOTALL | re.IGNORECASE)
-    out = re.sub(r"<(?!/)[^<>]*?invoke\b[^<>]*/>", "", out, flags=re.IGNORECASE)
+    # Bare invoke blocks (with or without the surrounding container).
+    out = re.sub(
+        r"<\s*\uff5cDSML\uff5c\s*invoke\b[^<>]*>.*?"
+        r"</\s*\uff5cDSML\uff5c\s*invoke\s*>",
+        "", out, flags=re.DOTALL | re.IGNORECASE,
+    )
+    out = re.sub(
+        r"<\s*\uff5cDSML\uff5c\s*invoke\b[^<>]*/>",
+        "", out, flags=re.IGNORECASE,
+    )
     # Drop a truncated (unclosed) container or invoke too, so nothing leaks.
     m = _DSML_CALLS_OPEN_RE.search(out)
     if m is not None:
         out = out[:m.start()]
-    m = re.search(r"<(?!/)[^<>]*?invoke\b", out, re.IGNORECASE)
+    m = _DSML_INVOKE_OPEN_BARE_RE.search(out)
     if m is not None:
         out = out[:m.start()]
     # Any leftover parameter tags.
-    out = re.sub(r"</?[^<>]*?parameter\b[^<>]*>", "", out, flags=re.IGNORECASE)
+    out = _DSML_PARAM_ANY_RE.sub("", out)
     return out
 
 
@@ -2348,11 +2386,18 @@ class MikeAgent:
             if reasoning:
                 assistant_msg["reasoning"] = reasoning
             if calls:
+                # Normalise a stable id onto every call dict FIRST, so the
+                # assistant tool-call message and the tool result in _run_tools
+                # reference the SAME id (the model pairs them by id). parse_*_calls
+                # already sets ids in prompted mode; native calls may not.
+                for c in calls:
+                    if not c.get("id"):
+                        c["id"] = f"call_{uuid.uuid4().hex[:8]}"
                 # Always record the calls in the session (rich history + Files
                 # Touched). They are only *sent* upstream in native mode.
                 assistant_msg["tool_calls"] = [
                     {
-                        "id": c.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                        "id": c["id"],
                         "type": "function",
                         "function": {
                             "name": c["name"],
@@ -2480,23 +2525,41 @@ class MikeAgent:
     # -- tools ------------------------------------------------------------
 
     def _run_tools(self, calls: list) -> None:
-        for call in calls:
-            name = call.get("name", "")
-            args = call.get("arguments", {}) or {}
-            self.console.print(Text(f"* {name}({_tool_preview(name, args)})", style="cyan"))
-            output = self.toolbox.call(name, args)
-            self.console.print(Text(_result_preview(output), style="dim"))
-            if self.tool_mode == "native":
+        if self.tool_mode == "native":
+            for call in calls:
+                name = call.get("name", "")
+                args = call.get("arguments", {}) or {}
+                self.console.print(Text(f"* {name}({_tool_preview(name, args)})", style="cyan"))
+                output = self.toolbox.call(name, args)
+                self.console.print(Text(_result_preview(output), style="dim"))
                 self._append({
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
                     "content": output,
                 }, unsent=True)
-            else:
-                self._append({
-                    "role": "user",
-                    "content": f"<tool_result>\n{output}\n</tool_result>",
-                }, unsent=True)
+                log.info("tool result queued: name=%s id=%s bytes=%d",
+                         name, call.get("id", ""), len(output or ""))
+            return
+
+        # Prompted mode. The reference encoder (encoding.py) has no standalone
+        # "tool" role: tool results are wrapped in <tool_result> blocks and
+        # MERGED into a single following user message, ordered to match the
+        # assistant's tool_calls (merge_tool_messages + sort_tool_results_by_call_order).
+        # We mirror that: one user message, one <tool_result> per call in order,
+        # each tagged with the assistant's call id so the model can pair them and
+        # continue the task instead of stopping.
+        blocks: list[str] = []
+        for call in calls:
+            name = call.get("name", "")
+            args = call.get("arguments", {}) or {}
+            call_id = call.get("id", "")
+            self.console.print(Text(f"* {name}({_tool_preview(name, args)})", style="cyan"))
+            output = self.toolbox.call(name, args)
+            self.console.print(Text(_result_preview(output), style="dim"))
+            blocks.append(f'<tool_result name="{name}" id="{call_id}">\n{output}\n</tool_result>')
+            log.info("tool result queued: name=%s id=%s bytes=%d",
+                     name, call_id, len(output or ""))
+        self._append({"role": "user", "content": "\n\n".join(blocks)}, unsent=True)
 
     # -- compaction / rollover -------------------------------------------
 

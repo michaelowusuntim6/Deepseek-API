@@ -527,3 +527,104 @@ result. Live check: asking "Remember BANANA", then in a *later* turn "What word
 did I ask you to remember?" returned `BANANA` while only the new prompt was sent
 — i.e. the same upstream chat was reused. (`sessions/…json` shows the stored
 `conversation_id`.)
+
+---
+
+# v0.3 — reference DSML parser + tool-result pairing
+
+## v0.3 motivation
+
+Two problems were reported with the live harness:
+
+1. **Tool calling was prompted-only.** `server/schemas.py` has no `tools` field,
+   so OpenAI-style `tools=[...]` is silently dropped and `detect_tool_mode()`
+   always returns `"prompted"`. The fix lives in mike's parse/feedback path, not
+   the server (the brief forbids touching the server request/response shape and
+   the transport).
+2. **The model stopped mid-task.** After a tool call the harness appended the
+   result as a generic `<tool_result>` **user** message with no link back to the
+   call, so the model could not tell its own tool call from a new user turn.
+
+## v0.3 D1. Replace the regex DSML parser with the reference parser
+
+**Decision.** `parse_dsml_calls()` and its helpers (`_dsml_value`,
+`_parse_param_tags`, `_attrs_to_args`, `strip_dsml`) now mirror the DeepSeek
+reference `encoding.py` parser, anchored on the real `｜DSML｜` token (the bar is
+U+FF5C, never ASCII `|`). The previous regex keyed only off the ASCII words
+(`invoke`/`parameter`/`calls`) with `<[^<>]*?…>`, which matched *any* tag that
+merely contained those substrings — over-permissive and not the reference shape.
+
+**Reference sources fetched and compared** (scratch, in `/tmp/dsrefs`, not
+vendored):
+- Official Rust `deepseek-recipe` (cloned). Ground-truth tag constants:
+  `DSML_SP_TOKEN = "｜DSML｜"`, V4 block name `tool_calls` / V4.1 block name
+  `" calls"` (leading space), and the stream parser accepts **both** end labels
+  `["</｜DSML｜tool_calls>", "</｜DSML｜ calls>"]`. Rust is the tie-breaker for
+  edge cases (it flushes a truncated call on `finish()`; empty invoke ⇒ `{}`).
+- HuggingFace `msuiche/DeepSeek-V4.1…/encoding/encoding.py` (pure Python). Has
+  the actual **parse** side (`parse_message_from_completion_text`,
+  `parse_tool_calls`, `_read_until_stop`, `decode_dsml_to_arguments`). This is
+  the base we vendored mechanics from.
+- vLLM `deepseek_v41_encoding.py` (pure Python). Confirmed **encode-only** (no
+  parse function) but it documents the tool-result template.
+
+**Base chosen: HF `encoding.py`** (only pure-Python *parse* implementation),
+generalized to accept **both** V4 (no-space) and V4.1 (space) tag forms per the
+Rust rules, with Rust-style tolerance instead of HF's strict `raise`.
+
+**V4 vs V4.1 difference.** V4 writes `<｜DSML｜tool_calls>` / `<｜DSML｜invoke>`
+(no space after the token). V4.1 writes `<｜DSML｜ calls>` / `<｜DSML｜ invoke>`
+(leading space). The regexes allow optional whitespace and either keyword
+(`(?:tool_calls|calls)`), so both are accepted. Verified by unit tests
+`test_dsml_v41_space_form` and `test_dsml_v4_no_space_form`.
+
+**Tolerated edge cases** (all asserted): standard open/close, self-closing with
+`{}`, attribute-style args on a self-closing invoke, truncated invoke dispatched
+with a WARN `tool_call_truncated name=…`, malformed parameter JSON kept as the
+raw string, multiple invokes in emission order, and a block split across two SSE
+frames (mike parses the reassembled `StreamParser.raw`, so frame boundaries never
+break a tag).
+
+## v0.3 D2. Tool results are paired to their call id
+
+**Decision.** `parse_tool_calls()` returns the pure reference shape
+(`{"name","arguments"}`); `MikeAgent.run` normalises a stable `id` onto every
+call dict **before** building the assistant message and before `_run_tools`, so
+both reference the SAME id. In prompted mode `_run_tools` merges **all** results
+of a turn into a single following **user** message, each wrapped as
+`<tool_result name="…" id="call_…">output</tool_result>` in call order — mirroring
+the reference `merge_tool_messages` + `sort_tool_results_by_call_order`. An INFO
+line `tool result queued: name=… id=… bytes=…` is emitted per result.
+
+**Which candidate A/B was chosen — neither, deliberately.** The brief offered
+candidate A (result as an *assistant* message) and candidate B (result as a
+*system* message). The reference is unambiguous: DeepSeek-V4.1 has no standalone
+`tool` role and encodes results as `<tool_result>` blocks inside a **user**
+message (`tool_output_template = "<tool_result>{content}</tool_result>"`). That is
+what mike already used, so the role was *not* the bug — the missing call-id
+pairing and the un-merged multi-result shape were. We kept role=user, added the
+id, and merged results into one user turn.
+
+**Why "stops mid-task" is fixed.** Previously multiple tool results in one turn
+were appended as several separate user messages; the server's
+`messages_to_prompt` then rendered them as multiple `User:` turns, which the model
+does not associate with the single assistant tool-call turn that preceded them.
+The merged single user message, ordered and tagged by call id, restores the
+assistant→tool-result pairing the model continues from.
+
+**Live evidence (real model, server auto-launched).** Three runs:
+- TEST 1 — one write_file call; `/tmp/dsml_v4_test.txt` = `hello-dsml`.
+- TEST 2 — the multi-step case: the model issued write_file×3, continued after
+  each merged result, then read_file×3, then summarised — **no early stop**; the
+  log shows six `tool result queued: … id=call_…` lines.
+- TEST 3 — write_file then bash in sequence; script created and `python3
+  /tmp/hello.py` ran, output `hi`.
+
+**Honest note on the DSML path.** `detect_tool_mode()` still returns `prompted`
+(the web bridge exposes no native tool channel), and in these live runs the model
+honoured the requested `<tool_call>{json}</tool_call>` envelope rather than raw
+DSML. Both paths flow through the same id-threading and merged-result fix, and
+both are unit-tested (`test_dsml_*` for DSML, `test_agent_runs_tool_then_answers`
+/ `test_*_roundtrip` for the envelope and DSML round-trips). The DSML work is the
+correctness fix the brief required; the pairing fix is what made the model
+continue.

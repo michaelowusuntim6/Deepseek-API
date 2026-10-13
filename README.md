@@ -123,8 +123,11 @@ the model's tool calls out of the reply. If a backend ever does return native
 **Two tool-call syntaxes are supported** (see
 [Tool calls](#tool-calls) below): the strict
 `<tool_call>{"name": ..., "arguments": {...}}</tool_call>` JSON envelope *and*
-DeepSeek's native DSML syntax (`invoke`/`parameter` tags). Both may even appear
-in the same message, and multiple calls per turn are dispatched in order.
+DeepSeek's native DSML syntax (`invoke`/`parameter` tags), parsed by the
+**reference** DSML parser (both V4 and V4.1 tag forms, full-width bar U+FF5C).
+Tool results are paired back to their call id so multi-step tasks continue.
+Both may even appear in the same message, and multiple calls per turn are
+dispatched in order.
 
 ### Thinking blocks
 
@@ -297,8 +300,13 @@ mike parses **two** tool-call syntaxes, in the same message if needed:
    </tool_call>
    ```
 
-2. DeepSeek's native DSML syntax — an `invoke` tag naming the tool, containing
-   `parameter` tags for the arguments.
+2. DeepSeek's native DSML syntax — a `calls` container holding one or more
+   `invoke` tags (naming the tool), each containing `parameter` tags for the
+   arguments. This path now uses the **reference parser** (adapted from
+   DeepSeek's `encoding.py`) and accepts **both** tag shapes, keyed off the real
+   `｜DSML｜` token (the full-width bar U+FF5C, never ASCII `|`):
+   - **V4** — no space after the token: `<｜DSML｜tool_calls>`, `<｜DSML｜invoke>`
+   - **V4.1** — leading space: `<｜DSML｜ calls>`, `<｜DSML｜ invoke>`
 
 Covered edge cases: **multiple** calls per message (dispatched in order),
 **self-closing** invokes (`invoke name="list_dir" /` → dispatched with `{}`),
@@ -308,6 +316,13 @@ Covered edge cases: **multiple** calls per message (dispatched in order),
 `tool_call_truncated` warning logged), and **malformed parameter JSON** (kept as
 a raw string rather than dropping the call). Tool syntax is always hidden from
 your scrollback; only the clean tool header and a short result preview are shown.
+
+**Tool results are paired to their call.** Each tool result is fed back in a
+single following user message as `<tool_result name="…" id="call_…">…</tool_result>`
+blocks ordered to match the assistant's `tool_calls`, mirroring DeepSeek's
+reference `merge_tool_messages` / `sort_tool_results_by_call_order`. Because the
+model can pair each result with the call that produced it, it continues multi-step
+tasks instead of stopping after the first tool.
 
 ## The OpenAI-compatible server
 

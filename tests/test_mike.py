@@ -86,13 +86,13 @@ BAR = "\uff5c"  # full-width vertical bar used by DeepSeek's DSML tool syntax
 
 def _dsml(name, params):
     """Build a DeepSeek DSML tool-call block (params: list of (name, value))."""
-    p = f"<{BAR}DSML{BAR}{BAR} parameter name=\"%s\" string=\"true\">%s</{BAR}{BAR}DSML{BAR}{BAR} parameter>"
+    p = f"<{BAR}DSML{BAR} parameter name=\"%s\" string=\"true\">%s</{BAR}DSML{BAR} parameter>"
     body = "\n".join(p % (k, v) for k, v in params)
-    return (f"<{BAR}DSML{BAR}{BAR} calls>\n"
-            f"<{BAR}{BAR}DSML{BAR}{BAR} invoke name=\"{name}\">\n"
+    return (f"<{BAR}DSML{BAR} calls>\n"
+            f"<{BAR}DSML{BAR} invoke name=\"{name}\">\n"
             f"{body}\n"
-            f"</{BAR}{BAR}DSML{BAR}{BAR} invoke>\n"
-            f"</{BAR}{BAR}DSML{BAR}{BAR} calls>")
+            f"</{BAR}DSML{BAR} invoke>\n"
+            f"</{BAR}DSML{BAR} calls>")
 
 
 def test_parse_dsml_tool_call():
@@ -369,7 +369,7 @@ def test_agent_runs_tool_then_answers(tmp_path):
     assert (tmp_path / "hello.txt").read_text() == "hi"
     assert result == "Done — created hello.txt."
     # Tool result was fed back as a user message wrapped in <tool_result>.
-    assert any("<tool_result>" in str(m.get("content")) for m in session.messages)
+    assert any("<tool_result" in str(m.get("content")) for m in session.messages)
     # Reasoning/tool envelopes are not left in assistant content.
     for m in session.messages:
         if m["role"] == "assistant":
@@ -572,25 +572,25 @@ def test_export_escapes_leading_hr(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def _calls_open():
-    return f"<{BAR}DSML{BAR}{BAR} calls>"
+    return f"<{BAR}DSML{BAR} calls>"
 
 
 def _calls_close():
-    return f"</{BAR}{BAR}DSML{BAR}{BAR} calls>"
+    return f"</{BAR}DSML{BAR} calls>"
 
 
 def _invoke_open(name):
-    return f"<{BAR}{BAR}DSML{BAR}{BAR} invoke name=\"{name}\">"
+    return f"<{BAR}DSML{BAR} invoke name=\"{name}\">"
 
 
 def _invoke_close():
-    return f"</{BAR}{BAR}DSML{BAR}{BAR} invoke>"
+    return f"</{BAR}DSML{BAR} invoke>"
 
 
 def _param(name, value, as_string=True):
     attr = ' string="true"' if as_string else ""
-    return (f"<{BAR}{BAR}DSML{BAR}{BAR} parameter name=\"{name}\"{attr}>"
-            f"{value}</{BAR}{BAR}DSML{BAR}{BAR} parameter>")
+    return (f"<{BAR}DSML{BAR} parameter name=\"{name}\"{attr}>"
+            f"{value}</{BAR}DSML{BAR} parameter>")
 
 
 def _dsml_block(name, params):
@@ -602,16 +602,16 @@ def _dsml_block(name, params):
 
 def _selfclosing(name, **attrs):
     extra = "".join(f' {k}="{v}"' for k, v in attrs.items())
-    return (f"<{BAR}DSML{BAR}{BAR} calls>\n"
-            f"<{BAR}{BAR}DSML{BAR}{BAR} invoke name=\"{name}\"{extra} />\n"
+    return (f"<{BAR}DSML{BAR} calls>\n"
+            f"<{BAR}DSML{BAR} invoke name=\"{name}\"{extra} />\n"
             f"{_calls_close()}")
 
 
 def _truncated(name, param_name, value):
     # No closing tags anywhere: the stream stops mid-invoke.
-    return (f"<{BAR}DSML{BAR}{BAR} calls>\n"
-            f"<{BAR}{BAR}DSML{BAR}{BAR} invoke name=\"{name}\">\n"
-            f"<{BAR}{BAR}DSML{BAR}{BAR} parameter name=\"{param_name}\" string=\"true\">"
+    return (f"<{BAR}DSML{BAR} calls>\n"
+            f"<{BAR}DSML{BAR} invoke name=\"{name}\">\n"
+            f"<{BAR}DSML{BAR} parameter name=\"{param_name}\" string=\"true\">"
             f"{value}")
 
 
@@ -672,7 +672,7 @@ class TestToolCallRoundTrip:
 
         assert recorded == [("read_file", {"path": "x.py"})]
         assert result == "I read the file."
-        fed = [m for m in session.messages if "<tool_result>" in str(m.get("content"))]
+        fed = [m for m in session.messages if "<tool_result" in str(m.get("content"))]
         assert fed and "hello world" in str(fed[0]["content"])
         assert "DSML" not in result
         _assert_no_syntax(console.text)
@@ -689,7 +689,7 @@ class TestToolCallRoundTrip:
 
         assert recorded == [("list_dir", {})]
         assert result == "listed it"
-        assert any("<tool_result>" in str(m.get("content")) for m in session.messages)
+        assert any("<tool_result" in str(m.get("content")) for m in session.messages)
         _assert_no_syntax(console.text)
 
     def test_dsml_selfclosing_with_attrs(self, tmp_path):
@@ -818,7 +818,7 @@ class TestToolCallRoundTrip:
         # The tool ran, returned an error, and did NOT write the file.
         assert recorded[0][0] == "edit_file"
         assert target.read_text() == original
-        fed = [m for m in session.messages if "<tool_result>" in str(m.get("content"))]
+        fed = [m for m in session.messages if "<tool_result" in str(m.get("content"))]
         assert fed and "error" in str(fed[0]["content"]).lower()
         assert "appears 2 times" in str(fed[0]["content"])
         assert result == "I could not make that edit."
@@ -863,7 +863,94 @@ class TestToolCallRoundTrip:
         # The follow-up carried ONLY the new tool result, not the whole history.
         follow_up = llm.seen_messages[1]
         assert len(follow_up) == 1
-        assert "<tool_result>" in str(follow_up[0]["content"])
+        assert "<tool_result" in str(follow_up[0]["content"])
+        # The result is paired to the assistant's tool-call by its id.
+        asst = next(m for m in session.messages if m["role"] == "assistant" and m.get("tool_calls"))
+        call_id = asst["tool_calls"][0]["id"]
+        assert f'id="{call_id}"' in str(follow_up[0]["content"])
 
         # And the thread id is persisted on the session for resume.
         assert session.to_dict()["conversation_id"] == "conv-123"
+
+
+# --------------------------------------------------------------------------- #
+# 11. Reference DSML parser + tool-result pairing (v0.3)                        #
+# --------------------------------------------------------------------------- #
+
+def _v41_block(name, params):
+    """DeepSeek V4.1 DSML: leading space after the ｜DSML｜ token."""
+    return _dsml_block(name, params)  # helpers already emit the V4.1 space form
+
+
+def _v4_block(name, params):
+    """DeepSeek V4 DSML: no space after the ｜DSML｜ token (<｜DSML｜tool_calls>)."""
+    params_txt = "\n".join(
+        f"<{BAR}DSML{BAR}parameter name=\"{k}\" string=\"true\">{v}</{BAR}DSML{BAR}parameter>"
+        for k, v in params
+    )
+    return (f"<{BAR}DSML{BAR}tool_calls>\n"
+            f"<{BAR}DSML{BAR}invoke name=\"{name}\">\n"
+            f"{params_txt}\n"
+            f"</{BAR}DSML{BAR}invoke>\n"
+            f"</{BAR}DSML{BAR}tool_calls>")
+
+
+def test_dsml_v41_space_form():
+    calls, clean = mike.parse_tool_calls(_v41_block("read_file", [("path", "x.py")]))
+    assert calls == [{"name": "read_file", "arguments": {"path": "x.py"}}]
+    assert "DSML" not in clean and "invoke" not in clean
+
+
+def test_dsml_v4_no_space_form():
+    calls, clean = mike.parse_tool_calls(_v4_block("read_file", [("path", "x.py")]))
+    assert calls == [{"name": "read_file", "arguments": {"path": "x.py"}}]
+    assert "DSML" not in clean and "invoke" not in clean
+
+
+def test_dsml_block_split_across_frames():
+    """A DSML block cut mid-invoke-tag across two SSE frames still parses.
+
+    mike parses on the reassembled raw stream text (StreamParser accumulates
+    everything into .raw), so a tag split across frames is rejoined before the
+    parser sees it.
+    """
+    block = _v41_block("read_file", [("path", "x.py")])
+    cut = block.index("invoke") + 2  # inside the invoke tag
+    sp = mike.StreamParser()
+    sp.feed(block[:cut])
+    # Nothing complete yet: parsing the partial frame yields no full call.
+    partial, _ = mike.parse_tool_calls(sp.raw)
+    sp.feed(block[cut:])
+    sp.finish()
+    calls, clean = mike.parse_tool_calls(sp.raw)
+    assert calls == [{"name": "read_file", "arguments": {"path": "x.py"}}]
+    assert "DSML" not in clean
+
+
+def test_tool_call_id_paired_with_result(tmp_path):
+    """The assistant tool-call id must equal the id in the paired tool result."""
+    (tmp_path / "x.py").write_text("contents\n")
+    turns = [
+        [{"type": "content", "text": _dsml_block("read_file", [("path", "x.py")])}],
+        [{"type": "content", "text": "done"}],
+    ]
+    agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+    agent.run("read x.py")
+
+    asst = next(m for m in session.messages
+                if m["role"] == "assistant" and m.get("tool_calls"))
+    result_msg = next(m for m in session.messages
+                      if m["role"] == "user" and "<tool_result" in str(m.get("content")))
+    assert result_msg["content"].index(asst["tool_calls"][0]["id"]) != -1
+
+
+def test_tool_result_uses_call_id(tmp_path):
+    """_run_tools must carry the call's id into the result message."""
+    (tmp_path / "x.py").write_text("payload\n")
+    agent, llm, console, session = _make_roundtrip_agent(tmp_path, [[]])
+    agent._run_tools([{"name": "read_file", "arguments": {"path": str(tmp_path / "x.py")},
+                      "id": "call_DEADBEEF"}])
+    last = session.messages[-1]
+    assert last["role"] == "user"
+    assert 'id="call_DEADBEEF"' in last["content"]
+    assert "payload" in last["content"]
