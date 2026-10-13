@@ -53,43 +53,36 @@ cd Deepseek-API
 python3 -m venv venv
 source venv/bin/activate            # Windows: venv\Scripts\activate
 
-pip install -r requirements.txt
-playwright install chromium         # only needed if Chrome is not installed
+pip install -r requirements.txt     # playwright is used only as a CDP client here
 
-python -m deepseek.auth             # sign in once — reuses your Chrome if possible
+python -m deepseek.auth             # sign in once (opens your Chrome at DeepSeek)
 ```
 
-**How the browser is chosen.** `python -m deepseek.auth` (and the server's
-on-demand login) pick a browser/profile in this order, using the first that
-launches:
+**How sign-in works.** `python -m deepseek.auth` (and the server's on-demand login)
+launch your **installed Chrome as a normal browser process** pointed at DeepSeek,
+then attach Playwright as a *passive debugger* over the Chrome DevTools Protocol
+(`connect_over_cdp`). Google's DeepSeek sign-in flow blocks browsers that were
+*started by automation* (it fingerprints `navigator.webdriver` and the Playwright /
+bundled-Chromium launch), showing *"Couldn't sign you in. This browser or app may not
+be secure."* Because this Chrome is launched by an ordinary `subprocess` with only
+`--remote-debugging-port` and a dedicated `--user-data-dir`, none of those signals are
+present — `navigator.webdriver` is `false` and there is no *"unsupported command-line
+flag"* banner.
 
-1. **Your installed Chrome with its real profile** — the token is read from your
-   existing `~/.config/google-chrome` login, so if you are already signed into
-   `chat.deepseek.com` in Chrome the session is captured **instantly, with no
-   password prompt**.
-2. **A separate Playwright Chrome profile** (`session/profile/`) — used when your
-   real Chrome is **currently running** (its profile is locked), or when the real
-   profile has no session. If this happens you'll see a warning telling you to
-   close Chrome to use your real profile; you may have to sign in once here.
-3. **Playwright's bundled Chromium** (`session/profile/`) — used only if Chrome is
-   not installed at all (run `playwright install chromium`).
+Because Chrome 136+ ignores `--remote-debugging-port` on the **default** profile, the
+harness drives a **dedicated** profile at `session/chrome-cdp-profile/`. The very first
+run opens Chrome with an empty profile (no Google account, no DeepSeek session); you
+sign in once. That profile then persists, so later runs (including the server's headless
+refresh) capture the token automatically with no prompt.
 
-Two knobs override the selection:
-
-- `--browser {auto,system,fresh,bundled}` forces a specific path
-  (`auto` is the default and tries them in order).
-  ```bash
-  python -m deepseek.auth --browser system   # only your real Chrome profile
-  python -m deepseek.auth --browser fresh    # separate Playwright profile
-  python -m deepseek.auth --browser bundled  # Playwright Chromium
-  ```
-- `DEEPSEEK_CHROME_PROFILE=/path/to/chrome/user-data-dir` points at a specific
-  Chrome profile directory instead of the auto-detected one.
+- Sign in inside that dedicated profile. You can stay logged into DeepSeek in your
+  regular Chrome too — DeepSeek allows multiple sessions — but the harness only reads
+  the dedicated `chrome-cdp-profile/`.
+- `DEEPSEEK_CDP_PROFILE=/path/to/profile` overrides the dedicated profile directory.
 
 Your session (bearer token + cookies) is saved under `session/` and refreshed
-automatically afterwards. The server can also open the login window on demand
-the first time it needs a session. The token value is never printed — only its
-length and the cookie count.
+automatically afterwards. The token value is never printed — only its length and the
+cookie count.
 
 ---
 

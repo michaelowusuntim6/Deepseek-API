@@ -6,6 +6,7 @@ __pycache__/
 
 # Session artifacts — contain session tokens + cookies. NEVER commit.
 session/
+session/chrome-cdp-profile/
 session.json
 *.env.*
 !.env.example
