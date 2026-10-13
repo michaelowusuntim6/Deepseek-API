@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -47,6 +48,10 @@ _BROWSER_MODES = ("auto", "system", "fresh", "bundled")
 # Substrings that mean "the Chrome user-data-dir is locked by a running Chrome".
 _LOCK_MARKERS = ("processsingleton", "singletonlock", "profile is already",
                  "is already in use", "already running", "cannot be opened because the profile")
+
+# Chrome profile folder names ("Default", "Profile 1", ...). Used to preselect a
+# profile with --profile-directory so system Chrome does not open the chooser.
+_PROFILE_NAME_RE = re.compile(r"^(Default|Profile \d+)$", re.IGNORECASE)
 
 LOCK_WARNING = (
     "[auth] Your Chrome is currently running, so its profile is locked. "
@@ -219,18 +224,38 @@ def _is_lock_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _LOCK_MARKERS)
 
 
+def _split_system_profile(path: Path) -> tuple[Path, str]:
+    """Return (user_data_dir, profile_directory_name) for a detected or overridden
+    Chrome path.
+
+    If the path already points at a profile folder (`Default` / `Profile N`), use
+    its parent as the data dir and that folder as the profile name; otherwise treat
+    the path as the data dir and preselect the `Default` profile. Preselecting
+    avoids Chrome's profile chooser opening `about:blank`.
+    """
+    if _PROFILE_NAME_RE.match(path.name):
+        return path.parent, path.name
+    return path, "Default"
+
+
 def _launch_candidates(fallback_profile: Path):
-    """Ordered (mode_label, channel, user_data_dir) specs to try for this mode.
+    """Ordered `(mode_label, channel, user_data_dir, profile_directory)` specs.
 
     system-chrome = the user's real profile (needs Chrome installed);
     fresh-chrome  = a Playwright-managed profile under system Chrome;
     bundled       = Playwright's bundled Chromium (no `channel`).
+    `profile_directory` is passed for the real profile only; the fresh/bundled dirs
+    are dedicated and show no chooser, so they get None.
     """
     mode = _browser_mode()
     sys_profile = find_system_chrome_profile()
-    a = ("system-chrome", "chrome", sys_profile) if sys_profile else None
-    b = ("fresh-chrome", "chrome", fallback_profile)
-    c = ("bundled-chromium", None, fallback_profile)
+    if sys_profile is not None:
+        udd, pname = _split_system_profile(sys_profile)
+        a = ("system-chrome", "chrome", udd, pname)
+    else:
+        a = None
+    b = ("fresh-chrome", "chrome", fallback_profile, None)
+    c = ("bundled-chromium", None, fallback_profile, None)
     if mode == "bundled":
         return [c]
     if mode == "fresh":
@@ -242,13 +267,24 @@ def _launch_candidates(fallback_profile: Path):
 def _open_context(p, *, headless: bool, fallback_profile: Path):
     """Launch the first browser/profile path that works for the current mode.
 
-    Returns a Playwright persistent context. On a locked real-Chrome profile it
-    prints the lock warning and falls through to the next option; it never forces
-    the lock. Raises RuntimeError only if nothing can launch.
+    Each candidate is attempted exactly once (no per-path retry loop). Returns a
+    Playwright persistent context. On a locked real-Chrome profile it prints the
+    lock warning and falls through; it never forces the lock. `--no-sandbox` is
+    suppressed from Playwright's defaults so Chrome shows no security banner — the
+    sandbox works on a normal desktop; a genuine startup failure has another cause
+    (permissions, a stale SingletonLock) that must be diagnosed, not worked around.
+    Raises RuntimeError only if nothing can launch.
     """
     last_err: Optional[BaseException] = None
-    for (label, channel, udd) in _launch_candidates(fallback_profile):
-        kwargs = {"headless": headless, "args": LAUNCH_ARGS}
+    for (label, channel, udd, profile_directory) in _launch_candidates(fallback_profile):
+        args = list(LAUNCH_ARGS)
+        if profile_directory:
+            args.append(f"--profile-directory={profile_directory}")
+        kwargs = {
+            "headless": headless,
+            "args": args,
+            "ignore_default_args": ["--no-sandbox"],
+        }
         if channel:
             kwargs["channel"] = channel
         try:
