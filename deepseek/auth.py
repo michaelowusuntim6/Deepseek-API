@@ -18,6 +18,7 @@ you've signed in, later runs reuse the profile and capture the token headlessly.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, asdict
@@ -37,6 +38,32 @@ SIGNIN_URL = "https://chat.deepseek.com/sign_in"
 LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
 # Token is trusted for this long before we refresh it from the browser again.
 SESSION_MAX_AGE = 6 * 60 * 60  # 6 hours
+
+# Browser/profile selection. `auto` prefers the user's real installed Chrome
+# profile (so an existing chat.deepseek.com login is reused instantly), then a
+# fresh system-Chrome profile, then Playwright's bundled Chromium.
+_BROWSER_MODES = ("auto", "system", "fresh", "bundled")
+
+# Substrings that mean "the Chrome user-data-dir is locked by a running Chrome".
+_LOCK_MARKERS = ("processsingleton", "singletonlock", "profile is already",
+                 "is already in use", "already running", "cannot be opened because the profile")
+
+LOCK_WARNING = (
+    "[auth] Your Chrome is currently running, so its profile is locked. "
+    "Using a separate Playwright profile instead.\n"
+    "[auth] To use your real Chrome profile, close Chrome completely and try again."
+)
+
+# Dedicated logger that always emits to stderr (message only), so the [auth] lines
+# are visible both when run from the CLI (`python -m deepseek.auth`) and when the
+# server calls this from a worker thread, without depending on uvicorn's config.
+log = logging.getLogger("deepseek.auth")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
 
 class LoginRequired(RuntimeError):
@@ -150,6 +177,95 @@ def _safe_goto(page, url: str) -> None:
     page.wait_for_timeout(2000)
 
 
+def _chrome_profile_bases() -> list[Path]:
+    """Candidate Chrome *user-data* directories, most-preferred first.
+
+    Each is a Chrome profile ROOT (it contains a `Default/` subdirectory), which
+    is what Playwright's `user_data_dir` expects — not the `Default` dir itself.
+    """
+    home = Path.home()
+    return [
+        home / ".config" / "google-chrome",       # Chrome stable
+        home / ".config" / "google-chrome-beta",  # Chrome beta
+        home / ".config" / "chromium",            # Chromium
+    ]
+
+
+def find_system_chrome_profile() -> Optional[Path]:
+    """Return the path to the user's real Chrome profile directory, or None if no
+    installed Chrome profile is found.
+
+    Honors the `DEEPSEEK_CHROME_PROFILE` env override (used directly if it is a
+    directory). Otherwise returns the first candidate base that exists AND
+    contains a `Default/` subdirectory.
+    """
+    override = os.getenv("DEEPSEEK_CHROME_PROFILE")
+    if override:
+        p = Path(override).expanduser()
+        return p if p.is_dir() else None
+    for base in _chrome_profile_bases():
+        if base.is_dir() and (base / "Default").is_dir():
+            return base
+    return None
+
+
+def _browser_mode() -> str:
+    mode = (os.getenv("DEEPSEEK_BROWSER_MODE") or "auto").strip().lower()
+    return mode if mode in _BROWSER_MODES else "auto"
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _LOCK_MARKERS)
+
+
+def _launch_candidates(fallback_profile: Path):
+    """Ordered (mode_label, channel, user_data_dir) specs to try for this mode.
+
+    system-chrome = the user's real profile (needs Chrome installed);
+    fresh-chrome  = a Playwright-managed profile under system Chrome;
+    bundled       = Playwright's bundled Chromium (no `channel`).
+    """
+    mode = _browser_mode()
+    sys_profile = find_system_chrome_profile()
+    a = ("system-chrome", "chrome", sys_profile) if sys_profile else None
+    b = ("fresh-chrome", "chrome", fallback_profile)
+    c = ("bundled-chromium", None, fallback_profile)
+    if mode == "bundled":
+        return [c]
+    if mode == "fresh":
+        return [b, c]
+    # auto and system both prefer the real profile, then fall back down.
+    return ([a] if a else []) + [b, c]
+
+
+def _open_context(p, *, headless: bool, fallback_profile: Path):
+    """Launch the first browser/profile path that works for the current mode.
+
+    Returns a Playwright persistent context. On a locked real-Chrome profile it
+    prints the lock warning and falls through to the next option; it never forces
+    the lock. Raises RuntimeError only if nothing can launch.
+    """
+    last_err: Optional[BaseException] = None
+    for (label, channel, udd) in _launch_candidates(fallback_profile):
+        kwargs = {"headless": headless, "args": LAUNCH_ARGS}
+        if channel:
+            kwargs["channel"] = channel
+        try:
+            udd.mkdir(parents=True, exist_ok=True)
+            context = p.chromium.launch_persistent_context(str(udd), **kwargs)
+            log.info("[auth] using profile: %s (mode: %s)", udd, label)
+            return context
+        except Exception as exc:
+            last_err = exc
+            if label == "system-chrome" and _is_lock_error(exc):
+                print(LOCK_WARNING)
+            else:
+                log.warning("[auth] could not start %s (%s); trying next option",
+                            label, str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
+    raise RuntimeError(f"No usable browser or profile was available: {last_err}")
+
+
 def login(
     profile_dir: Path = DEFAULT_PROFILE_DIR,
     headless: bool = False,
@@ -166,14 +282,7 @@ def login(
     pass this so the window doesn't visibly bounce CHAT_URL -> SIGNIN_URL."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
-        try:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=headless, channel="chrome", args=LAUNCH_ARGS,
-            )
-        except Exception:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=headless, args=LAUNCH_ARGS,
-            )
+        context = _open_context(p, headless=headless, fallback_profile=profile_dir)
         page = context.pages[0] if context.pages else context.new_page()
 
         # Normally we first land on CHAT_URL to reuse an already-signed-in
@@ -206,14 +315,7 @@ def _headless_refresh(profile_dir: Path) -> Optional[Session]:
     visible window."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
-        try:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=True, channel="chrome", args=LAUNCH_ARGS,
-            )
-        except Exception:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=True, args=LAUNCH_ARGS,
-            )
+        context = _open_context(p, headless=True, fallback_profile=profile_dir)
         page = context.pages[0] if context.pages else context.new_page()
         try:
             _safe_goto(page, CHAT_URL)
@@ -262,5 +364,33 @@ def get_session(
 
 
 if __name__ == "__main__":
-    s = login()
-    print(f"[auth] captured token {s.token[:10]}... ({len(s.cookies)} cookies)")
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m deepseek.auth",
+        description=(
+            "Sign in to DeepSeek once and save the session. By default this "
+            "prefers your installed Chrome and its real profile, so an existing "
+            "chat.deepseek.com login is reused with no password prompt."
+        ),
+    )
+    parser.add_argument(
+        "--browser", choices=_BROWSER_MODES, default=None,
+        help=(
+            "which browser/profile to use: 'system' = your real Chrome profile, "
+            "'fresh' = a separate Playwright Chrome profile, 'bundled' = "
+            "Playwright's Chromium, 'auto' (default) = try them in order."
+        ),
+    )
+    args = parser.parse_args()
+    if args.browser:
+        os.environ["DEEPSEEK_BROWSER_MODE"] = args.browser
+
+    try:
+        s = login()
+    except Exception as exc:
+        print(f"[auth] login failed: {exc}")
+        raise SystemExit(1)
+    # Never print the token itself — only its length and the cookie count.
+    print(f"[auth] captured a session token ({len(s.token)} chars, "
+          f"{len(s.cookies)} cookies); saved to {DEFAULT_SESSION_FILE}")

@@ -54,14 +54,42 @@ python3 -m venv venv
 source venv/bin/activate            # Windows: venv\Scripts\activate
 
 pip install -r requirements.txt
-playwright install chromium         # one-time: browser for sign-in
+playwright install chromium         # only needed if Chrome is not installed
 
-python -m deepseek.auth             # sign in once (opens a browser)
+python -m deepseek.auth             # sign in once — reuses your Chrome if possible
 ```
+
+**How the browser is chosen.** `python -m deepseek.auth` (and the server's
+on-demand login) pick a browser/profile in this order, using the first that
+launches:
+
+1. **Your installed Chrome with its real profile** — the token is read from your
+   existing `~/.config/google-chrome` login, so if you are already signed into
+   `chat.deepseek.com` in Chrome the session is captured **instantly, with no
+   password prompt**.
+2. **A separate Playwright Chrome profile** (`session/profile/`) — used when your
+   real Chrome is **currently running** (its profile is locked), or when the real
+   profile has no session. If this happens you'll see a warning telling you to
+   close Chrome to use your real profile; you may have to sign in once here.
+3. **Playwright's bundled Chromium** (`session/profile/`) — used only if Chrome is
+   not installed at all (run `playwright install chromium`).
+
+Two knobs override the selection:
+
+- `--browser {auto,system,fresh,bundled}` forces a specific path
+  (`auto` is the default and tries them in order).
+  ```bash
+  python -m deepseek.auth --browser system   # only your real Chrome profile
+  python -m deepseek.auth --browser fresh    # separate Playwright profile
+  python -m deepseek.auth --browser bundled  # Playwright Chromium
+  ```
+- `DEEPSEEK_CHROME_PROFILE=/path/to/chrome/user-data-dir` points at a specific
+  Chrome profile directory instead of the auto-detected one.
 
 Your session (bearer token + cookies) is saved under `session/` and refreshed
 automatically afterwards. The server can also open the login window on demand
-the first time it needs a session.
+the first time it needs a session. The token value is never printed — only its
+length and the cookie count.
 
 ---
 
