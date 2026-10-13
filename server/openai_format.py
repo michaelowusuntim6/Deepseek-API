@@ -96,7 +96,6 @@ def completion_response(model: str, content: str, prompt: str,
 
 def stream_chunks(model: str, stream, thinking: bool = False) -> Iterable[str]:
     """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
-
     `stream` is the client's stream object; after it's consumed we read its
     `.conversation_id` and attach it to the final chunk. When `thinking` is on and
     the client exposes typed events, reasoning is streamed as a non-standard
@@ -139,3 +138,24 @@ def stream_chunks(model: str, stream, thinking: bool = False) -> Iterable[str]:
         extra["reasoning_content"] = reasoning
     yield frame({}, finish="stop", extra=extra)
     yield "data: [DONE]\n\n"
+
+
+def error_frame(message: str, err_type: str = "upstream_error",
+                model: str = None) -> str:
+    """A terminal SSE chunk that carries an error to the client.
+
+    Emitted instead of crashing the ASGI task when the upstream call raises
+    mid-stream. The object stays a valid ``chat.completion.chunk`` (one choice,
+    an empty ``delta`` and ``finish_reason`` ``"error"``) so streaming parsers do
+    not choke; the top-level ``error`` object is a non-standard extension the
+    client reads to surface the failure. Always followed by ``data: [DONE]``.
+    """
+    obj = {
+        "id": _id(),
+        "object": "chat.completion.chunk",
+        "created": _now(),
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+        "error": {"message": message, "type": err_type},
+    }
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"

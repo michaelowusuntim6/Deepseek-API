@@ -2103,6 +2103,12 @@ class DeepSeekLLM:
                 (getattr(chunk, "model_extra", None) or {}).get("conversation_id")
             if cid:
                 returned_cid = cid
+            extra = getattr(chunk, "model_extra", None) or {}
+            err = extra.get("error") or getattr(chunk, "error", None)
+            if isinstance(err, dict) and err.get("message"):
+                # Server-side upstream failure (see server/openai_format.error_frame).
+                yield StreamEvent(type="error", message=str(err["message"]))
+                continue
             choices = getattr(chunk, "choices", None)
             if not choices:
                 continue
@@ -2165,6 +2171,11 @@ class DeepSeekLLM:
                     continue
                 if obj.get("conversation_id"):
                     returned_cid = obj["conversation_id"]
+                err = obj.get("error")
+                if isinstance(err, dict) and err.get("message"):
+                    # Server-side upstream failure (see server/openai_format.error_frame).
+                    yield StreamEvent(type="error", message=str(err["message"]))
+                    continue
                 for choice in obj.get("choices", []):
                     delta = choice.get("delta") or {}
                     if delta.get("reasoning_content"):
@@ -2364,7 +2375,7 @@ class MikeAgent:
             if guard > 40:
                 self.console.print("[yellow]stopping: too many tool iterations[/yellow]")
                 break
-            text, reasoning, native_calls, _finish = self._stream_once()
+            text, reasoning, native_calls, _finish, stream_error = self._stream_once()
             # The request reached the server (and the upstream thread): the
             # pending messages are now inside the conversation.
             self._unsent = []
@@ -2381,6 +2392,16 @@ class MikeAgent:
                     maybe_reasoning, _ = extract_thinking(text)
                     if maybe_reasoning:
                         self.last_reasoning = maybe_reasoning
+
+            if stream_error:
+                # The server sent a terminal error frame (Fix 1). Show the exact
+                # upstream reason instead of silently returning to the prompt, and
+                # stop the turn without appending an empty assistant message.
+                self.console.print(f"[red]error: {stream_error}[/red]")
+                self.console.print(
+                    "[dim]This usually means the session was invalidated. Run /auth "
+                    "to re-authenticate, or check the server log for the exact error.[/dim]")
+                return stream_error
 
             assistant_msg: dict = {"role": "assistant", "content": clean_text}
             if reasoning:
@@ -2412,6 +2433,16 @@ class MikeAgent:
                 self._save()
                 self._maybe_compact()
                 continue
+
+            if not clean_text.strip() and not calls and not reasoning:
+                # Truly empty stream with no error frame: same silent-blank failure.
+                # Report it and stop; do NOT append an empty assistant message.
+                self.console.print(
+                    "[red]error: no response from the model — the upstream stream was empty.[/red]")
+                self.console.print(
+                    "[dim]This usually means the session was invalidated. Run /auth "
+                    "to re-authenticate, or check the server log for the exact error.[/dim]")
+                return ""
 
             self._append(assistant_msg)
             self._save()
@@ -2450,6 +2481,7 @@ class MikeAgent:
         finish = None
         printed_any = False
         reasoning_displayed = False
+        stream_error: Optional[str] = None
 
         live = None
         if self.thinking_mode == "spinner" and _RICH and hasattr(self.console, "set_live"):
@@ -2499,6 +2531,9 @@ class MikeAgent:
                             printed_any = True
                 elif etype == "tool_calls":
                     native_calls.extend(event.get("calls", []))
+                elif etype == "error":
+                    stream_error = event.get("message") or "upstream error"
+                    log.warning("upstream SSE error: %s", stream_error)
                 elif etype == "finish":
                     finish = event.get("finish_reason")
             for kind, chunk in parser.finish():
@@ -2508,6 +2543,15 @@ class MikeAgent:
                     stop_live()
                     self.console.print(chunk, end="", soft_wrap=True)
                     printed_any = True
+        except Exception as exc:
+            # The OpenAI SDK raises (rather than yields) when the server sends an
+            # SSE error frame, and httpx/other backends may raise too. Convert any
+            # stream-level failure into a reported error instead of letting it
+            # crash the whole turn with a traceback panel. run() turns this into a
+            # clean message; a silent blank prompt is the bug we are fixing.
+            if not stream_error:
+                stream_error = str(exc) or exc.__class__.__name__
+            log.warning("stream raised: %s", stream_error)
         finally:
             stop_live()
             if reasoning_displayed or printed_any:
@@ -2515,8 +2559,9 @@ class MikeAgent:
 
         # Return the RAW assistant text (including hidden tool_call blocks) so the
         # prompted-mode parser can find them; the visible text was already
-        # streamed to the console from `parser.content`.
-        return parser.raw, parser.reasoning, native_calls, finish
+        # streamed to the console from `parser.content`. Also return any upstream
+        # SSE error so run() can surface it instead of a silent blank.
+        return parser.raw, parser.reasoning, native_calls, finish, stream_error
 
     def _spinner_text(self, reasoning: str):
         tail = reasoning[-80:].replace("\n", " ")

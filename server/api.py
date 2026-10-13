@@ -21,6 +21,7 @@ RATE_LIMIT_PER_MINUTE); /healthz is exempt.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -43,11 +44,21 @@ from .config import (
     is_known_model,
     resolve_model_type,
 )
-from .openai_format import completion_response, messages_to_prompt, stream_chunks
+from .openai_format import (
+    completion_response,
+    error_frame,
+    messages_to_prompt,
+    stream_chunks,
+)
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
 
 load_dotenv()
+
+# Server-side operational log. Uses uvicorn's own error logger so these lines
+# reach the console that already renders request logs (uvicorn does not attach a
+# handler to the root logger, so a bespoke "deepseek.server" INFO would be lost).
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="DeepSeek OpenAI-compatible API", version="1.0.0")
 install_rate_limit(app, RateLimiter(limit=RATE_LIMIT_PER_MINUTE, window=60.0))
@@ -141,11 +152,22 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if req.stream:
         def gen():
-            stream = client.stream(
-                prompt, conversation_id=req.conversation_id,
-                model=model_type, thinking=req.thinking, search=req.search,
-            )
-            yield from stream_chunks(canonical_id, stream, thinking=req.thinking)
+            # Catch ONLY exceptions raised by building the stream (client.stream
+            # -> create_chat_session can 401) or by iterating it (the completion
+            # POST). Anything else propagates. Turn an upstream failure into a
+            # well-formed terminal SSE frame + [DONE] instead of crashing the ASGI
+            # task, which truncates the response and yields a blank client reply.
+            try:
+                stream = client.stream(
+                    prompt, conversation_id=req.conversation_id,
+                    model=model_type, thinking=req.thinking, search=req.search,
+                )
+                yield from stream_chunks(canonical_id, stream, thinking=req.thinking)
+            except Exception as exc:
+                logger.exception("upstream streaming failed mid-response")
+                yield error_frame(str(exc), err_type="upstream_error",
+                                  model=canonical_id)
+                yield "data: [DONE]\n\n"
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 

@@ -22,6 +22,7 @@ session (see `deepseek.auth`). For each message it:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 from dataclasses import dataclass
@@ -29,11 +30,16 @@ from typing import Iterator, Optional
 
 import httpx
 
-from .auth import Session, get_session
+from .auth import LoginRequired, Session, get_session
 from .pow import DeepSeekPow
 
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
+
+# The [auth] refresh log lines must be visible in the server console. uvicorn only
+# attaches handlers to its own loggers (not the root), so we borrow uvicorn.error;
+# this code path only runs inside the server process.
+log = logging.getLogger("uvicorn.error")
 
 # DeepSeek's mode pill, sent as `model_type` in the completion body. "default" is
 # Instant (the fast model); "expert" is the stronger, slower model. Omitting the
@@ -119,9 +125,59 @@ class DeepSeekClient:
             "x-client-timezone-offset": "19800",
         }
 
+    # --- auth refresh (401 handling) ---------------------------------------
+
+    @staticmethod
+    def _is_auth_error(exc: BaseException) -> bool:
+        """True only for DeepSeek's 401-class auth failures, not any RuntimeError.
+
+        Matches the message the web API returns via `_biz`:
+        "DeepSeek API error: Authorization Failed (invalid token)".
+        """
+        text = str(exc).lower()
+        return "authorization failed" in text or "invalid token" in text
+
+    def _apply_session(self, new: Session) -> None:
+        """Swap in a refreshed session and update the live httpx client.
+
+        httpx keeps the old `authorization` header on the client, so it must be
+        overwritten explicitly; the cookies and user-agent change with the session.
+        """
+        self.session = new
+        self._http.headers["authorization"] = f"Bearer {new.token}"
+        self._http.headers["user-agent"] = new.user_agent
+        self._http.cookies.clear()
+        self._http.cookies.update(new.cookies)
+
+    def _refresh_after_401(self) -> None:
+        """Force exactly one headless token refresh from the browser profile.
+
+        `max_age=0` bypasses the cached session.json and re-captures from the
+        persistent profile. If the profile can no longer recover headlessly
+        (LoginRequired), there is nothing we can do without a human — we log and
+        re-raise so the caller propagates a clear error rather than retrying.
+        """
+        try:
+            new = get_session(max_age=0, allow_interactive=False)
+        except LoginRequired:
+            log.warning("[auth] token refresh failed; session cannot be recovered headlessly")
+            raise
+        self._apply_session(new)
+        log.info("[auth] token refreshed after 401, retrying")
+
     # --- protocol steps -----------------------------------------------------
 
     def create_chat_session(self) -> str:
+        try:
+            r = self._http.post("/api/v0/chat_session/create", json={})
+            r.raise_for_status()
+            return _biz(r.json())["chat_session"]["id"]
+        except Exception as exc:
+            if not self._is_auth_error(exc):
+                raise
+        # Auth failure: refresh once and retry exactly once. A second failure
+        # propagates (no loop).
+        self._refresh_after_401()
         r = self._http.post("/api/v0/chat_session/create", json={})
         r.raise_for_status()
         return _biz(r.json())["chat_session"]["id"]
@@ -226,17 +282,36 @@ class _Stream:
         return body
 
     def iter_events(self) -> Iterator[tuple]:
-        """Yield ``("response"|"reasoning", text)`` tuples for the whole stream."""
-        headers = self._request_headers()
+        """Yield ``("response"|"reasoning", text)`` tuples for the whole stream.
+
+        If the completion POST (or its short-lived PoW header) returns a 401-class
+        auth error before anything has been emitted, refresh the token once and
+        reissue the request exactly once. We never retry after yielding, so a
+        partial stream is never duplicated.
+        """
         meta: dict = {}
-        with self._client._http.stream(
-            "POST", COMPLETION_PATH, json=self._body(), headers=headers
-        ) as resp:
-            resp.raise_for_status()
-            for kind, text in _iter_sse_events(resp.iter_lines(), meta):
-                if kind == "reasoning":
-                    self._reasoning += text
-                yield kind, text
+        attempt = 0
+        emitted = False
+        while True:
+            try:
+                headers = self._request_headers()
+                with self._client._http.stream(
+                    "POST", COMPLETION_PATH, json=self._body(), headers=headers
+                ) as resp:
+                    resp.raise_for_status()
+                    for kind, text in _iter_sse_events(resp.iter_lines(), meta):
+                        emitted = True
+                        if kind == "reasoning":
+                            self._reasoning += text
+                        yield kind, text
+                break
+            except Exception as exc:
+                if (attempt == 0 and not emitted
+                        and self._client._is_auth_error(exc)):
+                    attempt = 1
+                    self._client._refresh_after_401()
+                    continue
+                raise
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
 

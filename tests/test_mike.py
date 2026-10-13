@@ -954,3 +954,239 @@ def test_tool_result_uses_call_id(tmp_path):
     assert last["role"] == "user"
     assert 'id="call_DEADBEEF"' in last["content"]
     assert "payload" in last["content"]
+
+
+# --------------------------------------------------------------------------- #
+# 12. Empty / failed stream handling (invalid token mid-stream)                #
+# --------------------------------------------------------------------------- #
+
+def _assistant_count(session):
+    return sum(1 for m in session.messages if m["role"] == "assistant")
+
+
+def test_run_reports_empty_stream(tmp_path):
+    """A blank upstream stream prints a visible error and does not append an
+    empty assistant turn — run() returns "" instead of a silent blank prompt."""
+    turns = [[{"type": "done"}]]  # nothing emitted by the model
+    agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+
+    result = agent.run("tell me what you can see")
+
+    low = console.text.lower()
+    assert "no response from the model" in low
+    assert "upstream stream was empty" in low
+    assert result == ""
+    assert _assistant_count(session) == 0   # no empty assistant message stored
+    # The user turn is preserved on disk; only the assistant reply is dropped.
+    assert any(m["role"] == "user" for m in session.messages)
+
+
+def test_run_surfaces_sse_error_frame(tmp_path):
+    """An SSE error frame (Fix 1) is shown verbatim and stops the turn without
+    appending an assistant message."""
+    msg = "DeepSeek API error: Authorization Failed (invalid token)"
+    turns = [[{"type": "error", "message": msg}]]
+    agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+
+    result = agent.run("tell me what you can see")
+
+    assert msg in console.text
+    assert result == msg
+    assert _assistant_count(session) == 0
+
+
+def test_run_surfaces_raised_stream_error(tmp_path):
+    """When the LLM backend *raises* (as the OpenAI SDK does on an error frame),
+    run() still reports the failure cleanly instead of crashing the turn."""
+    msg = "DeepSeek API error: Authorization Failed (invalid token)"
+
+    class _RaisingLLM:
+        base_url = "http://stub/v1"
+
+        def chat_stream(self, *a, **k):
+            raise RuntimeError(msg)
+
+        def complete(self, *a, **k):
+            return "ok"
+
+    store = mike.SessionStore(tmp_path / "sessions")
+    session = store.new_session(name="raise")
+    comp = mike.Compactor(mike.TokenCounter("heuristic"))
+    console = _RecordingConsole()
+    agent = mike.MikeAgent(
+        llm=_RaisingLLM(), session=session, store=store, compactor=comp,
+        toolbox=mike.Toolbox(str(tmp_path)), console=console,
+        tool_mode="prompted", cwd=str(tmp_path),
+    )
+
+    result = agent.run("tell me what you can see")
+
+    assert msg in console.text
+    assert "This usually means the session was invalidated" in console.text
+    assert result == msg
+    assert _assistant_count(session) == 0
+
+
+def test_stream_once_returns_error(tmp_path):
+    """_stream_once must return the error message as its 5th element."""
+    turns = [[{"type": "error", "message": "boom"}]]
+    agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+    text, reasoning, calls, finish, err = agent._stream_once()
+    assert err == "boom"
+    assert text == "" and calls == []
+
+
+# --------------------------------------------------------------------------- #
+# 13. Invalid-token mid-stream: server error frame + client 401 retry          #
+# --------------------------------------------------------------------------- #
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._p = payload
+
+    def raise_for_status(self):
+        if self._p.get("code") != 0:
+            raise RuntimeError(f"DeepSeek API error: {self._p.get('msg')}")
+
+    def json(self):
+        return self._p
+
+
+class _FakeCookies:
+    def clear(self):
+        pass
+
+    def update(self, d):
+        pass
+
+
+class _FakeHTTP:
+    """httpx stand-in: first POST gets a 401 auth failure, then succeeds."""
+
+    def __init__(self, fail_first=True):
+        self.headers = {}
+        self.cookies = _FakeCookies()
+        self.calls = 0
+        self.fail_first = fail_first
+
+    def post(self, *args, **kwargs):
+        self.calls += 1
+        if self.fail_first and self.calls == 1:
+            return _FakeResp({"code": 1001,
+                              "msg": "Authorization Failed (invalid token)",
+                              "data": {}})
+        return _FakeResp({"code": 0,
+                          "data": {"biz_data": {"chat_session": {"id": "SID-NEW"}}}})
+
+
+def _bare_client(http):
+    """A DeepSeekClient built without touching network/Playwright/PoW."""
+    import deepseek.client as dc
+    import time as _t
+    c = dc.DeepSeekClient.__new__(dc.DeepSeekClient)
+    c._http = http
+    c.session = dc.Session(token="stale", cookies={}, user_agent="UA",
+                           captured_at=_t.time())
+    return c
+
+
+def test_is_auth_error_matches_only_auth_failures():
+    import deepseek.client as dc
+    assert dc.DeepSeekClient._is_auth_error(
+        RuntimeError("DeepSeek API error: Authorization Failed (invalid token)"))
+    assert dc.DeepSeekClient._is_auth_error(
+        RuntimeError("deepseek api error: Invalid Token"))
+    assert not dc.DeepSeekClient._is_auth_error(RuntimeError("DeepSeek API error: rate limited"))
+
+
+def test_client_refreshes_and_retries_once_after_401(monkeypatch):
+    import deepseek.client as dc
+    import time as _t
+    fresh = dc.Session(token="fresh-tok", cookies={"c": "1"}, user_agent="UA2",
+                       captured_at=_t.time())
+    refresh_calls = {"n": 0}
+
+    def fake_get_session(**kwargs):
+        refresh_calls["n"] += 1
+        assert kwargs.get("max_age") == 0          # forces a headless re-capture
+        assert kwargs.get("allow_interactive") is False
+        return fresh
+
+    monkeypatch.setattr(dc, "get_session", fake_get_session)
+    http = _FakeHTTP(fail_first=True)
+    c = _bare_client(http)
+
+    sid = c.create_chat_session()
+
+    assert sid == "SID-NEW"
+    assert http.calls == 2                 # original + exactly one retry
+    assert refresh_calls["n"] == 1         # refreshed once
+    assert c.session.token == "fresh-tok"  # new session swapped in
+    assert c._http.headers["authorization"] == "Bearer fresh-tok"
+
+
+def test_client_propagates_when_refresh_cannot_recover(monkeypatch):
+    import deepseek.client as dc
+    from deepseek.auth import LoginRequired
+
+    def boom(**kwargs):
+        raise LoginRequired()
+
+    monkeypatch.setattr(dc, "get_session", boom)
+    http = _FakeHTTP(fail_first=True)
+    c = _bare_client(http)
+
+    with pytest.raises(LoginRequired):
+        c.create_chat_session()
+    assert http.calls == 1   # no retry once refresh fails
+
+
+def test_client_does_not_retry_non_auth_errors():
+    import deepseek.client as dc
+    http = _FakeHTTP(fail_first=True)
+    http._fail_msg = "some other failure"
+    # Make the only post fail with a non-auth error.
+    def always_fail(*a, **k):
+        http.calls += 1
+        return _FakeResp({"code": 2000, "msg": "some other failure", "data": {}})
+    http.post = always_fail
+    c = _bare_client(http)
+    with pytest.raises(RuntimeError):
+        c.create_chat_session()
+    assert http.calls == 1   # non-auth error is not retried
+
+
+def test_error_frame_shape_and_server_emits_on_failure():
+    import json as _json
+    from server.openai_format import error_frame
+    frame = error_frame("kaboom", err_type="upstream_error", model="m1")
+    assert frame.startswith("data: ") and frame.endswith("\n\n")
+    obj = _json.loads(frame[len("data: "):].strip())
+    assert obj["object"] == "chat.completion.chunk"
+    assert obj["model"] == "m1"
+    assert obj["choices"][0]["delta"] == {}
+    assert obj["choices"][0]["finish_reason"] == "error"
+    assert obj["error"] == {"message": "kaboom", "type": "upstream_error"}
+
+    from fastapi.testclient import TestClient
+    import server.api as api
+    client = TestClient(api.app)
+
+    class _RaisingClient:
+        def stream(self, *a, **k):
+            raise RuntimeError("DeepSeek API error: Authorization Failed (invalid token)")
+
+    original = api._client
+    api._client = _RaisingClient()
+    try:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": api.MODEL_ID, "stream": True,
+                  "messages": [{"role": "user", "content": "hi"}]},
+        )
+    finally:
+        api._client = original
+    assert resp.status_code == 200
+    assert '"finish_reason": "error"' in resp.text
+    assert "Authorization Failed" in resp.text
+    assert "data: [DONE]" in resp.text
