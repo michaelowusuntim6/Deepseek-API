@@ -3092,7 +3092,8 @@ class MikeAgent:
             stream_error: Optional[str] = None
 
             live = None
-            if _RICH and hasattr(self.console, "set_live"):
+            if (self.thinking_mode in ("on", "spinner")
+                    and _RICH and hasattr(self.console, "set_live")):
                 live = Live(self._live_status(), console=self.console,
                             refresh_per_second=12, transient=True, auto_refresh=True)
                 live.start()
@@ -3120,10 +3121,13 @@ class MikeAgent:
                             ))
                         parser.reasoning += event["text"]
                     elif etype == "content":
-                        for kind, chunk in parser.feed(event["text"]):
+                        parsed_chunks = parser.feed(event["text"])
+                        for kind, chunk in parsed_chunks:
                             if kind == "reasoning":
                                 if live is not None:
                                     live.update(self._live_status(parser.reasoning))
+                        if any(kind != "reasoning" for kind, _chunk in parsed_chunks):
+                            stop_live()
                     elif etype == "tool_calls":
                         native_calls.extend(event.get("calls", []))
                     elif etype == "error":
@@ -3165,9 +3169,16 @@ class MikeAgent:
 
     def _live_status(self, reasoning: str = ""):
         estimate = self.compactor.estimate(self.context)
+        context = f"Ctx: {estimate:,} / {self.compactor.max_context:,}"
+        if self.thinking_mode == "on" and _RICH:
+            return Panel(
+                Text(reasoning or "Thinking...", style="dim"),
+                title=f"Reasoning · {context}",
+                border_style="dim",
+                expand=False,
+            )
         text = (
-            f" Thinking... (Ctx: {estimate:,} / "
-            f"{self.compactor.max_context:,})"
+            f" Thinking... ({context})"
         )
         tail = reasoning[-80:].replace("\n", " ")
         if tail:
@@ -3189,12 +3200,9 @@ class MikeAgent:
             self.console.print(text)
 
     def _render_assistant_response(self, text: str, reasoning: str = "") -> None:
-        if reasoning and self.thinking_mode == "on":
-            if _is_rich_console(self.console):
-                self.console.print(Text(reasoning, style="dim"))
-                self.console.rule(style="dim")
-            else:
-                self.console.print(reasoning)
+        # Reasoning is shown only in the transient Live view so it collapses
+        # when visible content starts. The stored copy remains available to
+        # /thinking last and reasoning replay.
         self._render_markdown(text)
 
     # -- tools ------------------------------------------------------------

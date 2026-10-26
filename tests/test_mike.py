@@ -396,6 +396,66 @@ def test_thinking_never_becomes_assistant_content(tmp_path):
     assert "thinking..." not in assistant["content"]
 
 
+def test_thinking_on_uses_transient_live_and_stops_on_content(tmp_path, monkeypatch):
+    reasoning = " ".join(["reason"] * 24)
+    turns = [[
+        {"type": "reasoning", "text": reasoning},
+        {"type": "content", "text": "The poem starts here."},
+        {"type": "finish", "finish_reason": "stop"},
+    ]]
+
+    class FakeLive:
+        instances = []
+
+        def __init__(self, renderable, **kwargs):
+            self.renderable = renderable
+            self.kwargs = kwargs
+            self.updates = []
+            self.stopped = False
+            FakeLive.instances.append(self)
+
+        def start(self):
+            pass
+
+        def update(self, renderable):
+            self.renderable = renderable
+            self.updates.append(renderable)
+
+        def stop(self):
+            self.stopped = True
+
+    class LiveConsole(mike._PlainConsole):
+        def set_live(self):
+            pass
+
+    monkeypatch.setattr(mike, "Live", FakeLive)
+    agent, _llm, _console, _session = _make_roundtrip_agent(tmp_path, turns)
+    agent.console = LiveConsole()
+    agent.thinking_mode = "on"
+
+    raw, saved_reasoning, calls, _finish, error = agent._stream_once()
+
+    assert raw == "The poem starts here."
+    assert saved_reasoning == reasoning
+    assert calls == [] and error is None
+    assert len(FakeLive.instances) == 1
+    live = FakeLive.instances[0]
+    assert live.kwargs["transient"] is True
+    assert live.stopped is True
+    assert isinstance(live.updates[-1], mike.Panel)
+    assert reasoning in str(live.updates[-1].renderable)
+
+
+def test_thinking_on_is_not_reprinted_after_live_stops(tmp_path):
+    agent, _llm, console, _session = _make_roundtrip_agent(tmp_path, [[]])
+    agent.thinking_mode = "on"
+
+    agent._render_assistant_response("Final answer.", "Temporary reasoning.")
+
+    assert "Final answer." in console.text
+    assert "Temporary reasoning." not in console.text
+
+
 # --------------------------------------------------------------------------- #
 # Stub helpers                                                                 #
 # --------------------------------------------------------------------------- #
