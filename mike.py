@@ -2816,6 +2816,7 @@ class MikeAgent:
         # results). When a conversation_id exists we send only these, so a
         # single DeepSeek chat grows turn by turn instead of many throwaway ones.
         self._unsent: list = []
+        self._has_called_tools_in_turn = False
 
     def _last_reasoning_from_history(self) -> str:
         for msg in reversed(self.session.messages):
@@ -2903,6 +2904,7 @@ class MikeAgent:
         user_input = user_input.strip()
         if not user_input:
             return ""
+        self._has_called_tools_in_turn = False
 
         if not self.session.messages:
             self._name_from(user_input)
@@ -3006,6 +3008,7 @@ class MikeAgent:
                 self._append(assistant_msg)
                 self._save()
                 self._run_tools(calls)
+                self._has_called_tools_in_turn = True
                 self._save()
                 self._maybe_compact()
                 continue
@@ -3044,7 +3047,7 @@ class MikeAgent:
 
             self._append(assistant_msg)
             self._save()
-            if nudge_count == 0:
+            if self._has_called_tools_in_turn and nudge_count == 0:
                 nudge_count += 1
                 self._append({
                     "role": "user",

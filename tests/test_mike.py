@@ -1488,6 +1488,11 @@ def test_apply_patch_in_toolbox_and_not_write_file(tmp_path):
 
 
 def test_task_complete_stops_loop(tmp_path):
+    list_call = (
+        "<tool_call>"
+        + json.dumps({"name": "list_dir", "arguments": {"path": "."}})
+        + "</tool_call>"
+    )
     task_call = (
         "<tool_call>"
         + json.dumps({
@@ -1497,7 +1502,7 @@ def test_task_complete_stops_loop(tmp_path):
         + "</tool_call>"
     )
     turns = [
-        [{"type": "content", "text": "I will inspect the files first."}],
+        [{"type": "content", "text": "I will inspect the files first.\n" + list_call}],
         [{"type": "content", "text": task_call},
          {"type": "finish", "finish_reason": "stop"}],
     ]
@@ -1508,7 +1513,7 @@ def test_task_complete_stops_loop(tmp_path):
 
     assert llm.calls == 2
     assert result == "Implemented and verified the change."
-    assert recorded == []
+    assert [name for name, _args in recorded] == ["list_dir"]
     assert any("inspect the files first" in str(m.get("content"))
                for m in session.messages if m["role"] == "assistant")
     assert all(
@@ -1546,8 +1551,13 @@ def test_task_complete_summary_hidden_when_text_was_visible(tmp_path):
 
 
 def test_commentary_nudge(tmp_path):
+    list_call = (
+        "<tool_call>"
+        + json.dumps({"name": "list_dir", "arguments": {"path": "."}})
+        + "</tool_call>"
+    )
     turns = [
-        [{"type": "content", "text": "Progress: reading the next file."}],
+        [{"type": "content", "text": "Progress: reading the next file.\n" + list_call}],
         [{"type": "content", "text": "The task is done."}],
     ]
     agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
@@ -1558,13 +1568,32 @@ def test_commentary_nudge(tmp_path):
 
     result = agent.run("do the work")
 
-    assert llm.calls == 2
+    assert llm.calls == 3
     assert result == "The task is done."
-    assert nudge in str(llm.seen_messages[1])
+    assert nudge in str(llm.seen_messages[2])
     assert sum(1 for m in session.messages if m.get("content") == nudge) == 1
 
 
+def test_conversational_no_nudge(tmp_path):
+    turns = [[{"type": "content", "text": "Hi! How can I help?"}]]
+    agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+    nudge = "You have not called `task_complete`"
+
+    result = agent.run("Hi")
+
+    assert result == "Hi! How can I help?"
+    assert llm.calls == 1
+    assert "Hi! How can I help?" in console.text
+    assert nudge not in console.text
+    assert all(nudge not in str(m.get("content", "")) for m in session.messages)
+
+
 def test_hallucinated_channel_tags_are_stripped(tmp_path):
+    list_call = (
+        "<tool_call>"
+        + json.dumps({"name": "list_dir", "arguments": {"path": "."}})
+        + "</tool_call>"
+    )
     task_call = (
         "<tool_call>"
         + json.dumps({
@@ -1574,7 +1603,7 @@ def test_hallucinated_channel_tags_are_stripped(tmp_path):
         + "</tool_call>"
     )
     turns = [
-        [{"type": "content", "text": "[COMMENTARY] Hello! I'm Mike."}],
+        [{"type": "content", "text": "[COMMENTARY] Hello! I'm Mike.\n" + list_call}],
         [{"type": "content", "text": task_call}],
     ]
     agent, _llm, console, session = _make_roundtrip_agent(tmp_path, turns)
