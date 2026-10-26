@@ -2975,10 +2975,10 @@ class MikeAgent:
                 # not store or replay it in the assistant's tool_calls.
                 self._append(assistant_msg)
                 self._save()
-                final_text = summary or clean_text
-                if summary.strip() and summary.strip() != clean_text.strip():
-                    if _is_rich_console(self.console):
-                        self.console.rule(style="dim")
+                if clean_text.strip():
+                    final_text = clean_text
+                else:
+                    final_text = summary
                     self._render_markdown(summary)
                 break
 

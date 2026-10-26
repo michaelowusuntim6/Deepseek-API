@@ -1457,6 +1457,34 @@ def test_task_complete_stops_loop(tmp_path):
     )
 
 
+def test_task_complete_summary_hidden_when_text_was_visible(tmp_path):
+    visible = "Hi! I'm Mike. What would you like me to do?"
+    summary = "No task was requested; the user only sent a greeting."
+    task_call = (
+        "<tool_call>"
+        + json.dumps({
+            "name": "task_complete",
+            "arguments": {"summary": summary},
+        })
+        + "</tool_call>"
+    )
+    turns = [[{
+        "type": "content",
+        "text": visible + "\n" + task_call,
+    }]]
+    agent, _llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+
+    result = agent.run("Hi")
+
+    assert result == visible
+    assert console.text.count(visible) == 1
+    assert summary not in console.text
+    assert "task_complete" not in console.text
+    assistant = [m for m in session.messages if m["role"] == "assistant"][-1]
+    assert assistant["content"] == visible
+    assert not assistant.get("tool_calls")
+
+
 def test_commentary_nudge(tmp_path):
     turns = [
         [{"type": "content", "text": "Progress: reading the next file."}],
