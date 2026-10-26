@@ -983,21 +983,59 @@ def _assistant_count(session):
     return sum(1 for m in session.messages if m["role"] == "assistant")
 
 
-def test_run_reports_empty_stream(tmp_path):
+def test_run_reports_empty_stream_after_retries(tmp_path, monkeypatch):
     """A blank upstream stream prints a visible error and does not append an
-    empty assistant turn — run() returns "" instead of a silent blank prompt."""
+    empty assistant turn after all automatic retries are exhausted."""
     turns = [[{"type": "done"}]]  # nothing emitted by the model
     agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+    sleeps = []
+    monkeypatch.setattr(mike.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     result = agent.run("tell me what you can see")
 
     low = console.text.lower()
+    assert llm.calls == 3
+    assert sleeps == [2.0, 2.0]
+    assert "retrying (attempt 1/2)" in low
+    assert "retrying (attempt 2/2)" in low
     assert "no response from the model" in low
     assert "upstream stream was empty" in low
     assert result == ""
     assert _assistant_count(session) == 0   # no empty assistant message stored
     # The user turn is preserved on disk; only the assistant reply is dropped.
     assert any(m["role"] == "user" for m in session.messages)
+
+
+def test_empty_stream_retry_recovers_with_same_messages(tmp_path, monkeypatch, caplog):
+    task_call = (
+        "<tool_call>"
+        + json.dumps({
+            "name": "task_complete",
+            "arguments": {"summary": "Recovered after a transient empty stream."},
+        })
+        + "</tool_call>"
+    )
+    turns = [
+        [{"type": "done"}],
+        [{"type": "content", "text": task_call}],
+    ]
+    agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+    sleeps = []
+    monkeypatch.setattr(mike.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    with caplog.at_level(logging.WARNING, logger="mike"):
+        result = agent.run("answer the existing prompt")
+
+    assert result == "Recovered after a transient empty stream."
+    assert llm.calls == 2
+    assert llm.seen_messages[0] == llm.seen_messages[1]
+    assert sleeps == [2.0]
+    assert "retrying (attempt 1/2)" in console.text.lower()
+    assert sum(1 for m in session.messages if m["role"] == "user") == 1
+    assert sum(
+        1 for record in caplog.records
+        if record.getMessage() == "empty upstream stream; retrying..."
+    ) == 1
 
 
 def test_run_surfaces_sse_error_frame(tmp_path):

@@ -3085,70 +3085,83 @@ class MikeAgent:
         tools = self.toolbox.openai_tools() if self.tool_mode == "native" else None
         thinking = self.thinking_mode != THINKING_OFF
 
-        parser = StreamParser()
-        native_calls: list = []
-        finish = None
-        stream_error: Optional[str] = None
+        for attempt in range(3):
+            parser = StreamParser()
+            native_calls: list = []
+            finish = None
+            stream_error: Optional[str] = None
 
-        live = None
-        if _RICH and hasattr(self.console, "set_live"):
-            live = Live(self._live_status(), console=self.console,
-                        refresh_per_second=12, transient=True, auto_refresh=True)
-            live.start()
+            live = None
+            if _RICH and hasattr(self.console, "set_live"):
+                live = Live(self._live_status(), console=self.console,
+                            refresh_per_second=12, transient=True, auto_refresh=True)
+                live.start()
 
-        def stop_live():
-            nonlocal live
-            if live is not None:
-                live.stop()
-                live = None
+            def stop_live():
+                nonlocal live
+                if live is not None:
+                    live.stop()
+                    live = None
 
-        try:
-            for event in self.llm.chat_stream(
-                    messages, tools=tools, thinking=thinking,
-                    conversation_id=self.session.conversation_id):
-                etype = event.get("type")
-                if etype == "conversation_id":
-                    cid = event.get("id")
-                    if cid and cid != self.session.conversation_id:
-                        self.session.conversation_id = cid
-                        self._save()
-                elif etype == "reasoning":
-                    if live is not None:
-                        live.update(self._live_status(
-                            parser.reasoning + event["text"]
-                        ))
-                    parser.reasoning += event["text"]
-                elif etype == "content":
-                    for kind, chunk in parser.feed(event["text"]):
-                        if kind == "reasoning":
-                            if live is not None:
-                                live.update(self._live_status(parser.reasoning))
-                elif etype == "tool_calls":
-                    native_calls.extend(event.get("calls", []))
-                elif etype == "error":
-                    stream_error = event.get("message") or "upstream error"
-                    log.warning("upstream SSE error: %s", stream_error)
-                elif etype == "finish":
-                    finish = event.get("finish_reason")
-            for kind, chunk in parser.finish():
-                if kind == "reasoning":
-                    parser.reasoning += chunk
-        except Exception as exc:
-            # The OpenAI SDK raises (rather than yields) when the server sends an
-            # SSE error frame, and httpx/other backends may raise too. Convert any
-            # stream-level failure into a reported error instead of letting it
-            # crash the whole turn with a traceback panel. run() turns this into a
-            # clean message; a silent blank prompt is the bug we are fixing.
-            if not stream_error:
-                stream_error = str(exc) or exc.__class__.__name__
-            log.warning("stream raised: %s", stream_error)
-        finally:
-            stop_live()
+            try:
+                for event in self.llm.chat_stream(
+                        messages, tools=tools, thinking=thinking,
+                        conversation_id=self.session.conversation_id):
+                    etype = event.get("type")
+                    if etype == "conversation_id":
+                        cid = event.get("id")
+                        if cid and cid != self.session.conversation_id:
+                            self.session.conversation_id = cid
+                            self._save()
+                    elif etype == "reasoning":
+                        if live is not None:
+                            live.update(self._live_status(
+                                parser.reasoning + event["text"]
+                            ))
+                        parser.reasoning += event["text"]
+                    elif etype == "content":
+                        for kind, chunk in parser.feed(event["text"]):
+                            if kind == "reasoning":
+                                if live is not None:
+                                    live.update(self._live_status(parser.reasoning))
+                    elif etype == "tool_calls":
+                        native_calls.extend(event.get("calls", []))
+                    elif etype == "error":
+                        stream_error = event.get("message") or "upstream error"
+                        log.warning("upstream SSE error: %s", stream_error)
+                    elif etype == "finish":
+                        finish = event.get("finish_reason")
+                for kind, chunk in parser.finish():
+                    if kind == "reasoning":
+                        parser.reasoning += chunk
+            except Exception as exc:
+                # The OpenAI SDK raises (rather than yields) when the server sends
+                # an SSE error frame, and httpx/other backends may raise too.
+                if not stream_error:
+                    stream_error = str(exc) or exc.__class__.__name__
+                log.warning("stream raised: %s", stream_error)
+            finally:
+                stop_live()
 
-        # Return the RAW assistant text (including hidden tool_call blocks) so the
-        # prompted-mode parser can find them. run() renders the clean result with
-        # Markdown after parsing, so tool syntax and reasoning tags never leak.
-        return parser.raw, parser.reasoning, native_calls, finish, stream_error
+            is_empty = not parser.raw and not parser.reasoning and not native_calls
+            if stream_error or not is_empty:
+                return parser.raw, parser.reasoning, native_calls, finish, stream_error
+
+            if attempt < 2:
+                retry_number = attempt + 1
+                log.warning("empty upstream stream; retrying...")
+                self.console.print(
+                    "[yellow]warning: empty response from upstream, retrying "
+                    f"(attempt {retry_number}/2)...[/yellow]"
+                )
+                time.sleep(2.0)
+                continue
+
+            # All three attempts were empty. Return the final empty result and let
+            # run() use the existing graceful "no response" error path.
+            return parser.raw, parser.reasoning, native_calls, finish, stream_error
+
+        return "", "", [], None, None
 
     def _live_status(self, reasoning: str = ""):
         estimate = self.compactor.estimate(self.context)
