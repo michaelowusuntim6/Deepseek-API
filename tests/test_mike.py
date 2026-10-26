@@ -1382,6 +1382,8 @@ def test_apply_patch_rejects_bad_envelope(tmp_path):
 def test_apply_patch_in_toolbox_and_not_write_file(tmp_path):
     specs = mike.Toolbox(str(tmp_path)).specs
     assert "apply_patch" in specs
+    assert "update_plan" in specs
+    assert "todo_write" not in specs
     assert "task_complete" in specs
     assert "write_file" not in specs
     assert "edit_file" not in specs
@@ -1558,3 +1560,88 @@ def test_dsml_stop_retry(tmp_path, caplog):
     assert "tool-call syntax detected in content but not parsed" in console.text
     assert sum(1 for r in caplog.records
                if r.getMessage() == "dsml_unparsed_retry") == 1
+
+
+# --------------------------------------------------------------------------- #
+# 16. Codex-style TUI helpers                                                  #
+# --------------------------------------------------------------------------- #
+
+def test_mike_completer_commands_and_arguments():
+    from prompt_toolkit.document import Document
+
+    completer = mike.MikeCompleter()
+    commands = list(completer.get_completions(Document("/th"), None))
+    assert [item.text for item in commands] == ["/thinking"]
+    assert "reasoning" in commands[0].display_meta_text.lower()
+
+    arguments = list(completer.get_completions(Document("/thinking o"), None))
+    assert {item.text for item in arguments} == {"on", "off"}
+
+
+def test_prompt_session_uses_file_history_and_multiline():
+    class _Agent:
+        pass
+
+    session = mike._build_prompt_session(_Agent())
+    assert session.multiline is True
+    assert isinstance(session.completer, mike.MikeCompleter)
+    assert session.history.filename == str(mike.ROOT / ".mike_history")
+
+
+def test_update_plan_schema_and_rendering(tmp_path):
+    console = _RecordingConsole()
+    toolbox = mike.Toolbox(str(tmp_path), console=console)
+    result = toolbox.call("update_plan", {
+        "plan": [
+            {"step": "Inspect the repo", "status": "completed"},
+            {"step": "Edit app.py", "status": "in_progress"},
+            {"step": "Run tests", "status": "pending"},
+        ],
+    })
+
+    assert "Plan · 1/3 complete" in result
+    assert "✓ Inspect the repo" in result
+    assert "⠋ Edit app.py" in result
+    assert "○ Run tests" in result
+    assert "✓ Inspect the repo" in console.text
+    assert toolbox.load_plan()[1]["status"] == "in_progress"
+    assert toolbox.call("todo_read", {}) == result
+
+
+def test_status_bar_reports_context_plan_and_cwd(tmp_path):
+    agent, _llm, _console, _session = _make_roundtrip_agent(tmp_path, [[]])
+    agent.toolbox.call("update_plan", {
+        "plan": [
+            {"step": "One", "status": "completed"},
+            {"step": "Two", "status": "pending"},
+        ],
+    })
+    status = str(mike.render_status_bar(agent))
+
+    assert "DeepSeek V4.1 Flash" in status
+    assert "Ctx " in status and "500,000" in status
+    assert "Plan 1/2" in status
+    assert "cwd" not in status
+
+
+def test_apply_patch_renders_unified_diff(tmp_path):
+    target = tmp_path / "code.py"
+    target.write_text("old\n")
+    console = _RecordingConsole()
+    toolbox = mike.Toolbox(str(tmp_path), console=console)
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: code.py\n"
+        "@@\n"
+        "-old\n"
+        "+new\n"
+        "*** End Patch\n"
+    )
+
+    result = toolbox.call("apply_patch", {"input": patch})
+
+    assert "updated code.py (1 hunks) +1 -1" in result
+    assert "--- a/code.py" in console.text
+    assert "+++ b/code.py" in console.text
+    assert "-old" in console.text and "+new" in console.text
+    assert target.read_text() == "new\n"

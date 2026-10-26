@@ -741,3 +741,85 @@ the requested two prompts. The model called `apply_patch` (summary output
 final completion turn without a commentary nudge. The explicit
 `task_complete` call ended the turn and is omitted from stored `tool_calls` as
 designed. The smoke session and `hello.txt` were removed afterwards.
+
+---
+
+# v0.5 — Codex-style inline TUI
+
+## Reference review
+
+**Decision.** The UI pass was based on a shallow sparse checkout of the official
+`openai/codex` repository. The reviewed TUI sources included
+`codex-rs/tui/src/bottom_pane/chat_composer.rs`, its `slash_input.rs`,
+`popup_state.rs`, and `footer_state.rs` modules,
+`codex-rs/tui/src/status_indicator_widget.rs`,
+`codex-rs/tui/src/history_cell/plans.rs`, and
+`codex-rs/tui/src/diff_render.rs`. The installed `codex --help` was also checked.
+
+**Observed patterns.** Codex keeps the composer at the bottom, opens a command
+popup above it for slash input, preserves history, displays a single animated
+working row with elapsed/context information, renders plans as compact
+checklists, and gives diffs per-file headers, line counts, gutter signs, and
+syntax-aware coloring.
+
+**Scope decision.** Mike remains an inline scrollback REPL. Recreating Codex's
+Ratatui alternate-screen layout and frame ownership would be a separate UI
+rewrite; matching the interaction primitives and visual hierarchy provides the
+polish requested without destabilizing the agent loop.
+
+## Prompt composer
+
+**Decision.** `prompt_toolkit` supplies the `PromptSession`, `FileHistory`
+stored at `.mike_history`, slash-command and argument completion, styled prompt,
+and multiline key bindings. Enter submits unless a completion is selected;
+`Esc`, then Enter, and Ctrl+Enter (typically delivered as Ctrl+J) insert a
+newline. A plain `input()` fallback remains for environments without
+prompt_toolkit or a TTY.
+
+**Rationale.** This mirrors Codex's command discovery and multiline authoring
+without adding a new Python module or replacing the existing command dispatcher.
+
+## Rich diffs and plan observability
+
+**Decision.** `apply_patch` keeps the existing two-phase atomic validation, then
+renders each validated file change with `difflib.unified_diff` and Rich
+`Syntax("diff", theme="monokai")`. The model receives only compact operation
+summaries and line/hunk deltas.
+
+**Decision.** `todo_write` is replaced by structured `update_plan`, with
+`step`/`status` objects and `pending`, `in_progress`, or `completed` states.
+`todo_read` remains as the read path. Rich renders the checklist with green
+checkmarks, a yellow spinner, and grey circles, while preserving old string-only
+plan files during load.
+
+**Rationale.** The model gets a precise execution plan while the user gets
+Codex-style observability and patch review without a second edit surface.
+
+## Inline status and Markdown transcript
+
+**Decision.** A status row before the composer reports model, context estimate,
+plan completion, and abbreviated cwd. During a request, a transient Rich
+spinner includes the same context usage. Assistant content is buffered until
+tool syntax is stripped, then rendered as Markdown with the Monokai code theme;
+visible reasoning is shown above a dim rule.
+
+**Rationale.** Buffering avoids rendering tool envelopes or partial reasoning
+tags, while preserving the exact stored session content and the existing
+`task_complete`, commentary nudge, DSML retry, and reasoning replay loops.
+
+## v0.5 verification
+
+`venv/bin/python -m pytest tests/test_mike.py -q` passes with 102 tests. New
+coverage asserts slash-command/argument completion, `.mike_history` and
+multiline prompt configuration, structured plan rendering and persistence,
+status-bar context/plan counts, compact patch summaries, and numbered unified
+diff output.
+
+The live smoke test ran against an isolated bridge on port 8010. Slash
+completion selected `/help`, Ctrl+J inserted a multiline prompt, `apply_patch`
+created `t.py` and rendered a numbered diff, `update_plan` rendered
+`✓`/`⠋`/`○` checklist states, and the status line advanced from `Ctx 0` to
+`Ctx 548` and `Plan 0/0` to `Plan 1/3`. The model then hit an empty upstream
+stream during its dependency/run check; the UI surfaced that error cleanly while
+the existing loop and recovery messaging remained intact. The smoke-created
+`t.py`, `.mike_history`, plan file, and sessions were removed.

@@ -134,7 +134,7 @@ without it you get a warning and a `Overwrite? [y/N]` prompt.
 ### Tools
 
 `read_file`, `apply_patch`, `list_dir`, `glob`, `grep`, `bash`, `python`,
-`web_fetch`, `todo_write`, `todo_read`, `task_complete`.
+`web_fetch`, `update_plan`, `todo_read`, `task_complete`.
 
 `apply_patch` is the only file-mutation surface. It accepts the line-oriented
 Codex patch envelope:
@@ -154,7 +154,13 @@ Codex patch envelope:
 `*** Move to:` after an update renames the file, and `*** End of File` supports
 an EOF append. Mike parses and validates the entire patch against an in-memory
 view before writing, so a bad context line cannot leave an earlier operation
-partially applied.
+partially applied. Successful patches render as syntax-highlighted unified
+diffs with file headers and added/removed counts.
+
+For multi-step work, the model calls `update_plan` with structured
+`step`/`status` items. The terminal shows a checklist using `✓` for completed
+steps, `⠋` for the active step, and `○` for pending steps. `todo_read` returns
+the current plan.
 
 The server's web backend does not implement OpenAI's `tools=` schema, so mike
 runs in **prompted mode**: it describes the tools in a system prompt and parses
@@ -188,6 +194,19 @@ The system prompt also asks for `[commentary]` and `[final]` channel labels.
 Those labels are guidance for the free web model; the enforceable completion
 signal is the `task_complete` tool call.
 
+### Codex-style composer and status
+
+The interactive prompt uses `prompt_toolkit` with persistent `.mike_history`,
+Up/Down history navigation, and a floating slash-command menu. Pressing `/`
+opens command completion; commands such as `/thinking`, `/resume`, and `/export`
+also complete their arguments.
+
+Enter submits a prompt. Use `Esc` then `Enter`, or `Ctrl+Enter` (encoded as
+`Ctrl+J` in most terminals), to insert a newline for pasted code or multi-line
+instructions. A status row before each prompt reports the model, context usage,
+plan progress, and working directory. While a request runs, the transient
+status line combines an animated spinner with current context usage.
+
 ### Thinking blocks
 
 DeepSeek streams reasoning (fragment type `THINK`). By default mike shows it in a
@@ -202,6 +221,10 @@ mode prepends it as `<reasoning>…</reasoning>` to the outgoing assistant copy;
 native tools mode sends it as the top-level `reasoning_content` field. The
 stored assistant content remains clean, and the server schema accepts
 `reasoning_content` when flattening history into the web prompt.
+
+Completed assistant messages are rendered as Markdown with a Monokai code
+theme. With `/thinking on`, the dimmed reasoning block appears above the answer,
+separated by a subtle horizontal rule.
 
 ### Sessions
 

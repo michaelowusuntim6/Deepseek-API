@@ -17,6 +17,7 @@ sessions/*.json
 !sessions/.gitkeep
 .mike/
 .mike_state.json
+.mike_history
 *.log
 
 # mike local config + exports (user data; mike.toml.example is committed)

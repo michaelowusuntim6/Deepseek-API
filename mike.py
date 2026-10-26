@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import datetime as _dt
+import difflib
 import glob as _globlib
 import html as _html
 import json
@@ -68,13 +69,35 @@ __version__ = "1.0.0"
 try:  # pragma: no cover - exercised only when rich is installed
     from rich.console import Console
     from rich.live import Live
+    from rich.markdown import Markdown
     from rich.panel import Panel
+    from rich.spinner import Spinner
+    from rich.syntax import Syntax
     from rich.table import Table
     from rich.text import Text
 
     _RICH = True
 except Exception:  # pragma: no cover
     _RICH = False
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.formatted_text import FormattedText
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.styles import Style
+
+    _PROMPT_TOOLKIT = True
+except Exception:  # pragma: no cover
+    PromptSession = None
+    Completer = object
+    Completion = None
+    FormattedText = None
+    FileHistory = None
+    KeyBindings = None
+    Style = None
+    _PROMPT_TOOLKIT = False
 
 
 def _make_console():  # pragma: no cover - trivial
@@ -849,6 +872,21 @@ def _schema(props: dict, required: list) -> dict:
     return {"type": "object", "properties": props, "required": required}
 
 
+def _is_rich_console(console) -> bool:
+    return _RICH and not isinstance(console, _PlainConsole)
+
+
+def _diff_counts(old_lines: list[str], new_lines: list[str]) -> tuple[int, int]:
+    added = removed = 0
+    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines)
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if tag in ("insert", "replace"):
+            added += new_end - new_start
+        if tag in ("delete", "replace"):
+            removed += old_end - old_start
+    return added, removed
+
+
 class Toolbox:
     """The set of tools mike exposes, plus the dispatcher."""
 
@@ -861,9 +899,10 @@ class Toolbox:
         "> /dev/sda",
     ]
 
-    def __init__(self, cwd: str):
+    def __init__(self, cwd: str, console=None):
         self.cwd = cwd
         self.todos_path = os.path.join(cwd, ".mike", "todos.json")
+        self.console = console or _make_console()
         self.specs: "OrderedDict[str, ToolSpec]" = OrderedDict()
         self._register()
 
@@ -954,20 +993,34 @@ class Toolbox:
             self._web_fetch, read_only=True, concurrency_safe=True,
         ))
         self._add(ToolSpec(
-            "todo_write",
-            "Create/replace the project TODO list. Pass the complete list of task strings.",
+            "update_plan",
+            "Create or replace the current structured plan for a multi-step task. "
+            "Use one item per step and keep its status current.",
             _schema({
-                "todos": {
+                "plan": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "The full todo list, oldest first",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {
+                                "type": "string",
+                                "description": "Concrete action to perform",
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                        },
+                        "required": ["step", "status"],
+                    },
+                    "description": "The complete plan, in execution order",
                 },
-            }, ["todos"]),
-            self._todo_write, read_only=False, concurrency_safe=False,
+            }, ["plan"]),
+            self._update_plan, read_only=False, concurrency_safe=False,
         ))
         self._add(ToolSpec(
             "todo_read",
-            "Read the current project TODO list.",
+            "Read the current structured plan.",
             _schema({}, []),
             self._todo_read, read_only=True, concurrency_safe=True,
         ))
@@ -1174,6 +1227,7 @@ class Toolbox:
         staged: dict[str, dict] = {}
         deleted: set[str] = set()
         summaries: list[str] = []
+        changes: list[dict] = []
 
         def load(path: str) -> dict:
             if path in deleted:
@@ -1202,24 +1256,43 @@ class Toolbox:
             kind = op["kind"]
             if kind == "add":
                 content = op["content"]
-                staged[path] = {
+                old_lines: list[str] = []
+                if path in staged:
+                    old_lines = list(staged[path]["lines"])
+                elif path not in deleted and os.path.exists(path):
+                    old_lines = list(load(path)["lines"])
+                new_data = {
                     "lines": content.splitlines(),
                     "newline": "\n",
                     "trailing": True,
                 }
+                staged[path] = new_data
                 deleted.discard(path)
-                summaries.append(f"added {display}")
+                summaries.append(f"added {display} ({len(new_data['lines'])} lines)")
+                changes.append({
+                    "display": display,
+                    "old": old_lines,
+                    "new": list(new_data["lines"]),
+                    "move_to": None,
+                })
                 continue
 
             if kind == "delete":
-                load(path)
+                data = load(path)
                 staged.pop(path, None)
                 deleted.add(path)
-                summaries.append(f"deleted {display}")
+                summaries.append(f"deleted {display} ({len(data['lines'])} lines)")
+                changes.append({
+                    "display": display,
+                    "old": list(data["lines"]),
+                    "new": [],
+                    "move_to": None,
+                })
                 continue
 
             data = load(path)
             lines = list(data["lines"])
+            original_lines = list(lines)
             cursor = 0
             for hunk in op["hunks"]:
                 entries = hunk["entries"]
@@ -1287,8 +1360,18 @@ class Toolbox:
             staged[path] = data
 
             hunk_count = len(op["hunks"])
+            change = {
+                "display": display,
+                "old": original_lines,
+                "new": list(lines),
+                "move_to": op.get("move_to"),
+            }
+            changes.append(change)
             if hunk_count or not op.get("move_to"):
-                summaries.append(f"updated {display} ({hunk_count} hunks)")
+                added, removed = _diff_counts(original_lines, lines)
+                summaries.append(
+                    f"updated {display} ({hunk_count} hunks) +{added} -{removed}"
+                )
             if op.get("move_to"):
                 move_display = op["move_to"]
                 move_path = self._resolve(move_display)
@@ -1326,7 +1409,42 @@ class Toolbox:
                 except OSError:
                     pass
 
+        self._render_patch_diffs(changes)
         return "\n".join(summaries)
+
+    def _render_patch_diffs(self, changes: list[dict]) -> None:
+        """Display validated patch changes as syntax-highlighted unified diffs."""
+        for change in changes:
+            display = change["display"]
+            target = change.get("move_to") or display
+            diff_text = "\n".join(difflib.unified_diff(
+                change["old"],
+                change["new"],
+                fromfile=f"a/{display}",
+                tofile=f"b/{target}",
+                lineterm="",
+            ))
+            added, removed = _diff_counts(change["old"], change["new"])
+            if not diff_text:
+                if change.get("move_to"):
+                    self.console.print(
+                        Text(f"• moved {display} → {target}", style="bold cyan")
+                    )
+                continue
+            if _is_rich_console(self.console):
+                header = Text("• ", style="dim")
+                header.append(target, style="bold")
+                header.append(f"  +{added}", style="green")
+                header.append(f"  -{removed}", style="red")
+                self.console.print(header)
+                self.console.print(Syntax(
+                    diff_text,
+                    "diff",
+                    theme="monokai",
+                    line_numbers=True,
+                ))
+            else:
+                self.console.print(diff_text)
 
     @staticmethod
     def _task_complete(args: dict, ctx: "Toolbox") -> str:
@@ -1450,34 +1568,106 @@ class Toolbox:
             text = text[:max_chars] + f"\n... (truncated at {max_chars} chars)"
         return text or "(no readable text)"
 
-    def _load_todos(self) -> list:
+    def load_plan(self) -> list[dict]:
+        """Load the current plan, accepting v0.4's old string-only todo format."""
         try:
             with open(self.todos_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-                return data if isinstance(data, list) else []
         except Exception:
             return []
+        if not isinstance(data, list):
+            return []
+        plan: list[dict] = []
+        for item in data:
+            if isinstance(item, str):
+                step, status = item, "pending"
+            elif isinstance(item, dict):
+                step = str(item.get("step", "")).strip()
+                status = str(item.get("status", "pending")).strip().lower()
+            else:
+                continue
+            if not step:
+                continue
+            if status not in ("pending", "in_progress", "completed"):
+                status = "pending"
+            plan.append({"step": step, "status": status})
+        return plan
 
-    def _save_todos(self, todos: list) -> None:
+    def _save_plan(self, plan: list[dict]) -> None:
         os.makedirs(os.path.dirname(self.todos_path), exist_ok=True)
-        atomic_write_json(Path(self.todos_path), todos)
+        atomic_write_json(Path(self.todos_path), plan)
 
-    def _todo_write(self, args: dict, ctx: "Toolbox") -> str:
-        todos = args.get("todos", [])
-        if not isinstance(todos, list):
-            return "error: 'todos' must be a list of strings"
-        todos = [str(t) for t in todos]
-        self._save_todos(todos)
-        return self._format_todos(todos)
+    def _update_plan(self, args: dict, ctx: "Toolbox") -> str:
+        raw_plan = args.get("plan", [])
+        if not isinstance(raw_plan, list):
+            return "error: 'plan' must be a list of objects"
+        plan: list[dict] = []
+        for index, item in enumerate(raw_plan, 1):
+            if not isinstance(item, dict):
+                return f"error: plan item {index} must be an object"
+            step = str(item.get("step", "")).strip()
+            status = str(item.get("status", "")).strip().lower()
+            if not step:
+                return f"error: plan item {index} requires a non-empty 'step'"
+            if status not in ("pending", "in_progress", "completed"):
+                return (
+                    f"error: plan item {index} has invalid status {status!r}; "
+                    "use pending, in_progress, or completed"
+                )
+            plan.append({"step": step, "status": status})
+        self._save_plan(plan)
+        self._render_plan(plan)
+        return self._format_plan(plan)
 
     def _todo_read(self, args: dict, ctx: "Toolbox") -> str:
-        return self._format_todos(self._load_todos())
+        return self._format_plan(self.load_plan())
+
+    def _render_plan(self, plan: list[dict]) -> None:
+        completed = sum(1 for item in plan if item["status"] == "completed")
+        title = f"Plan · {completed}/{len(plan)} complete"
+        if _is_rich_console(self.console):
+            self.console.print(Text(title, style="bold cyan"))
+            table = Table.grid(padding=(0, 1))
+            table.add_column(width=1)
+            table.add_column()
+            for item in plan:
+                marker, style = {
+                    "completed": ("✓", "green"),
+                    "in_progress": ("⠋", "yellow"),
+                    "pending": ("○", "grey62"),
+                }[item["status"]]
+                table.add_row(Text(marker, style=f"bold {style}"), Text(item["step"]))
+            self.console.print(table)
+        else:
+            self.console.print(self._format_plan(plan))
+
+    @staticmethod
+    def _format_plan(plan: list[dict]) -> str:
+        if not plan:
+            return "Plan · 0/0 complete\n○ (no steps)"
+        completed = sum(1 for item in plan if item["status"] == "completed")
+        markers = {
+            "completed": "✓",
+            "in_progress": "⠋",
+            "pending": "○",
+        }
+        lines = [f"Plan · {completed}/{len(plan)} complete"]
+        lines.extend(f"{markers[item['status']]} {item['step']}" for item in plan)
+        return "\n".join(lines)
 
     @staticmethod
     def _format_todos(todos: list) -> str:
-        if not todos:
-            return "(no todos)"
-        return "\n".join(f"{i + 1}. [ ] {t}" for i, t in enumerate(todos))
+        """Compatibility helper for callers that only have string todos."""
+        plan = []
+        for item in todos:
+            if isinstance(item, dict):
+                plan.append({
+                    "step": str(item.get("step", "")),
+                    "status": str(item.get("status", "pending")),
+                })
+            else:
+                plan.append({"step": str(item), "status": "pending"})
+        return Toolbox._format_plan(plan)
 
 
 def _html_to_text(body: str, selector: Optional[str] = None) -> str:
@@ -2527,10 +2717,11 @@ You DO things - you use your tools instead of explaining how. Be concise and con
 
 Rules:
 1. Read a file before editing it. Use `apply_patch` for every file edit.
-2. Keep calling tools until the task is genuinely complete; don't stop after one step.
-3. Never print raw JSON tool schemas or fake tool output to the user.
-4. Use absolute or repo-relative paths. Never guess - use glob/grep/list_dir to find things.
-5. After you finish, give a one-line summary of what changed and how to run/test it.
+2. For multi-step tasks, call `update_plan` before starting and update statuses as work advances.
+3. Keep calling tools until the task is genuinely complete; don't stop after one step.
+4. Never print raw JSON tool schemas or fake tool output to the user.
+5. Use absolute or repo-relative paths. Never guess - use glob/grep/list_dir to find things.
+6. After you finish, give a one-line summary of what changed and how to run/test it.
 
 ## Channels
 You have two kinds of output:
@@ -2577,6 +2768,8 @@ def build_prompted_tool_prompt(toolbox: Toolbox) -> str:
         "- You may emit several <tool_call> blocks in one turn.",
         "- Arguments must be a JSON object matching the tool's parameters.",
         "- After the tools run you will receive a <tool_result> message; keep going until done.",
+        "- For multi-step tasks, use `update_plan` first and keep each step's status current.",
+        "- Use `todo_read` to inspect the current plan.",
         "- For file edits, ALWAYS use `apply_patch`; do not use shell redirection, `cat`, or `sed -i`.",
         "- Use ONLY this envelope for tools. Do NOT use any other tool syntax"
         " (no DSML tags, no bare function names, no fenced code blocks).",
@@ -2761,6 +2954,9 @@ class MikeAgent:
                     "to re-authenticate, or check the server log for the exact error.[/dim]")
                 return stream_error
 
+            if clean_text.strip() or (reasoning and self.thinking_mode == "on"):
+                self._render_assistant_response(clean_text, reasoning)
+
             assistant_msg: dict = {"role": "assistant", "content": clean_text}
             if reasoning:
                 assistant_msg["reasoning"] = reasoning
@@ -2780,6 +2976,10 @@ class MikeAgent:
                 self._append(assistant_msg)
                 self._save()
                 final_text = summary or clean_text
+                if summary.strip() and summary.strip() != clean_text.strip():
+                    if _is_rich_console(self.console):
+                        self.console.rule(style="dim")
+                    self._render_markdown(summary)
                 break
 
             if calls:
@@ -2888,13 +3088,11 @@ class MikeAgent:
         parser = StreamParser()
         native_calls: list = []
         finish = None
-        printed_any = False
-        reasoning_displayed = False
         stream_error: Optional[str] = None
 
         live = None
-        if self.thinking_mode == "spinner" and _RICH and hasattr(self.console, "set_live"):
-            live = Live(Text("thinking...", style="dim"), console=self.console,
+        if _RICH and hasattr(self.console, "set_live"):
+            live = Live(self._live_status(), console=self.console,
                         refresh_per_second=12, transient=True, auto_refresh=True)
             live.start()
 
@@ -2916,28 +3114,15 @@ class MikeAgent:
                         self._save()
                 elif etype == "reasoning":
                     if live is not None:
-                        live.update(self._spinner_text(parser.reasoning + event["text"]))
-                    elif self.thinking_mode == "on":
-                        self.console.print(Text(event["text"], style="dim"),
-                                           end="", soft_wrap=True)
-                        reasoning_displayed = True
+                        live.update(self._live_status(
+                            parser.reasoning + event["text"]
+                        ))
                     parser.reasoning += event["text"]
                 elif etype == "content":
                     for kind, chunk in parser.feed(event["text"]):
                         if kind == "reasoning":
                             if live is not None:
-                                live.update(self._spinner_text(parser.reasoning))
-                            elif self.thinking_mode == "on":
-                                self.console.print(Text(chunk, style="dim"),
-                                                   end="", soft_wrap=True)
-                                reasoning_displayed = True
-                        else:
-                            stop_live()
-                            if reasoning_displayed:
-                                self.console.print("")
-                                reasoning_displayed = False
-                            self.console.print(chunk, end="", soft_wrap=True)
-                            printed_any = True
+                                live.update(self._live_status(parser.reasoning))
                 elif etype == "tool_calls":
                     native_calls.extend(event.get("calls", []))
                 elif etype == "error":
@@ -2948,10 +3133,6 @@ class MikeAgent:
             for kind, chunk in parser.finish():
                 if kind == "reasoning":
                     parser.reasoning += chunk
-                elif kind == "content":
-                    stop_live()
-                    self.console.print(chunk, end="", soft_wrap=True)
-                    printed_any = True
         except Exception as exc:
             # The OpenAI SDK raises (rather than yields) when the server sends an
             # SSE error frame, and httpx/other backends may raise too. Convert any
@@ -2963,18 +3144,45 @@ class MikeAgent:
             log.warning("stream raised: %s", stream_error)
         finally:
             stop_live()
-            if reasoning_displayed or printed_any:
-                self.console.print("")
 
         # Return the RAW assistant text (including hidden tool_call blocks) so the
-        # prompted-mode parser can find them; the visible text was already
-        # streamed to the console from `parser.content`. Also return any upstream
-        # SSE error so run() can surface it instead of a silent blank.
+        # prompted-mode parser can find them. run() renders the clean result with
+        # Markdown after parsing, so tool syntax and reasoning tags never leak.
         return parser.raw, parser.reasoning, native_calls, finish, stream_error
 
-    def _spinner_text(self, reasoning: str):
+    def _live_status(self, reasoning: str = ""):
+        estimate = self.compactor.estimate(self.context)
+        text = (
+            f" Thinking... (Ctx: {estimate:,} / "
+            f"{self.compactor.max_context:,})"
+        )
         tail = reasoning[-80:].replace("\n", " ")
-        return Text(f"... {tail}", style="dim")
+        if tail:
+            text += f" · {tail}"
+        if _RICH:
+            return Spinner("dots", text=Text(text, style="dim"), style="cyan")
+        return text
+
+    def _spinner_text(self, reasoning: str):
+        """Compatibility wrapper retained for tests and embedders."""
+        return self._live_status(reasoning)
+
+    def _render_markdown(self, text: str) -> None:
+        if not text.strip():
+            return
+        if _is_rich_console(self.console):
+            self.console.print(Markdown(text, code_theme="monokai"))
+        else:
+            self.console.print(text)
+
+    def _render_assistant_response(self, text: str, reasoning: str = "") -> None:
+        if reasoning and self.thinking_mode == "on":
+            if _is_rich_console(self.console):
+                self.console.print(Text(reasoning, style="dim"))
+                self.console.rule(style="dim")
+            else:
+                self.console.print(reasoning)
+        self._render_markdown(text)
 
     # -- tools ------------------------------------------------------------
 
@@ -3130,6 +3338,167 @@ def detect_tool_mode(llm: DeepSeekLLM) -> str:
 # 14. REPL + slash commands                                                    #
 # --------------------------------------------------------------------------- #
 
+SLASH_COMMANDS = OrderedDict([
+    ("/help", "Show available commands"),
+    ("/quit", "Exit and save the session"),
+    ("/exit", "Exit and save the session"),
+    ("/clear", "Clear the terminal"),
+    ("/model", "Show the single available model"),
+    ("/thinking", "Set reasoning display: on, off, or last"),
+    ("/sessions", "List saved sessions"),
+    ("/resume", "Resume a saved session"),
+    ("/rename", "Rename the current session"),
+    ("/export", "Export this session as Markdown"),
+    ("/compact", "Compact the current context"),
+    ("/tokens", "Show context usage"),
+    ("/tools", "List available tools"),
+    ("/rollover", "Start a continuation session"),
+])
+
+
+class MikeCompleter(Completer):
+    """Slash-command and argument completion for the mike composer."""
+
+    def __init__(self, agent: Optional["MikeAgent"] = None):
+        self.agent = agent
+
+    def get_completions(self, document, complete_event):
+        if Completion is None:
+            return
+        before = document.text_before_cursor
+        current_line = before.splitlines()[-1] if before.splitlines() else ""
+        if not current_line.startswith("/"):
+            return
+
+        if " " not in current_line:
+            prefix = current_line
+            for command, description in SLASH_COMMANDS.items():
+                if command.startswith(prefix):
+                    yield Completion(
+                        command,
+                        start_position=-len(prefix),
+                        display_meta=description,
+                    )
+            return
+
+        command, arg_prefix = current_line.split(" ", 1)
+        for candidate, description in self._argument_options(command):
+            if candidate.startswith(arg_prefix):
+                yield Completion(
+                    candidate,
+                    start_position=-len(arg_prefix),
+                    display_meta=description,
+                )
+
+    def _argument_options(self, command: str) -> list[tuple[str, str]]:
+        if command == "/thinking":
+            return [
+                ("on", "stream full reasoning"),
+                ("off", "hide reasoning"),
+                ("last", "show the latest reasoning block"),
+                ("spinner", "animate a reasoning preview"),
+            ]
+        if command == "/model":
+            return [(alias, "routes to DeepSeek V4.1 Flash") for alias in MODEL_ALIASES]
+        if command == "/export":
+            return [("--force", "overwrite an existing export")]
+        if command == "/resume" and self.agent is not None:
+            options: list[tuple[str, str]] = []
+            try:
+                for index, session in enumerate(
+                        self.agent.store.list_sessions(), 1):
+                    options.append((session.name, f"{index}. {session.last_user_preview(36)}"))
+            except Exception:
+                pass
+            return options
+        return []
+
+
+def _display_cwd(cwd: str) -> str:
+    path = os.path.abspath(os.path.expanduser(cwd))
+    home = os.path.abspath(os.path.expanduser("~"))
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def render_status_bar(agent: MikeAgent) -> Any:
+    """Render a compact Codex-like state row for the inline REPL."""
+    estimate = agent.compactor.estimate(agent.context)
+    plan = agent.toolbox.load_plan()
+    completed = sum(1 for item in plan if item.get("status") == "completed")
+    if not _RICH:
+        return (
+            f"{MODEL_LABEL} | Ctx {estimate:,} / "
+            f"{agent.compactor.max_context:,} | Plan {completed}/{len(plan)} | "
+            f"{_display_cwd(agent.cwd)}"
+        )
+    status = Text()
+    status.append(MODEL_LABEL, style="bold cyan")
+    status.append(" | Ctx ", style="dim")
+    status.append(
+        f"{estimate:,} / {agent.compactor.max_context:,}",
+        style="bright_white",
+    )
+    status.append(" | Plan ", style="dim")
+    status.append(f"{completed}/{len(plan)}", style="yellow")
+    status.append(" | ", style="dim")
+    status.append(_display_cwd(agent.cwd), style="green")
+    return status
+
+
+def _prompt_key_bindings():
+    if not _PROMPT_TOOLKIT:
+        return None
+    bindings = KeyBindings()
+
+    @bindings.add("c-m", eager=True)
+    def _submit(event):
+        buffer = event.current_buffer
+        completion = (
+            buffer.complete_state.current_completion
+            if buffer.complete_state is not None else None
+        )
+        if completion is not None:
+            buffer.apply_completion(completion)
+        else:
+            buffer.validate_and_handle()
+
+    @bindings.add("escape", "enter")
+    def _newline_after_escape(event):
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add("c-j")
+    def _newline_ctrl_enter(event):
+        # Most terminals encode Ctrl+Enter as LINE FEED (Ctrl+J).
+        event.current_buffer.insert_text("\n")
+
+    return bindings
+
+
+def _build_prompt_session(agent: MikeAgent):
+    if not _PROMPT_TOOLKIT:
+        return None
+    style = Style.from_dict({
+        "prompt": "bold ansicyan",
+        "completion-menu.completion": "bg:#1f2937 #d1d5db",
+        "completion-menu.completion.current": "bg:#2563eb #ffffff bold",
+        "completion-menu.meta.completion": "bg:#111827 #9ca3af",
+        "completion-menu.meta.completion.current": "bg:#1d4ed8 #dbeafe",
+    })
+    return PromptSession(
+        history=FileHistory(str(ROOT / ".mike_history")),
+        completer=MikeCompleter(agent),
+        complete_while_typing=True,
+        multiline=True,
+        key_bindings=_prompt_key_bindings(),
+        style=style,
+        reserve_space_for_menu=10,
+    )
+
+
 HELP_TEXT = """\
 Commands:
   /help                 show this help
@@ -3137,24 +3506,36 @@ Commands:
   /clear                clear the screen
   /model [name]         show the model (there is exactly one)
   /thinking on|off|last thinking display: on / off / show last block
-/sessions             list saved sessions
-/resume <n|name>      switch to a saved session
-/rename <name>        rename the current session
-/export [--force] [path]  write this session to a Markdown transcript
-/compact              force compaction now
+  /sessions             list saved sessions
+  /resume <n|name>      switch to a saved session
+  /rename <name>        rename the current session
+  /export [--force] [path]  write this session to a Markdown transcript
+  /compact              force compaction now
   /tokens               show the current token estimate + threshold
   /tools                list the available tools
   /rollover             force a session rollover
+
+Input:
+  Enter                 submit
+  Esc, Enter / Ctrl+J   insert a newline
+  Tab                   complete slash commands and arguments
+  Up / Down             navigate input history
 """
 
 
 def run_repl(agent: MikeAgent, console, cfg: Optional[dict] = None) -> None:
     cfg = cfg or getattr(agent, "cfg", None) or dict(DEFAULTS)
     _print_banner(agent, console)
+    prompt_session = _build_prompt_session(agent)
+    prompt = FormattedText([("class:prompt", "> ")]) if _PROMPT_TOOLKIT else "> "
     while True:
         try:
             console.print()
-            user_input = input("> ").strip()
+            console.print(render_status_bar(agent), no_wrap=True, overflow="ellipsis")
+            if prompt_session is not None and sys.stdin.isatty():
+                user_input = prompt_session.prompt(prompt).strip()
+            else:
+                user_input = input("> ").strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\nbye.")
             break
@@ -3534,7 +3915,7 @@ def main(argv: Optional[list] = None) -> int:
         keep_recent=cfg["keep_recent_turns"],
         summarizer=None,  # deterministic, guaranteed 7-section summaries
     )
-    toolbox = Toolbox(os.getcwd())
+    toolbox = Toolbox(os.getcwd(), console=console)
 
     want_resume = args.resume or args.command == "resume"
     session = None
