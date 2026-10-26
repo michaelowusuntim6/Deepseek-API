@@ -1,7 +1,14 @@
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.tmp
+*.swp
+.DS_Store
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
 .env
 
 # Session artifacts — contain session tokens + cookies. NEVER commit.
@@ -13,7 +20,7 @@ session.json
 CLAUDE.md
 
 # mike agent sessions + cached state (user data, never committed)
-sessions/*.json
+sessions/*
 !sessions/.gitkeep
 .mike/
 .mike_state.json

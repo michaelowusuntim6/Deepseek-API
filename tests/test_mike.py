@@ -1476,6 +1476,31 @@ def test_commentary_nudge(tmp_path):
     assert sum(1 for m in session.messages if m.get("content") == nudge) == 1
 
 
+def test_hallucinated_channel_tags_are_stripped(tmp_path):
+    task_call = (
+        "<tool_call>"
+        + json.dumps({
+            "name": "task_complete",
+            "arguments": {"summary": "[final] Hi! I'm Mike."},
+        })
+        + "</tool_call>"
+    )
+    turns = [
+        [{"type": "content", "text": "[COMMENTARY] Hello! I'm Mike."}],
+        [{"type": "content", "text": task_call}],
+    ]
+    agent, _llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+
+    result = agent.run("Hi")
+
+    assert result == "Hi! I'm Mike."
+    assert "[commentary]" not in console.text.lower()
+    assert "[final]" not in console.text.lower()
+    for message in session.messages:
+        assert "[commentary]" not in str(message.get("content", "")).lower()
+        assert "[final]" not in str(message.get("content", "")).lower()
+
+
 def _reasoning_replay_agent(tmp_path, tool_mode):
     agent, _llm, _console, session = _make_roundtrip_agent(
         tmp_path, [[]], tool_mode=tool_mode)

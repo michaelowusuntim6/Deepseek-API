@@ -548,6 +548,15 @@ def strip_tool_results(text: str) -> str:
     return _TOOL_RESULT_RE.sub("", text)
 
 
+def strip_channel_tags(text: str) -> str:
+    """Remove hallucinated Codex channel labels from visible assistant text."""
+    if not text:
+        return text
+    text = re.sub(r"\[commentary\]\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\[final\]\s*", "", text, flags=re.IGNORECASE)
+    return text
+
+
 class StreamParser:
     """Incremental parser for streamed deltas.
 
@@ -2723,25 +2732,15 @@ Rules:
 5. Use absolute or repo-relative paths. Never guess - use glob/grep/list_dir to find things.
 6. After you finish, give a one-line summary of what changed and how to run/test it.
 
-## Channels
-You have two kinds of output:
-
-- [commentary] — a short progress update before a group of tool calls.
-  Example: "[commentary] I'll inspect the repo structure first."
-- [final] — the completed answer. Only send this when the task is done.
-
-Rules:
-- Send one [commentary] line before your first tool call in a turn.
-- Never put a blocking question in [commentary]; ask it in [final].
-- Never end a turn with a promise to do work later. Either call the tool now
-  or call task_complete.
-- When the task is genuinely complete, call task_complete with a summary.
+Before calling tools, write a short 1-2 sentence progress update as standard
+text. Do not use `[commentary]` or `[final]` tags. When the task is fully
+complete, call `task_complete`.
 
 ## Compaction awareness
 The conversation may be summarized when it grows long. If you see a message
 beginning “The conversation was compacted…”, treat it as authoritative context,
 not as a new user request. Assume the last user intent is current. Do not
-repeat completed work or re-send commentary updates that were already delivered.
+repeat completed work or re-send progress updates that were already delivered.
 
 You always run as the single model {MODEL_LABEL}. Working directory: {{cwd}}.
 Context budget: {{max_context:,}} tokens (auto-compaction at {{compact_at:,}}).
@@ -2942,7 +2941,7 @@ class MikeAgent:
             # Strip any echoed <tool_result> wrapper the model leaked into its reply
             # (both tool modes). Idempotent; the stored assistant content stays clean
             # so the next turn's history has no stray fragments.
-            clean_text = strip_tool_results(clean_text)
+            clean_text = strip_channel_tags(strip_tool_results(clean_text))
 
             if stream_error:
                 # The server sent a terminal error frame (Fix 1). Show the exact
@@ -2971,6 +2970,7 @@ class MikeAgent:
                     complete_args, dict) else ""
                 if not isinstance(summary, str):
                     summary = str(summary)
+                summary = strip_channel_tags(summary)
                 # The signalling call is harness metadata, not a tool result. Do
                 # not store or replay it in the assistant's tool_calls.
                 self._append(assistant_msg)

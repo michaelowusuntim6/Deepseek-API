@@ -1,5 +1,7 @@
 # RECON — DeepSeek-API + sibling harnesses
 
+Canonical location: `docs/RECON.md`.
+
 Read-only reconnaissance performed before any modification. All findings below
 were verified against the code in `~/Deepseek-API`, `~/nanocode`, and
 `~/cipher-harness` (2026-10-07).

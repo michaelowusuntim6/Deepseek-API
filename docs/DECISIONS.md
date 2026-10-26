@@ -1,5 +1,7 @@
 # DECISIONS — building `mike.py` on Deepseek-API
 
+Canonical location: `docs/DECISIONS.md`.
+
 Every non-obvious choice made while executing the brief, in the form
 **Decision — Rationale — Alternatives considered**. Also records the test
 summary and the end-to-end transcripts required by the brief.
@@ -823,3 +825,15 @@ created `t.py` and rendered a numbered diff, `update_plan` rendered
 stream during its dependency/run check; the UI surfaced that error cleanly while
 the existing loop and recovery messaging remained intact. The smoke-created
 `t.py`, `.mike_history`, plan file, and sessions were removed.
+
+## v0.6 final polish
+
+**Decision.** The system prompt now asks for short natural-language progress
+updates before tools and no longer requests literal channel labels. A defensive
+case-insensitive filter removes hallucinated `[commentary]` and `[final]` tags
+from assistant text and `task_complete` summaries before display or storage.
+
+**Documentation.** Long-form design and reconnaissance notes now live under
+`docs/`, with README links pointing to `docs/DECISIONS.md` and
+`docs/RECON.md`. Ignore rules cover the complete session directory, persistent
+prompt history, local state, and common editor/cache temporary files.

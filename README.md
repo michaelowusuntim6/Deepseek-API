@@ -190,9 +190,10 @@ text-only reply is accepted as the final fallback, so the loop cannot run
 forever. A structured `task_complete` call ends the turn immediately and its
 `summary` becomes the returned final answer.
 
-The system prompt also asks for `[commentary]` and `[final]` channel labels.
-Those labels are guidance for the free web model; the enforceable completion
-signal is the `task_complete` tool call.
+The system prompt asks for a short natural-language progress update before
+tool calls, without channel labels. Mike defensively strips literal
+`[commentary]` and `[final]` tags if the model hallucinates them. The
+enforceable completion signal is the `task_complete` tool call.
 
 ### Codex-style composer and status
 
@@ -506,7 +507,8 @@ See [examples/](examples/) for runnable versions.
 | `deepseek/` | Core client: auth, HTTP driver, PoW solver |
 | `server/` | FastAPI OpenAI-compatible server |
 | `tests/test_mike.py` | Hermetic pytest suite for mike |
-| `RECON.md`, `DECISIONS.md` | Reconnaissance notes and design decisions |
+| [`docs/RECON.md`](docs/RECON.md) | Reconnaissance notes |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Design decisions and verification history |
 | `app.py` | Starts the server |
 
 ## License
