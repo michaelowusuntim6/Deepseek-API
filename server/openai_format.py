@@ -43,6 +43,8 @@ def messages_to_prompt(messages: List[ChatMessage]) -> str:
     lines = []
     for m in messages:
         label = _ROLE_LABELS.get(m.role, m.role.capitalize())
+        if m.role == "assistant" and getattr(m, "reasoning_content", None):
+            lines.append(f"Assistant (reasoning): {m.reasoning_content}")
         lines.append(f"{label}: {_text_of(m.content)}")
     lines.append("Assistant:")
     return "\n\n".join(lines)

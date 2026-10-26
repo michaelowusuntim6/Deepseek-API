@@ -293,6 +293,12 @@ SUMMARY_SECTIONS = [
     "## Last User Intent",
     "## Next Steps",
 ]
+COMPACTION_PREFIX = "The conversation was compacted."
+COMPACTION_HEADER = (
+    "The conversation was compacted. This is a summary of the work so far. "
+    "Continue the task from where it left off. Do not restart or redo finished "
+    "work. The last user intent is the current instruction."
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -875,26 +881,20 @@ class Toolbox:
             self._read_file, read_only=True, concurrency_safe=True,
         ))
         self._add(ToolSpec(
-            "write_file",
-            "Create a file or overwrite it with new content. Prefer edit_file for small changes.",
+            "apply_patch",
+            "Apply a Codex-style patch to add, update, delete, or move files. "
+            "The input MUST be a single string beginning with '*** Begin Patch' "
+            "and ending with '*** End Patch'. Use this for ALL file edits.",
             _schema({
-                "path": {"type": "string", "description": "File path to write"},
-                "content": {"type": "string", "description": "Full file content"},
-            }, ["path", "content"]),
-            self._write_file, read_only=False, concurrency_safe=False, destructive=True,
-        ))
-        self._add(ToolSpec(
-            "edit_file",
-            "Replace an exact string in a file. Fails if old_string is missing or ambiguous unless replace_all=true.",
-            _schema({
-                "path": {"type": "string"},
-                "old_string": {"type": "string", "description": "Exact text to find (alias: old)"},
-                "new_string": {"type": "string", "description": "Replacement text (alias: new)"},
-                "old": {"type": "string", "description": "Alias of old_string"},
-                "new": {"type": "string", "description": "Alias of new_string"},
-                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"},
-            }, ["path"]),
-            self._edit_file, read_only=False, concurrency_safe=False, destructive=False,
+                "input": {
+                    "type": "string",
+                    "description": "Full patch envelope including Begin/End markers",
+                },
+            }, ["input"]),
+            self._apply_patch,
+            read_only=False,
+            concurrency_safe=False,
+            destructive=True,
         ))
         self._add(ToolSpec(
             "list_dir",
@@ -971,6 +971,18 @@ class Toolbox:
             _schema({}, []),
             self._todo_read, read_only=True, concurrency_safe=True,
         ))
+        self._add(ToolSpec(
+            "task_complete",
+            "Call this ONLY when the user's task is fully done. "
+            "Provide a one-paragraph summary of what was accomplished. "
+            "Do not call it if you still have work to do.",
+            _schema({
+                "summary": {"type": "string", "description": "What was accomplished"},
+            }, ["summary"]),
+            self._task_complete,
+            read_only=True,
+            concurrency_safe=True,
+        ))
 
     def _add(self, spec: ToolSpec) -> None:
         self.specs[spec.name] = spec
@@ -1016,46 +1028,309 @@ class Toolbox:
             return "(empty)"
         return "".join(f"{start + i + 1:>5}\t{ln}" for i, ln in enumerate(selected)).rstrip("\n")
 
-    def _write_file(self, args: dict, ctx: "Toolbox") -> str:
-        path = self._resolve(args["path"])
-        content = str(args.get("content", ""))
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        lines = content.count("\n") + (0 if content.endswith("\n") else 1)
-        return f"wrote {lines} line(s) to {path}"
+    def _apply_patch(self, args: dict, ctx: "Toolbox") -> str:
+        patch_text = args.get("input")
+        if not isinstance(patch_text, str):
+            return "error: apply_patch requires a string 'input'"
+        try:
+            operations = self._parse_patch(patch_text)
+            return self._execute_patch(operations)
+        except ValueError as exc:
+            return f"error: {exc}"
 
-    def _edit_file(self, args: dict, ctx: "Toolbox") -> str:
-        path = self._resolve(args["path"])
-        if not os.path.isfile(path):
-            return f"error: file not found: {path}"
-        # Accept both {old_string, new_string} and the shorter {old, new} form.
-        if "old_string" in args:
-            old = str(args.get("old_string") or "")
-        elif "old" in args:
-            old = str(args.get("old") or "")
-        else:
-            return "error: edit_file requires 'old_string' (alias: 'old')"
-        if "new_string" in args:
-            new = str(args.get("new_string") or "")
-        elif "new" in args:
-            new = str(args.get("new") or "")
-        else:
-            new = ""
-        replace_all = bool(args.get("replace_all", False))
-        with open(path, "r", errors="replace") as fh:
-            original = fh.read()
-        count = original.count(old)
-        if count == 0:
-            return f"error: old_string not found in {path}"
-        if count > 1 and not replace_all:
-            return (f"error: old_string appears {count} times in {path}; "
-                    "add context to make it unique or pass replace_all=true")
-        updated = original.replace(old, new) if replace_all else original.replace(old, new, 1)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(updated)
-        n = count if replace_all else 1
-        return f"edited {path} ({n} replacement{'s' if n != 1 else ''})"
+    @staticmethod
+    def _parse_patch(patch_text: str) -> list[dict]:
+        """Parse the complete Codex patch envelope without touching disk."""
+        lines = patch_text.splitlines()
+        nonempty = [i for i, line in enumerate(lines) if line.strip()]
+        if not nonempty:
+            raise ValueError("patch is empty")
+        if lines[nonempty[0]].strip() != "*** Begin Patch":
+            raise ValueError("patch must start with '*** Begin Patch'")
+        if lines[nonempty[-1]].strip() != "*** End Patch":
+            raise ValueError("patch must end with '*** End Patch'")
+
+        start, end = nonempty[0] + 1, nonempty[-1]
+        operations: list[dict] = []
+        i = start
+
+        def is_file_op(line: str) -> bool:
+            return line.startswith((
+                "*** Add File: ",
+                "*** Delete File: ",
+                "*** Update File: ",
+            ))
+
+        while i < end:
+            line = lines[i]
+            if not line.strip():
+                i += 1
+                continue
+            if line.startswith("*** Add File: "):
+                path = line[len("*** Add File: "):].strip()
+                if not path:
+                    raise ValueError("Add File requires a path")
+                i += 1
+                body: list[str] = []
+                while i < end and not is_file_op(lines[i]):
+                    body_line = lines[i]
+                    if body_line.startswith("*** "):
+                        raise ValueError(f"unexpected patch directive: {body_line}")
+                    if not body_line.startswith("+"):
+                        raise ValueError(
+                            f"{path}: Add File body lines must start with '+'"
+                        )
+                    body.append(body_line[1:])
+                    i += 1
+                content = "".join(f"{body_line}\n" for body_line in body)
+                if not content.endswith("\n"):
+                    content += "\n"
+                operations.append({"kind": "add", "path": path, "content": content})
+                continue
+
+            if line.startswith("*** Delete File: "):
+                path = line[len("*** Delete File: "):].strip()
+                if not path:
+                    raise ValueError("Delete File requires a path")
+                operations.append({"kind": "delete", "path": path})
+                i += 1
+                continue
+
+            if line.startswith("*** Update File: "):
+                path = line[len("*** Update File: "):].strip()
+                if not path:
+                    raise ValueError("Update File requires a path")
+                i += 1
+                move_to = None
+                if i < end and lines[i].startswith("*** Move to: "):
+                    move_to = lines[i][len("*** Move to: "):].strip()
+                    if not move_to:
+                        raise ValueError("Move to requires a path")
+                    i += 1
+                hunks: list[dict] = []
+                while (i < end and not is_file_op(lines[i])
+                       and not lines[i].startswith("*** Move to: ")):
+                    if not lines[i].startswith("@@"):
+                        if not lines[i].strip():
+                            i += 1
+                            continue
+                        raise ValueError(
+                            f"{path}: expected '@@' before update hunk; got {lines[i]!r}"
+                        )
+                    i += 1
+                    entries: list[tuple[str, str]] = []
+                    after_eof = False
+                    while (i < end and not lines[i].startswith("@@")
+                           and not is_file_op(lines[i])
+                           and not lines[i].startswith("*** Move to: ")):
+                        hunk_line = lines[i]
+                        if hunk_line.strip() == "*** End of File":
+                            entries.append(("eof", ""))
+                            after_eof = True
+                            i += 1
+                            continue
+                        if hunk_line.startswith("*** "):
+                            raise ValueError(
+                                f"{path}: unexpected directive in hunk: {hunk_line}"
+                            )
+                        if after_eof:
+                            if not hunk_line.startswith("+"):
+                                raise ValueError(
+                                    f"{path}: only '+' lines may follow"
+                                    " '*** End of File'"
+                                )
+                            entries.append(("add", hunk_line[1:]))
+                        elif hunk_line == "" or hunk_line.startswith(" "):
+                            entries.append((
+                                "context",
+                                hunk_line[1:] if hunk_line.startswith(" ") else "",
+                            ))
+                        elif hunk_line.startswith("-"):
+                            entries.append(("remove", hunk_line[1:]))
+                        elif hunk_line.startswith("+"):
+                            entries.append(("add", hunk_line[1:]))
+                        else:
+                            raise ValueError(
+                                f"{path}: hunk lines must start with ' ', '-', or '+'"
+                            )
+                        i += 1
+                    hunks.append({"entries": entries})
+                operations.append({
+                    "kind": "update",
+                    "path": path,
+                    "move_to": move_to,
+                    "hunks": hunks,
+                })
+                continue
+
+            if line.startswith("*** Move to: "):
+                raise ValueError("'*** Move to:' must immediately follow '*** Update File:'")
+            raise ValueError(f"unexpected patch directive: {line}")
+
+        return operations
+
+    def _execute_patch(self, operations: list[dict]) -> str:
+        """Validate all operations against a staged view, then write once."""
+        staged: dict[str, dict] = {}
+        deleted: set[str] = set()
+        summaries: list[str] = []
+
+        def load(path: str) -> dict:
+            if path in deleted:
+                raise ValueError(f"file not found: {path}")
+            if path in staged:
+                return staged[path]
+            if not os.path.exists(path):
+                raise ValueError(f"file not found: {path}")
+            if not os.path.isfile(path):
+                raise ValueError(f"not a file: {path}")
+            raw = Path(path).read_bytes()
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{path}: not UTF-8 text") from exc
+            newline = "\r\n" if "\r\n" in text else "\n"
+            return {
+                "lines": text.splitlines(),
+                "newline": newline,
+                "trailing": text.endswith(("\n", "\r")),
+            }
+
+        for op in operations:
+            display = op["path"]
+            path = self._resolve(display)
+            kind = op["kind"]
+            if kind == "add":
+                content = op["content"]
+                staged[path] = {
+                    "lines": content.splitlines(),
+                    "newline": "\n",
+                    "trailing": True,
+                }
+                deleted.discard(path)
+                summaries.append(f"added {display}")
+                continue
+
+            if kind == "delete":
+                load(path)
+                staged.pop(path, None)
+                deleted.add(path)
+                summaries.append(f"deleted {display}")
+                continue
+
+            data = load(path)
+            lines = list(data["lines"])
+            cursor = 0
+            for hunk in op["hunks"]:
+                entries = hunk["entries"]
+                eof_at = next(
+                    (idx for idx, entry in enumerate(entries) if entry[0] == "eof"),
+                    None,
+                )
+                if eof_at is None:
+                    before_eof = entries
+                    after_eof: list[tuple[str, str]] = []
+                else:
+                    before_eof = entries[:eof_at]
+                    after_eof = entries[eof_at + 1:]
+
+                old_lines = [text for action, text in before_eof
+                             if action in ("context", "remove")]
+                if old_lines:
+                    match_at = None
+                    search_end = len(lines) - len(old_lines) + 1
+                    for candidate in range(cursor, max(cursor, search_end)):
+                        if lines[candidate:candidate + len(old_lines)] == old_lines:
+                            match_at = candidate
+                            break
+                    if match_at is None:
+                        raise ValueError(
+                            f"{display}: context mismatch; expected line "
+                            f"{old_lines[0]!r}"
+                        )
+                    if eof_at is not None and match_at + len(old_lines) != len(lines):
+                        raise ValueError(
+                            f"{display}: context mismatch; expected line "
+                            f"{old_lines[-1]!r} at end of file"
+                        )
+                    replacement: list[str] = []
+                    old_offset = 0
+                    for action, text in before_eof:
+                        if action == "context":
+                            replacement.append(old_lines[old_offset])
+                            old_offset += 1
+                        elif action == "remove":
+                            old_offset += 1
+                        elif action == "add":
+                            replacement.append(text)
+                    lines[match_at:match_at + len(old_lines)] = replacement
+                    cursor = match_at + len(replacement)
+                else:
+                    additions = [text for action, text in before_eof if action == "add"]
+                    additions += [text for action, text in after_eof if action == "add"]
+                    if additions:
+                        if eof_at is not None:
+                            lines.extend(additions)
+                            cursor = len(lines)
+                        else:
+                            lines[cursor:cursor] = additions
+                            cursor += len(additions)
+
+                if eof_at is not None and old_lines:
+                    eof_additions = [text for action, text in after_eof if action == "add"]
+                    if eof_additions:
+                        lines.extend(eof_additions)
+                        cursor = len(lines)
+
+            data = dict(data)
+            data["lines"] = lines
+            staged[path] = data
+
+            hunk_count = len(op["hunks"])
+            if hunk_count or not op.get("move_to"):
+                summaries.append(f"updated {display} ({hunk_count} hunks)")
+            if op.get("move_to"):
+                move_display = op["move_to"]
+                move_path = self._resolve(move_display)
+                if move_path != path:
+                    staged.pop(path, None)
+                    staged[move_path] = data
+                    deleted.discard(move_path)
+                    deleted.add(path)
+                    summaries.append(f"moved {display} -> {move_display}")
+
+        prepared: list[tuple[str, str]] = []
+        try:
+            for path, data in staged.items():
+                content = data["newline"].join(data["lines"])
+                if data["trailing"] and data["lines"]:
+                    content += data["newline"]
+                parent = os.path.dirname(path) or "."
+                os.makedirs(parent, exist_ok=True)
+                tmp = f"{path}.mike-patch-{os.getpid()}"
+                with open(tmp, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(content)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                prepared.append((path, tmp))
+            for path, tmp in prepared:
+                os.replace(tmp, path)
+            for path in deleted:
+                if os.path.exists(path):
+                    os.remove(path)
+        finally:
+            for _path, tmp in prepared:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+
+        return "\n".join(summaries)
+
+    @staticmethod
+    def _task_complete(args: dict, ctx: "Toolbox") -> str:
+        return "task marked complete"
 
     def _list_dir(self, args: dict, ctx: "Toolbox") -> str:
         path = self._resolve(args.get("path", "."))
@@ -1280,11 +1555,11 @@ class Compactor:
         """Return a new history: one summary message + the recent turns verbatim."""
         if len(messages) <= self.keep_recent:
             summary = self.build_summary(messages)
-            return [{"role": "user", "content": f"[CONTEXT SUMMARY]\n\n{summary}"}]
+            return [{"role": "user", "content": f"{COMPACTION_HEADER}\n\n{summary}"}]
         older = messages[:-self.keep_recent]
         tail = messages[-self.keep_recent:]
         summary = self.build_summary(older)
-        head = {"role": "user", "content": f"[CONTEXT SUMMARY]\n\n{summary}"}
+        head = {"role": "user", "content": f"{COMPACTION_HEADER}\n\n{summary}"}
         return [head] + list(tail)
 
     # -- deterministic extraction ----------------------------------------
@@ -1296,16 +1571,17 @@ class Compactor:
         goal = ""
         for m in users:
             text = strip_thinking(_content_text(m.get("content")))
-            if text and not text.startswith("[CONTEXT SUMMARY"):
+            if (text and not text.startswith(COMPACTION_PREFIX)
+                    and not text.startswith("[CONTEXT SUMMARY")):
                 goal = text
                 break
-        if not goal and users:
-            goal = strip_thinking(_content_text(users[0].get("content")))
 
         last_user = ""
         for m in reversed(users):
             text = strip_thinking(_content_text(m.get("content")))
-            if text and not text.startswith("[CONTEXT SUMMARY") and "<tool_result>" not in text:
+            if (text and not text.startswith(COMPACTION_PREFIX)
+                    and not text.startswith("[CONTEXT SUMMARY")
+                    and "<tool_result>" not in text):
                 last_user = text
                 break
 
@@ -1420,7 +1696,10 @@ def _files_touched(messages: list) -> set:
 def _find_lines(messages: list, keywords: tuple, max_lines: int = 8) -> list:
     hits: list = []
     for m in messages:
-        for line in _content_text(m.get("content")).splitlines():
+        text = _content_text(m.get("content"))
+        if text.startswith((COMPACTION_PREFIX, "[CONTEXT SUMMARY")):
+            continue
+        for line in text.splitlines():
             low = line.lower()
             if any(k in low for k in keywords) and 8 < len(line.strip()) < 200:
                 cleaned = line.strip().lstrip("-*# ").strip()
@@ -2247,11 +2526,31 @@ BASE_SYSTEM_PROMPT = f"""You are mike, an autonomous coding agent running on the
 You DO things - you use your tools instead of explaining how. Be concise and concrete.
 
 Rules:
-1. Read a file before editing it. Prefer edit_file for small changes, write_file for new files.
+1. Read a file before editing it. Use `apply_patch` for every file edit.
 2. Keep calling tools until the task is genuinely complete; don't stop after one step.
 3. Never print raw JSON tool schemas or fake tool output to the user.
 4. Use absolute or repo-relative paths. Never guess - use glob/grep/list_dir to find things.
 5. After you finish, give a one-line summary of what changed and how to run/test it.
+
+## Channels
+You have two kinds of output:
+
+- [commentary] — a short progress update before a group of tool calls.
+  Example: "[commentary] I'll inspect the repo structure first."
+- [final] — the completed answer. Only send this when the task is done.
+
+Rules:
+- Send one [commentary] line before your first tool call in a turn.
+- Never put a blocking question in [commentary]; ask it in [final].
+- Never end a turn with a promise to do work later. Either call the tool now
+  or call task_complete.
+- When the task is genuinely complete, call task_complete with a summary.
+
+## Compaction awareness
+The conversation may be summarized when it grows long. If you see a message
+beginning “The conversation was compacted…”, treat it as authoritative context,
+not as a new user request. Assume the last user intent is current. Do not
+repeat completed work or re-send commentary updates that were already delivered.
 
 You always run as the single model {MODEL_LABEL}. Working directory: {{cwd}}.
 Context budget: {{max_context:,}} tokens (auto-compaction at {{compact_at:,}}).
@@ -2278,6 +2577,7 @@ def build_prompted_tool_prompt(toolbox: Toolbox) -> str:
         "- You may emit several <tool_call> blocks in one turn.",
         "- Arguments must be a JSON object matching the tool's parameters.",
         "- After the tools run you will receive a <tool_result> message; keep going until done.",
+        "- For file edits, ALWAYS use `apply_patch`; do not use shell redirection, `cat`, or `sed -i`.",
         "- Use ONLY this envelope for tools. Do NOT use any other tool syntax"
         " (no DSML tags, no bare function names, no fenced code blocks).",
         "",
@@ -2340,17 +2640,16 @@ class MikeAgent:
             self.console.print(f"[red]warning: could not save session: {exc}[/red]")
 
     def _api_messages(self) -> list:
-        """Build the OpenAI message list sent upstream (reasoning stripped)."""
+        """Build the OpenAI message list sent upstream."""
         out = [{"role": "system", "content": self._system}]
         if self.tool_mode == "prompted":
             out.append({"role": "system", "content": build_prompted_tool_prompt(self.toolbox)})
         for msg in self.context:
             role = msg.get("role", "user")
             if role == "assistant":
-                entry: dict = {"role": "assistant", "content": msg.get("content") or None}
-                if msg.get("tool_calls") and self.tool_mode == "native":
-                    entry["tool_calls"] = msg["tool_calls"]
-                if not entry["content"] and not entry.get("tool_calls"):
+                entry = self._render_outgoing(msg)
+                if (not entry["content"] and not entry.get("tool_calls")
+                        and not entry.get("reasoning_content")):
                     continue
                 out.append(entry)
             elif role == "tool":
@@ -2367,7 +2666,21 @@ class MikeAgent:
         """Convert one stored message to the shape sent upstream."""
         role = msg.get("role", "user")
         if role == "assistant":
-            entry = {"role": "assistant", "content": msg.get("content") or ""}
+            content = msg.get("content") or ""
+            reasoning = msg.get("reasoning")
+            if self.tool_mode == "native":
+                entry: dict = {
+                    "role": "assistant",
+                    "content": content or None,
+                }
+                if reasoning:
+                    entry["reasoning_content"] = str(reasoning)
+            else:
+                if reasoning:
+                    content = (
+                        f"<reasoning>\n{reasoning}\n</reasoning>\n{content}"
+                    )
+                entry = {"role": "assistant", "content": content}
             if msg.get("tool_calls") and self.tool_mode == "native":
                 entry["tool_calls"] = msg["tool_calls"]
             return entry
@@ -2407,13 +2720,15 @@ class MikeAgent:
         self._maybe_compact()
 
         final_text = ""
+        nudge_count = 0
+        dsml_retry = False
         guard = 0
         while True:
             guard += 1
             if guard > 40:
                 self.console.print("[yellow]stopping: too many tool iterations[/yellow]")
                 break
-            text, reasoning, native_calls, _finish, stream_error = self._stream_once()
+            text, reasoning, native_calls, finish, stream_error = self._stream_once()
             # The request reached the server (and the upstream thread): the
             # pending messages are now inside the conversation.
             self._unsent = []
@@ -2449,6 +2764,24 @@ class MikeAgent:
             assistant_msg: dict = {"role": "assistant", "content": clean_text}
             if reasoning:
                 assistant_msg["reasoning"] = reasoning
+
+            complete_call = next(
+                (call for call in calls if call.get("name") == "task_complete"),
+                None,
+            )
+            if complete_call is not None:
+                complete_args = complete_call.get("arguments") or {}
+                summary = complete_args.get("summary", "") if isinstance(
+                    complete_args, dict) else ""
+                if not isinstance(summary, str):
+                    summary = str(summary)
+                # The signalling call is harness metadata, not a tool result. Do
+                # not store or replay it in the assistant's tool_calls.
+                self._append(assistant_msg)
+                self._save()
+                final_text = summary or clean_text
+                break
+
             if calls:
                 # Normalise a stable id onto every call dict FIRST, so the
                 # assistant tool-call message and the tool result in _run_tools
@@ -2477,6 +2810,28 @@ class MikeAgent:
                 self._maybe_compact()
                 continue
 
+            raw = text or ""
+            looks_like_tool = (
+                "DSML" in raw
+                or "<tool_call>" in raw
+                or "invoke name=" in raw
+            )
+            if finish == "stop" and looks_like_tool and not dsml_retry:
+                dsml_retry = True
+                log.warning("dsml_unparsed_retry")
+                self.console.print(
+                    "[yellow]warning: tool-call syntax detected in content but not parsed; "
+                    "retrying with a stricter nudge[/yellow]")
+                self._append({
+                    "role": "user",
+                    "content": (
+                        "Your last message contained tool syntax but no executable tool call. "
+                        "Emit a single valid <tool_call> envelope or a DSML invoke block now."
+                    ),
+                }, unsent=True)
+                self._save()
+                continue
+
             if not clean_text.strip() and not calls and not reasoning:
                 # Truly empty stream with no error frame: same silent-blank failure.
                 # Report it and stop; do NOT append an empty assistant message.
@@ -2489,6 +2844,17 @@ class MikeAgent:
 
             self._append(assistant_msg)
             self._save()
+            if nudge_count == 0:
+                nudge_count += 1
+                self._append({
+                    "role": "user",
+                    "content": (
+                        "You have not called `task_complete`. Continue the task or "
+                        "call `task_complete` with a summary."
+                    ),
+                }, unsent=True)
+                self._save()
+                continue
             final_text = clean_text
             break
         return final_text
@@ -2672,7 +3038,13 @@ class MikeAgent:
         if self.session.conversation_id:
             # The upstream thread keeps the old turns, so send the fresh summary
             # plus anything still pending (e.g. the user turn we just added).
-            self._unsent = [self.context[0]] + [m for m in pending if m is not self.context[0]]
+            pending = [
+                m for m in pending
+                if not str(m.get("content", "")).startswith(
+                    (COMPACTION_PREFIX, "[CONTEXT SUMMARY")
+                )
+            ]
+            self._unsent = [self.context[0]] + pending
         else:
             self._unsent = []
         self._save()
@@ -2696,6 +3068,9 @@ class MikeAgent:
 def _tool_preview(name: str, args: dict) -> str:
     if not isinstance(args, dict):
         return ""
+    if name == "apply_patch" and "input" in args:
+        val = str(args["input"]).replace("\n", " ")
+        return val[:60] + ("..." if len(val) > 60 else "")
     for key in ("path", "command", "pattern", "url", "code"):
         if key in args:
             val = str(args[key]).replace("\n", " ")

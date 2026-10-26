@@ -14,6 +14,9 @@ class ChatMessage(BaseModel):
     # content is a plain string, or a list of parts (OpenAI vision-style). We only
     # read text parts; non-text parts are ignored.
     content: Union[str, List[dict], None] = None
+    # DeepSeek requires prior thinking-mode reasoning to be replayed when tools
+    # are present. The field is accepted here and flattened by the prompt bridge.
+    reasoning_content: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):

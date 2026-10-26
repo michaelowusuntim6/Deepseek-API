@@ -158,7 +158,8 @@ unattended.
 and the last 80 characters are shown in a dimmed single-line status area. `/thinking
 on` streams full dim reasoning; `/thinking off` hides it entirely; `/thinking
 last` prints the most recent block once. Reasoning is stored under `reasoning`
-and never sent back as assistant content.
+and is replayed through the v0.4 outgoing protocol without changing the stored
+assistant content.
 **Rationale.** Satisfies both "render thinking dimmed by default / don't dump to
 scrollback" and "/thinking off is the hidden mode".
 **Alternatives.** Reasoning off at the API level by default — rejected: there
@@ -628,3 +629,115 @@ both are unit-tested (`test_dsml_*` for DSML, `test_agent_runs_tool_then_answers
 / `test_*_roundtrip` for the envelope and DSML round-trips). The DSML work is the
 correctness fix the brief required; the pairing fix is what made the model
 continue.
+
+---
+
+# v0.4 — Codex-style completion and `apply_patch`
+
+## Completion is explicit; commentary is not final
+
+**Decision.** The agent loop only terminates normally when the model emits a
+structured `task_complete` call. A text-only reply is stored as commentary and
+followed by exactly one nudge asking the model to continue or call
+`task_complete`; a second text-only reply is the bounded fallback final answer.
+The system prompt introduces `[commentary]` / `[final]` guidance, but those
+labels are not required in prompted mode.
+
+**Rationale.** DeepSeek often says “I’ll read the file next” and stops without
+making the call. Breaking on the first empty `tool_calls` list treats that
+promise as a final answer. An explicit structured signal matches Codex’s
+completion model while retaining a finite failure mode when the web model
+ignores the tool.
+
+**Alternatives.** Infer completion from clean text or `finish_reason: stop` —
+rejected because both are routinely emitted for progress messages. Loop until
+`task_complete` with no fallback — rejected because a free web model that never
+calls the tool would hang the turn.
+
+## `apply_patch` replaces direct write/edit tools
+
+**Decision.** `write_file` and `edit_file` are no longer registered. The sole
+file-mutation tool is a Codex-style, line-oriented `apply_patch` with Add,
+Update, Move, Delete, hunks, and EOF insertion support. The whole envelope is
+parsed and all hunk contexts are validated against a staged view before any
+disk write. Add File overwrites and ensures a trailing newline; bare blank hunk
+lines are accepted as empty context.
+
+**Rationale.** One constrained patch surface makes edits inspectable, supports
+multi-file changes atomically from the model’s perspective, prevents partial
+application on a context error, and gives a clear place to enforce “no shell
+redirection / `cat` / `sed -i`” edits. Old sessions containing `write_file` or
+`edit_file` calls remain valid JSON history; only the live registry changed.
+
+**Alternatives.** Keep string-replacement editing beside the patch tool —
+rejected because two mutation paths weaken the edit protocol and make prompts
+ambiguous.
+
+## Reasoning replay and server schema
+
+**Decision.** Stored assistant `reasoning` is replayed on every later request.
+In prompted mode mike prepends a `<reasoning>…</reasoning>` block to the
+outgoing assistant content only; in native tools mode it sends a top-level
+`reasoning_content` field. `server.schemas.ChatMessage` accepts
+`reasoning_content`, and `messages_to_prompt()` serializes it as
+`Assistant (reasoning): …`. Non-streaming completion responses preserve the
+field when reasoning is returned.
+
+**Rationale.** DeepSeek rejects thinking-mode requests with tools when prior
+assistant reasoning is omitted. The flat-prompt bridge otherwise discards the
+field. Tagged prompted replay keeps the flat architecture while the named field
+keeps native OpenAI-shaped requests compatible.
+
+**Alternatives.** Replay reasoning as ordinary visible assistant content —
+rejected because it pollutes the transcript and answer semantics. Change the
+bridge to native Chat Completions tool handling — outside this hardening pass
+and unnecessary for the workaround.
+
+## Compaction is explicit continuation context
+
+**Decision.** Compactor summaries now start with “The conversation was
+compacted…” and the system prompt contains a **Compaction awareness** section.
+Section extraction skips both the new prefix and legacy `[CONTEXT SUMMARY]`
+messages. When a `conversation_id` exists, the new summary is queued as the
+first unsent message and prior queued summaries are filtered out.
+
+**Rationale.** A bare `[CONTEXT SUMMARY]` user message can look like a fresh
+request and cause the model to restart. Explicit continuation language keeps
+the last intent current and avoids duplicate summaries in an existing thread.
+
+**Alternatives.** Change the summary role to system — rejected because the web
+bridge flattens roles and the existing user-message threading is known to work.
+
+## DSML safety net after `finish_reason: "stop"`
+
+**Decision.** If a stopped response parses to no calls but its raw content still
+contains `DSML`, `<tool_call>`, or `invoke name=`, mike logs
+`dsml_unparsed_retry`, warns the user, and sends one stricter continuation
+nudge. The retry is allowed once per user turn; subsequent unparsed syntax falls
+through to normal commentary/nudge handling.
+
+**Rationale.** The free web model can return a complete-looking or malformed
+tool block as plain content with `finish_reason: stop`. Silently treating that
+as completion reintroduces the early-stop bug even with `task_complete`.
+
+**Alternatives.** Retry indefinitely — rejected because malformed generations
+can repeat forever. Parse arbitrary content heuristically — rejected because it
+would execute unvalidated tool syntax.
+
+## v0.4 verification
+
+`venv/bin/python -m pytest tests/test_mike.py -q` covers the new patch grammar,
+atomic context failure, missing tool registry entries, `task_complete`
+termination, the one-shot commentary nudge, prompted/native reasoning replay,
+compaction headers and awareness, and the DSML `stop` retry. Result:
+
+```
+97 passed in 3.02s
+```
+
+The live smoke test ran `venv/bin/python mike.py` against the local bridge with
+the requested two prompts. The model called `apply_patch` (summary output
+`added hello.txt`), read `hello.txt` back and received `hi`, then emitted its
+final completion turn without a commentary nudge. The explicit
+`task_complete` call ended the turn and is omitted from stored `tool_calls` as
+designed. The smoke session and `hello.txt` were removed afterwards.

@@ -133,8 +133,28 @@ without it you get a warning and a `Overwrite? [y/N]` prompt.
 
 ### Tools
 
-`read_file`, `write_file`, `edit_file`, `list_dir`, `glob`, `grep`, `bash`,
-`python`, `web_fetch`, `todo_write`, `todo_read`.
+`read_file`, `apply_patch`, `list_dir`, `glob`, `grep`, `bash`, `python`,
+`web_fetch`, `todo_write`, `todo_read`, `task_complete`.
+
+`apply_patch` is the only file-mutation surface. It accepts the line-oriented
+Codex patch envelope:
+
+```
+*** Begin Patch
+*** Add File: notes.txt
++hello
+*** Update File: app.py
+@@
+-old
++new
+*** Delete File: obsolete.txt
+*** End Patch
+```
+
+`*** Move to:` after an update renames the file, and `*** End of File` supports
+an EOF append. Mike parses and validates the entire patch against an in-memory
+view before writing, so a bad context line cannot leave an earlier operation
+partially applied.
 
 The server's web backend does not implement OpenAI's `tools=` schema, so mike
 runs in **prompted mode**: it describes the tools in a system prompt and parses
@@ -150,14 +170,38 @@ Tool results are paired back to their call id so multi-step tasks continue.
 Both may even appear in the same message, and multiple calls per turn are
 dispatched in order.
 
+### Completion and commentary
+
+A text-only reply is treated as commentary, not completion. Before the first
+tool call the model is asked to send a short progress update. If it replies
+without calling `task_complete`, mike appends:
+
+> You have not called `task_complete`. Continue the task or call
+> `task_complete` with a summary.
+
+The model then gets one more chance to keep working or finish. A second
+text-only reply is accepted as the final fallback, so the loop cannot run
+forever. A structured `task_complete` call ends the turn immediately and its
+`summary` becomes the returned final answer.
+
+The system prompt also asks for `[commentary]` and `[final]` channel labels.
+Those labels are guidance for the free web model; the enforceable completion
+signal is the `task_complete` tool call.
+
 ### Thinking blocks
 
 DeepSeek streams reasoning (fragment type `THINK`). By default mike shows it in a
 dimmed single-line spinner and never dumps it to scrollback; `/thinking on`
 streams the full reasoning in dim text, `/thinking off` hides it, and
 `/thinking last` prints the most recent full reasoning block once. Reasoning is
-stored in the session under a separate `reasoning` field and is **never** fed
-back to the model as assistant content.
+stored in the session under a separate `reasoning` field.
+
+**Reasoning replay:** on later requests, mike replays that field because
+DeepSeek requires prior thinking-mode reasoning when tools are present. Prompted
+mode prepends it as `<reasoning>…</reasoning>` to the outgoing assistant copy;
+native tools mode sends it as the top-level `reasoning_content` field. The
+stored assistant content remains clean, and the server schema accepts
+`reasoning_content` when flattening history into the web prompt.
 
 ### Sessions
 
@@ -168,6 +212,11 @@ compaction log, and the model name. Compaction shrinks only the *in-context*
 view; the on-disk transcript is never truncated. When a session is still over
 budget after compaction, mike transparently **rolls over** to a new
 `<slug>-contN` session seeded with the summary.
+
+Compaction summaries begin with “The conversation was compacted…” and the
+system prompt marks them as continuation context. The model is told not to
+treat the summary as a new user request, restart the task, or repeat completed
+work.
 
 Each session is also pinned to **one upstream DeepSeek chat**: mike stores the
 server's `conversation_id` and reuses it for every follow-up request, so tool

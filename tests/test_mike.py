@@ -347,10 +347,13 @@ class _FakeLLM:
 
 
 def test_agent_runs_tool_then_answers(tmp_path):
+    patch = "*** Begin Patch\n*** Add File: hello.txt\n+hi\n*** End Patch\n"
     tool_turn = [
         {"type": "content", "text":
-            '<tool_call>{"name": "write_file", "arguments": '
-            '{"path": "hello.txt", "content": "hi"}}</tool_call>'},
+            "<tool_call>" + json.dumps({
+                "name": "apply_patch",
+                "arguments": {"input": patch},
+            }) + "</tool_call>"},
     ]
     answer_turn = [{"type": "content", "text": "Done — created hello.txt."}]
     llm = _FakeLLM([tool_turn, answer_turn])
@@ -366,7 +369,7 @@ def test_agent_runs_tool_then_answers(tmp_path):
 
     result = agent.run("create hello.txt")
 
-    assert (tmp_path / "hello.txt").read_text() == "hi"
+    assert (tmp_path / "hello.txt").read_text() == "hi\n"
     assert result == "Done — created hello.txt."
     # Tool result was fed back as a user message wrapped in <tool_result>.
     assert any("<tool_result" in str(m.get("content")) for m in session.messages)
@@ -777,13 +780,20 @@ class TestToolCallRoundTrip:
         _assert_no_syntax(console.text)
         assert "<tool_call>" not in console.text
 
-    def test_edit_file_roundtrip(self, tmp_path):
+    def test_apply_patch_roundtrip(self, tmp_path):
         target = tmp_path / "code.txt"
         target.write_text("alpha\nbeta\ngamma\n")
-        (tmp_path / "note").write_text("")
-        text = _dsml_block("edit_file", [("path", str(target)),
-                                         ("old", "beta"),
-                                         ("new", "BETA")])
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: code.txt\n"
+            "@@\n"
+            " alpha\n"
+            "-beta\n"
+            "+BETA\n"
+            " gamma\n"
+            "*** End Patch\n"
+        )
+        text = _dsml_block("apply_patch", [("input", patch)])
         turns = [
             [{"type": "content", "text": text}],
             [{"type": "content", "text": "Renamed beta to BETA."}],
@@ -792,36 +802,45 @@ class TestToolCallRoundTrip:
         recorded = _spy(agent)
         result = agent.run("change beta to BETA")
 
-        assert recorded[0][0] == "edit_file"
-        assert recorded[0][1]["old"] == "beta" and recorded[0][1]["new"] == "BETA"
+        assert recorded[0][0] == "apply_patch"
+        assert recorded[0][1]["input"].rstrip("\n") == patch.rstrip("\n")
         # The file on disk was really mutated.
         on_disk = target.read_text()
         assert "BETA" in on_disk and "beta" not in on_disk
         assert result == "Renamed beta to BETA."
         _assert_no_syntax(console.text)
 
-    def test_edit_file_not_unique(self, tmp_path):
+    def test_apply_patch_bad_context_is_atomic(self, tmp_path):
         target = tmp_path / "dup.txt"
         original = "same\nsame\n"
         target.write_text(original)
-        text = _dsml_block("edit_file", [("path", str(target)),
-                                         ("old", "same"),
-                                         ("new", "diff")])
+        patch = (
+            "*** Begin Patch\n"
+            "*** Add File: should-not-exist.txt\n"
+            "+partial\n"
+            "*** Update File: dup.txt\n"
+            "@@\n"
+            "-different\n"
+            "+changed\n"
+            "*** End Patch\n"
+        )
+        text = _dsml_block("apply_patch", [("input", patch)])
         turns = [
             [{"type": "content", "text": text}],
-            [{"type": "content", "text": "I could not make that edit."}],
+            [{"type": "content", "text": "The patch could not be applied."}],
         ]
         agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
         recorded = _spy(agent)
         result = agent.run("replace same")
 
         # The tool ran, returned an error, and did NOT write the file.
-        assert recorded[0][0] == "edit_file"
+        assert recorded[0][0] == "apply_patch"
         assert target.read_text() == original
+        assert not (tmp_path / "should-not-exist.txt").exists()
         fed = [m for m in session.messages if "<tool_result" in str(m.get("content"))]
         assert fed and "error" in str(fed[0]["content"]).lower()
-        assert "appears 2 times" in str(fed[0]["content"])
-        assert result == "I could not make that edit."
+        assert "context mismatch" in str(fed[0]["content"])
+        assert result == "The patch could not be applied."
         _assert_no_syntax(console.text)
 
     def test_native_mode_still_works(self, tmp_path):
@@ -1272,3 +1291,270 @@ def test_run_strips_tool_result_from_assistant(tmp_path):
     assert asst and all("tool_result" not in t for t in asst)
     assert "Looking." in asst[0]
     assert "tool_result" not in console.text
+
+
+# --------------------------------------------------------------------------- #
+# 15. Codex-style completion and apply_patch protocol (v0.4)                  #
+# --------------------------------------------------------------------------- #
+
+def test_apply_patch_add_update_delete_move(tmp_path):
+    (tmp_path / "edit.txt").write_text("one\ntwo\nthree\n")
+    (tmp_path / "delete.txt").write_text("remove me\n")
+    (tmp_path / "move.txt").write_text("move me\n")
+    (tmp_path / "eof.txt").write_text("head\n")
+    toolbox = mike.Toolbox(str(tmp_path))
+
+    patch = (
+        "*** Begin Patch\n"
+        "*** Add File: nested/added.txt\n"
+        "+hello\n"
+        "+world\n"
+        "*** Update File: edit.txt\n"
+        "@@ optional function name\n"
+        " one\n"
+        "-two\n"
+        "+TWO\n"
+        " three\n"
+        "*** Delete File: delete.txt\n"
+        "*** Update File: move.txt\n"
+        "*** Move to: moved/moved.txt\n"
+        "*** Update File: eof.txt\n"
+        "@@\n"
+        " head\n"
+        "*** End of File\n"
+        "+tail\n"
+        "*** End Patch\n"
+    )
+    result = toolbox.call("apply_patch", {"input": patch})
+
+    assert not result.startswith("error:")
+    assert (tmp_path / "nested" / "added.txt").read_text() == "hello\nworld\n"
+    assert (tmp_path / "edit.txt").read_text() == "one\nTWO\nthree\n"
+    assert not (tmp_path / "delete.txt").exists()
+    assert not (tmp_path / "move.txt").exists()
+    assert (tmp_path / "moved" / "moved.txt").read_text() == "move me\n"
+    assert (tmp_path / "eof.txt").read_text() == "head\ntail\n"
+    assert "added nested/added.txt" in result
+    assert "updated edit.txt (1 hunks)" in result
+    assert "deleted delete.txt" in result
+    assert "moved move.txt -> moved/moved.txt" in result
+
+    before_edit = (tmp_path / "edit.txt").read_text()
+    (tmp_path / "safe-delete.txt").write_text("keep me\n")
+    bad = (
+        "*** Begin Patch\n"
+        "*** Add File: atomic-new.txt\n"
+        "+should not exist\n"
+        "*** Delete File: safe-delete.txt\n"
+        "*** Update File: edit.txt\n"
+        "@@\n"
+        "-not present\n"
+        "+replacement\n"
+        "*** End Patch\n"
+    )
+    bad_result = toolbox.call("apply_patch", {"input": bad})
+
+    assert bad_result.startswith("error:")
+    assert "context mismatch" in bad_result and "edit.txt" in bad_result
+    assert not (tmp_path / "atomic-new.txt").exists()
+    assert (tmp_path / "safe-delete.txt").read_text() == "keep me\n"
+    assert (tmp_path / "edit.txt").read_text() == before_edit
+
+
+def test_apply_patch_rejects_bad_envelope(tmp_path):
+    target = tmp_path / "safe.txt"
+    target.write_text("unchanged\n")
+    toolbox = mike.Toolbox(str(tmp_path))
+    result = toolbox.call("apply_patch", {
+        "input": (
+            "*** Update File: safe.txt\n"
+            "@@\n"
+            "-unchanged\n"
+            "+changed\n"
+            "*** End Patch\n"
+        ),
+    })
+    assert result.startswith("error:")
+    assert "*** Begin Patch" in result
+    assert target.read_text() == "unchanged\n"
+
+
+def test_apply_patch_in_toolbox_and_not_write_file(tmp_path):
+    specs = mike.Toolbox(str(tmp_path)).specs
+    assert "apply_patch" in specs
+    assert "task_complete" in specs
+    assert "write_file" not in specs
+    assert "edit_file" not in specs
+
+
+def test_task_complete_stops_loop(tmp_path):
+    task_call = (
+        "<tool_call>"
+        + json.dumps({
+            "name": "task_complete",
+            "arguments": {"summary": "Implemented and verified the change."},
+        })
+        + "</tool_call>"
+    )
+    turns = [
+        [{"type": "content", "text": "I will inspect the files first."}],
+        [{"type": "content", "text": task_call},
+         {"type": "finish", "finish_reason": "stop"}],
+    ]
+    agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+    recorded = _spy(agent)
+
+    result = agent.run("finish the task")
+
+    assert llm.calls == 2
+    assert result == "Implemented and verified the change."
+    assert recorded == []
+    assert any("inspect the files first" in str(m.get("content"))
+               for m in session.messages if m["role"] == "assistant")
+    assert all(
+        mike._call_name(call) != "task_complete"
+        for m in session.messages for call in (m.get("tool_calls") or [])
+    )
+
+
+def test_commentary_nudge(tmp_path):
+    turns = [
+        [{"type": "content", "text": "Progress: reading the next file."}],
+        [{"type": "content", "text": "The task is done."}],
+    ]
+    agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+    nudge = (
+        "You have not called `task_complete`. Continue the task or call "
+        "`task_complete` with a summary."
+    )
+
+    result = agent.run("do the work")
+
+    assert llm.calls == 2
+    assert result == "The task is done."
+    assert nudge in str(llm.seen_messages[1])
+    assert sum(1 for m in session.messages if m.get("content") == nudge) == 1
+
+
+def _reasoning_replay_agent(tmp_path, tool_mode):
+    agent, _llm, _console, session = _make_roundtrip_agent(
+        tmp_path, [[]], tool_mode=tool_mode)
+    session.messages = [
+        {"role": "user", "content": "inspect it"},
+        {
+            "role": "assistant",
+            "content": "I inspected the file.",
+            "reasoning": "I should read before editing.",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "x.py"}),
+                },
+            }],
+        },
+    ]
+    agent.context = list(session.messages)
+    return agent, session
+
+
+def test_reasoning_replayed_prompted(tmp_path):
+    agent, session = _reasoning_replay_agent(tmp_path, "prompted")
+    messages = agent._request_messages()
+    assistant = next(m for m in messages if m["role"] == "assistant")
+
+    assert "<reasoning>\nI should read before editing.\n</reasoning>" in assistant["content"]
+    assert "reasoning_content" not in assistant
+    assert session.messages[1]["content"] == "I inspected the file."
+
+
+def test_reasoning_replayed_native(tmp_path):
+    agent, _session = _reasoning_replay_agent(tmp_path, "native")
+    messages = agent._request_messages()
+    assistant = next(m for m in messages if m["role"] == "assistant")
+
+    assert assistant["reasoning_content"] == "I should read before editing."
+    assert "<reasoning>" not in (assistant["content"] or "")
+    assert assistant["tool_calls"][0]["id"] == "call_1"
+
+
+def test_server_prompt_and_completion_replay_reasoning():
+    from server.openai_format import completion_response, messages_to_prompt
+    from server.schemas import ChatMessage
+
+    prompt = messages_to_prompt([
+        ChatMessage(role="user", content="inspect it"),
+        ChatMessage(
+            role="assistant",
+            content="I inspected it.",
+            reasoning_content="I should read before editing.",
+        ),
+        ChatMessage(role="user", content="continue"),
+    ])
+    response = completion_response(
+        "deepseek-v4.1-flash", "done", prompt,
+        reasoning="Final reasoning.",
+    )
+
+    assert "Assistant (reasoning): I should read before editing." in prompt
+    assert response["choices"][0]["message"]["reasoning_content"] == "Final reasoning."
+
+
+def test_compaction_header_and_awareness(tmp_path):
+    agent, _llm, _console, session = _make_roundtrip_agent(tmp_path, [[]])
+    session.conversation_id = "conv-compact"
+    agent.context = [
+        {"role": "user", "content": "Implement the feature."},
+        {"role": "assistant", "content": "Working on it."},
+    ]
+    pending = {"role": "user", "content": "Continue with tests."}
+    agent._unsent = [pending]
+
+    summary = agent.compact(force=True)
+
+    assert summary
+    assert agent.context[0]["content"].startswith(mike.COMPACTION_HEADER)
+    assert agent._unsent[0]["content"].startswith(mike.COMPACTION_HEADER)
+    assert sum(
+        1 for m in agent._unsent
+        if str(m.get("content", "")).startswith(mike.COMPACTION_HEADER)
+    ) == 1
+    assert pending in agent._unsent
+    assert "Compaction awareness" in agent._system
+    only_compaction = agent.compactor.build_summary([agent.context[0]])
+    assert "The conversation was compacted." not in only_compaction
+
+
+def test_dsml_stop_retry(tmp_path, caplog):
+    raw_dsml = (
+        "Trying a tool call.\n"
+        f"<{BAR}DSML{BAR}tool_calls>\n"
+        f"<{BAR}DSML{BAR} truncated"
+    )
+    task_call = (
+        "<tool_call>"
+        + json.dumps({
+            "name": "task_complete",
+            "arguments": {"summary": "Retried and completed."},
+        })
+        + "</tool_call>"
+    )
+    turns = [
+        [
+            {"type": "content", "text": raw_dsml},
+            {"type": "finish", "finish_reason": "stop"},
+        ],
+        [{"type": "content", "text": task_call}],
+    ]
+    agent, llm, console, session = _make_roundtrip_agent(tmp_path, turns)
+
+    with caplog.at_level(logging.WARNING, logger="mike"):
+        result = agent.run("try the tool")
+
+    assert result == "Retried and completed."
+    assert llm.calls == 2
+    assert "Your last message contained tool syntax" in str(llm.seen_messages[1])
+    assert "tool-call syntax detected in content but not parsed" in console.text
+    assert sum(1 for r in caplog.records
+               if r.getMessage() == "dsml_unparsed_retry") == 1
